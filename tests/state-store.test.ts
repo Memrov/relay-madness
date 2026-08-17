@@ -153,9 +153,25 @@ function createPopulatedV4DatabaseWithRunBranch(): string {
     INSERT INTO schema_migrations (version, applied_at)
       VALUES (4, '2026-08-16T00:03:00.000Z');
     UPDATE work_items
-      SET current_branch = 'relay/run/work-v3/legacy-run'
+      SET current_branch = 'relay/run/work-v3/legacy-run',
+          current_sha = '${'c'.repeat(40)}',
+          pull_request = 143
       WHERE id = 'work-v3';
   `);
+  database.close();
+  return path;
+}
+
+function createPopulatedV4DatabaseWithNullBranch(): string {
+  const path = createPopulatedV4DatabaseWithRunBranch();
+  const database = new Database(path);
+  database
+    .prepare(
+      `UPDATE work_items
+       SET current_branch = NULL, current_sha = NULL, pull_request = NULL
+       WHERE id = 'work-v3'`,
+    )
+    .run();
   database.close();
   return path;
 }
@@ -660,7 +676,7 @@ test('applies ordered schema migrations', () => {
   assert.ok(landingLeaseColumns.some(({ name }) => name === 'expires_at'));
 });
 
-test('migrates a version-four relay run branch to a dedicated integration branch', () => {
+test('migrates a version-four relay run branch without retaining its SHA or PR', () => {
   const store = StateStore.open(createPopulatedV4DatabaseWithRunBranch());
 
   const workItem = store.getWorkItem('work-v3');
@@ -668,6 +684,20 @@ test('migrates a version-four relay run branch to a dedicated integration branch
   assert.equal(workItem.integrationBranch.startsWith('relay/run/'), false);
   assert.notEqual(workItem.integrationBranch, workItem.baseBranch);
   assert.equal(workItem.currentBranch, workItem.integrationBranch);
+  assert.equal(workItem.currentSha, undefined);
+  assert.equal(workItem.pullRequest, undefined);
+  store.close();
+});
+
+test('preserves a null legacy current branch while backfilling integration', () => {
+  const store = StateStore.open(createPopulatedV4DatabaseWithNullBranch());
+
+  const workItem = store.getWorkItem('work-v3');
+  assert.match(workItem.integrationBranch, /^relay\/work\//);
+  assert.notEqual(workItem.integrationBranch, workItem.baseBranch);
+  assert.equal(workItem.currentBranch, undefined);
+  assert.equal(workItem.currentSha, undefined);
+  assert.equal(workItem.pullRequest, undefined);
   store.close();
 });
 

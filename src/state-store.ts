@@ -1510,11 +1510,15 @@ export class StateStore {
           ALTER TABLE candidates ADD COLUMN integration_branch TEXT;
         `);
         const workItems = this.database
-          .prepare('SELECT id, base_branch, current_branch FROM work_items')
+          .prepare(
+            `SELECT id, base_branch, current_branch, current_sha, pull_request
+             FROM work_items`,
+          )
           .all() as SqlRow[];
         const updateWorkItem = this.database.prepare(
           `UPDATE work_items
-           SET integration_branch = ?, current_branch = ?, updated_at = ?
+           SET integration_branch = ?, current_branch = ?, current_sha = ?,
+               pull_request = ?, updated_at = ?
            WHERE id = ?`,
         );
         const now = new Date().toISOString();
@@ -1528,11 +1532,12 @@ export class StateStore {
           )
             ? currentBranch
             : integrationBranchFor(id, baseBranch);
+          const replacesCandidateBranch = isRelayCandidateBranch(currentBranch);
           updateWorkItem.run(
             integrationBranch,
-            isRelayCandidateBranch(currentBranch) || currentBranch === undefined
-              ? integrationBranch
-              : currentBranch,
+            replacesCandidateBranch ? integrationBranch : currentBranch ?? null,
+            replacesCandidateBranch ? null : row.current_sha,
+            replacesCandidateBranch ? null : row.pull_request,
             now,
             id,
           );
