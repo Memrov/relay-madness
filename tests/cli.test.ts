@@ -235,6 +235,7 @@ test('surfaces quarantined launch state in human-readable status', async () => {
           correlationId: 'run_uncertain',
           delegationDepth: 0,
           startedAt: '2026-08-16T00:00:00.000Z',
+          skills: [],
         },
       ],
     }),

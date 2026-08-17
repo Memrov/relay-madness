@@ -5,6 +5,11 @@ import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 
 import { RelayError } from './errors.js';
+import {
+  parseResolvedSkills,
+  serializeResolvedSkills,
+  type ResolvedSkill,
+} from './skills.js';
 import type {
   MutationMode,
   ProviderName,
@@ -81,6 +86,7 @@ export interface WorkItemRecord {
   title: string;
   baseBranch: string;
   integrationBranch: string;
+  skillSourceSha?: string;
   currentBranch?: string;
   currentSha?: string;
   pullRequest?: number;
@@ -97,10 +103,12 @@ export interface SessionInput {
   providerUrl?: string;
   status: 'pending' | 'active' | 'complete' | 'failed' | 'expired';
   branch?: string;
+  skills?: readonly ResolvedSkill[];
 }
 
-export interface SessionRecord extends SessionInput {
+export interface SessionRecord extends Omit<SessionInput, 'skills'> {
   id: string;
+  skills: readonly ResolvedSkill[];
   lastActivityAt: string;
 }
 
@@ -141,6 +149,7 @@ export interface RunRecord extends RunInput {
   finishedAt?: string;
   launchAttemptId?: string;
   launchState?: 'prepared' | 'accepted' | 'uncertain';
+  skills: readonly ResolvedSkill[];
 }
 
 export type CheckSummary = 'passing' | 'failing' | 'pending' | 'unknown';
@@ -697,6 +706,40 @@ export class StateStore {
     );
   }
 
+  pinWorkItemSkillSource(id: string, sourceSha: string): WorkItemRecord {
+    if (!/^[0-9a-f]{40}$/i.test(sourceSha)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Skill source SHA must contain exactly 40 hexadecimal characters.',
+      );
+    }
+    const normalizedSha = sourceSha.toLowerCase();
+    return this.database.transaction(() => {
+      const row = this.requiredRow(
+        this.database
+          .prepare('SELECT skill_source_sha FROM work_items WHERE id = ?')
+          .get(id),
+        `WorkItem ${id} was not found.`,
+      );
+      const existing = nullableString(row.skill_source_sha);
+      if (existing !== undefined && existing !== normalizedSha) {
+        throw new RelayError(
+          'state_conflict',
+          `WorkItem ${id} is already pinned to another skill source commit.`,
+          { workItemId: id, skillSourceSha: existing },
+        );
+      }
+      if (existing === undefined) {
+        this.database
+          .prepare(
+            'UPDATE work_items SET skill_source_sha = ?, updated_at = ? WHERE id = ?',
+          )
+          .run(normalizedSha, new Date().toISOString(), id);
+      }
+      return this.getWorkItem(id);
+    }).immediate();
+  }
+
   getProject(id: string): ProjectRecord {
     return this.projectFromRow(
       this.requiredRow(
@@ -744,7 +787,7 @@ export class StateStore {
       }
       const existing = this.database
         .prepare(
-          `SELECT id FROM provider_sessions
+          `SELECT id, skills_json FROM provider_sessions
            WHERE work_item_id = ? AND provider = ? AND account_id IS ?
              AND provider_session_id = ?`,
         )
@@ -755,12 +798,13 @@ export class StateStore {
           input.providerSessionId,
         ) as SqlRow | undefined;
       if (existing === undefined) {
+        const skillsJson = serializeResolvedSkills(input.skills ?? []);
         this.database
           .prepare(
             `INSERT INTO provider_sessions (
               id, work_item_id, provider, account_id, provider_session_id, provider_url,
-              status, branch, last_activity_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              status, branch, skills_json, last_activity_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             randomUUID(),
@@ -771,9 +815,20 @@ export class StateStore {
             input.providerUrl ?? null,
             input.status,
             input.branch ?? null,
+            skillsJson,
             now,
           );
       } else {
+        if (
+          input.skills !== undefined &&
+          serializeResolvedSkills(input.skills) !== String(existing.skills_json)
+        ) {
+          throw new RelayError(
+            'state_conflict',
+            'A provider session skill selection cannot be changed.',
+            { sessionId: String(existing.id) },
+          );
+        }
         this.database
           .prepare(
             `UPDATE provider_sessions SET provider_url = ?, status = ?, branch = ?,
@@ -891,7 +946,7 @@ export class StateStore {
       const session = this.requiredRow(
         this.database
           .prepare(
-            `SELECT work_item_id, provider, account_id
+            `SELECT work_item_id, provider, account_id, skills_json
              FROM provider_sessions WHERE id = ?`,
           )
           .get(input.sessionId),
@@ -900,6 +955,8 @@ export class StateStore {
       const workItemId = String(session.work_item_id);
       const provider = String(session.provider) as ProviderName;
       const accountId = nullableString(session.account_id);
+      const skillsJson = String(session.skills_json);
+      parseResolvedSkills(skillsJson);
       if (input.provider !== provider) {
         throw new RelayError(
           'provider_mismatch',
@@ -943,8 +1000,8 @@ export class StateStore {
             id, session_id, work_item_id, provider, type, prompt, status,
             mutation_mode, correlation_id, origin_provider, delegation_depth,
             parent_run_id, expected_branch, baseline_sha, pinned_sha, account_id,
-            model, base_sha, result_sha, started_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            model, base_sha, result_sha, skills_json, started_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -965,6 +1022,7 @@ export class StateStore {
           input.model ?? null,
           input.baseSha ?? null,
           input.resultSha ?? null,
+          skillsJson,
           now,
         );
       return this.getRun(id);
@@ -1885,6 +1943,16 @@ export class StateStore {
         throw new Error('Migration 8 left foreign-key violations.');
       }
     }
+    if (!applied.has(9)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          ALTER TABLE work_items ADD COLUMN skill_source_sha TEXT;
+          ALTER TABLE provider_sessions ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';
+          ALTER TABLE provider_runs ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]';
+        `);
+        this.recordMigration(9);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -2102,6 +2170,9 @@ export class StateStore {
       updatedAt: String(row.updated_at),
     };
     if (row.current_branch !== null) record.currentBranch = String(row.current_branch);
+    if (row.skill_source_sha !== null) {
+      record.skillSourceSha = String(row.skill_source_sha);
+    }
     if (row.current_sha !== null) record.currentSha = String(row.current_sha);
     if (row.pull_request !== null) record.pullRequest = Number(row.pull_request);
     return record;
@@ -2114,6 +2185,7 @@ export class StateStore {
       provider: String(row.provider) as ProviderName,
       providerSessionId: String(row.provider_session_id),
       status: String(row.status) as SessionRecord['status'],
+      skills: parseResolvedSkills(String(row.skills_json)),
       lastActivityAt: String(row.last_activity_at),
     };
     if (row.provider_url !== null) record.providerUrl = String(row.provider_url);
@@ -2134,6 +2206,7 @@ export class StateStore {
       correlationId: String(row.correlation_id),
       delegationDepth: Number(row.delegation_depth),
       startedAt: String(row.started_at),
+      skills: parseResolvedSkills(String(row.skills_json)),
     };
     if (row.prompt !== null) record.prompt = String(row.prompt);
     if (row.origin_provider !== null) {

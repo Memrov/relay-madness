@@ -223,7 +223,14 @@ export function serializeResolvedSkills(
   skills: readonly ResolvedSkill[],
 ): string {
   validateResolvedSkills(skills);
-  return JSON.stringify(skills);
+  return JSON.stringify(
+    skills.map(({ name, path, sourceSha, treeSha }) => ({
+      name,
+      path,
+      sourceSha,
+      treeSha,
+    })),
+  );
 }
 
 function validateSkillDocument(expectedName: string, source: string): void {
