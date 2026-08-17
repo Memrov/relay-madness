@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+
+const args = process.argv.slice(2);
+const scenario = process.env.FAKE_CLAUDE_SCENARIO ?? 'start';
+const log = process.env.FAKE_COMMAND_LOG;
+if (log) appendFileSync(log, `${JSON.stringify(args)}\n`);
+
+if (args[0] === 'auth' && args[1] === 'status') {
+  process.stdout.write(JSON.stringify({
+    loggedIn: scenario !== 'logged-out',
+    authMethod: scenario === 'logged-out' ? 'none' : 'claude.ai',
+    apiProvider: 'firstParty',
+  }));
+} else if (args[0] === '--version') {
+  process.stdout.write('2.1.217 (Claude Code)');
+} else if (args[0] === '--help') {
+  process.stdout.write('--cloud Start or attach to an existing cloud session');
+} else if (args[0] === '--cloud' && args.length === 2) {
+  if (scenario === 'malformed') {
+    process.stdout.write('cloud session launched');
+  } else if (scenario === 'attach') {
+    process.exitCode = 0;
+  } else {
+    process.stdout.write('Session created: https://claude.ai/code/session_abc123');
+  }
+} else if (args[0] === '-p') {
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    session_id: 'session_abc123',
+    url: 'https://claude.ai/code/session_abc123',
+  }));
+} else {
+  process.stderr.write(`unsupported fake claude command: ${args.join(' ')}`);
+  process.exitCode = 2;
+}
