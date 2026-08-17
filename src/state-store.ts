@@ -509,16 +509,13 @@ export class StateStore {
     if (!isValidDate(now)) {
       throw new RelayError('invalid_argument', 'Lease time must be a valid date.');
     }
-    const nowText = now.toISOString();
-    return this.database.transaction(() => {
-      this.database
-        .prepare('DELETE FROM account_leases WHERE account_id = ? AND expires_at <= ?')
-        .run(accountId, nowText);
-      const row = this.database
-        .prepare('SELECT COUNT(*) AS count FROM account_leases WHERE account_id = ?')
-        .get(accountId) as SqlRow;
-      return Number(row.count);
-    }).immediate();
+    const row = this.database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM account_leases
+         WHERE account_id = ? AND expires_at > ?`,
+      )
+      .get(accountId, now.toISOString()) as SqlRow;
+    return Number(row.count);
   }
 
   acquireAccountLease(
@@ -1569,6 +1566,33 @@ export class StateStore {
         this.recordMigration(6);
       }).immediate();
     }
+    if (!applied.has(7)) {
+      this.database.transaction(() => {
+        const workItems = this.database
+          .prepare('SELECT id, base_branch, integration_branch FROM work_items')
+          .all() as SqlRow[];
+        const updateWorkItem = this.database.prepare(
+          'UPDATE work_items SET integration_branch = ?, updated_at = ? WHERE id = ?',
+        );
+        const now = new Date().toISOString();
+        for (const row of workItems) {
+          const id = String(row.id);
+          const baseBranch = String(row.base_branch);
+          const integrationBranch = nullableString(row.integration_branch);
+          if (isDedicatedIntegrationBranch(integrationBranch, baseBranch)) continue;
+          updateWorkItem.run(integrationBranchFor(id, baseBranch), now, id);
+        }
+        this.database.exec(`
+          UPDATE candidates
+          SET integration_branch = (
+            SELECT work_items.integration_branch
+            FROM work_items
+            WHERE work_items.id = candidates.work_item_id
+          );
+        `);
+        this.recordMigration(7);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -1799,9 +1823,9 @@ function isDedicatedIntegrationBranch(
 ): branch is string {
   return (
     branch !== undefined &&
-    branch.length > 0 &&
-    branch !== baseBranch &&
-    !isRelayCandidateBranch(branch)
+    branch.startsWith('relay/work/') &&
+    branch.length > 'relay/work/'.length &&
+    branch !== baseBranch
   );
 }
 

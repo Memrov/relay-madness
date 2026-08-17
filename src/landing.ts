@@ -488,12 +488,9 @@ function candidateCommitMessage(candidate: CandidateRecord): string {
 
 function isSafeIntegrationBranch(branch: string, baseBranch: string): boolean {
   return (
-    branch.length > 0 &&
-    branch !== baseBranch &&
-    branch !== 'relay/run' &&
-    !branch.startsWith('relay/run/') &&
-    branch !== 'relay/stage' &&
-    !branch.startsWith('relay/stage/')
+    branch.startsWith('relay/work/') &&
+    branch.length > 'relay/work/'.length &&
+    branch !== baseBranch
   );
 }
 

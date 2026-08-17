@@ -176,6 +176,32 @@ function createPopulatedV4DatabaseWithNullBranch(): string {
   return path;
 }
 
+function createMalformedV6Database(): string {
+  const path = databasePath();
+  const store = StateStore.open(path);
+  const project = store.upsertProject({
+    repo: 'acme/malformed-v6',
+    defaultBranch: 'develop',
+    locatorPath: '/tmp/malformed-v6',
+  });
+  const workItem = store.createWorkItem({
+    id: 'work-v6',
+    projectId: project.id,
+    title: 'Malformed integration',
+    baseBranch: 'develop',
+    currentBranch: 'develop',
+  });
+  store.close();
+
+  const database = new Database(path);
+  database
+    .prepare('UPDATE work_items SET integration_branch = ? WHERE id = ?')
+    .run('main', workItem.id);
+  database.prepare('DELETE FROM schema_migrations WHERE version = ?').run(7);
+  database.close();
+  return path;
+}
+
 function storeWithAccount(
   id: string,
   provider: 'claude' | 'codex' | 'jules',
@@ -657,7 +683,7 @@ test('applies ordered schema migrations', () => {
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3, 4, 5, 6],
+    [1, 2, 3, 4, 5, 6, 7],
   );
   assert.ok(runColumns.some(({ name }) => name === 'baseline_sha'));
   assert.ok(runColumns.some(({ name }) => name === 'account_id'));
@@ -698,6 +724,16 @@ test('preserves a null legacy current branch while backfilling integration', () 
   assert.equal(workItem.currentBranch, undefined);
   assert.equal(workItem.currentSha, undefined);
   assert.equal(workItem.pullRequest, undefined);
+  store.close();
+});
+
+test('repairs a malformed legacy integration branch that points at main', () => {
+  const store = StateStore.open(createMalformedV6Database());
+
+  const workItem = store.getWorkItem('work-v6');
+  assert.equal(workItem.baseBranch, 'develop');
+  assert.match(workItem.integrationBranch, /^relay\/work\//);
+  assert.notEqual(workItem.integrationBranch, 'main');
   store.close();
 });
 
@@ -909,6 +945,34 @@ test('enforces account capacity transactionally and reclaims stale leases', () =
   assert.equal(replacement.runId, 'run-b');
   store.releaseAccountLease('codex-a', 'run-b');
   store.close();
+});
+
+test('counts only unexpired account leases without reclaiming expired rows', () => {
+  const path = databasePath();
+  const store = StateStore.open(path);
+  store.upsertProviderAccount({
+    id: 'codex-a',
+    provider: 'codex',
+    label: 'Primary',
+    profilePath: '/profiles/codex-a',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: true,
+  });
+  store.acquireAccountLease('codex-a', 'run-a', new Date('2026-08-16T10:00:00Z'));
+
+  assert.equal(
+    store.countActiveAccountLeases('codex-a', new Date('2026-08-16T11:00:01Z')),
+    0,
+  );
+  store.close();
+
+  const database = new Database(path, { readonly: true });
+  const row = database
+    .prepare('SELECT COUNT(*) AS count FROM account_leases WHERE account_id = ?')
+    .get('codex-a') as { count: number };
+  database.close();
+  assert.equal(row.count, 1);
 });
 
 test('does not acquire leases from disabled or authentication-required accounts', () => {

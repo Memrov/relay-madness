@@ -161,6 +161,27 @@ test('lands a read-first WorkItem on its reserved integration branch, never base
   assert.equal(fixture.remoteSha('main'), fixture.integrationBefore);
 });
 
+test('rejects malformed candidate state that targets main when the base is develop', async () => {
+  const fixture = await createLandingRepository();
+  const mainBefore = fixture.remoteSha('main');
+  const getCandidate = fixture.store.getCandidate.bind(fixture.store);
+  const getWorkItem = fixture.store.getWorkItem.bind(fixture.store);
+  fixture.store.getCandidate = (runId) => {
+    const candidate = getCandidate(runId);
+    return candidate === undefined ? undefined : { ...candidate, integrationBranch: 'main' };
+  };
+  fixture.store.getWorkItem = (workItemId) => ({
+    ...getWorkItem(workItemId),
+    baseBranch: 'develop',
+  });
+
+  const result = await fixture.lander.land(fixture.runId);
+
+  assert.equal(result.status, 'stale');
+  assert.equal(fixture.remoteSha('main'), mainBefore);
+  assert.equal(fixture.runner.commands.length, 0);
+});
+
 test('leaves integration unchanged on textual conflict', async () => {
   const fixture = await createConflictingLandingRepository();
 
