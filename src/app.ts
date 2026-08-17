@@ -17,7 +17,11 @@ import { CodexProvider } from './providers/codex.js';
 import { JulesProvider } from './providers/jules.js';
 import { RelayCore } from './relay-core.js';
 import { runRepl } from './repl.js';
-import { GitSkillResolver } from './skills.js';
+import {
+  GitSkillResolver,
+  MAX_SELECTED_SKILLS,
+  SKILL_NAME_PATTERN,
+} from './skills.js';
 import {
   StateStore,
   type CandidateRecord,
@@ -241,6 +245,7 @@ export function createCli(
     .option('--work-item <id>', 'existing WorkItem ID')
     .option('--account <id>', 'provider account ID')
     .option('--model <model>', 'provider model identifier')
+    .addOption(skillOption())
     .addOption(modeOption('write'))
     .option('--json', 'print machine-readable JSON')
     .action(async (providerText: string, task: string, commandOptions) => {
@@ -261,6 +266,7 @@ export function createCli(
         ...(commandOptions.model === undefined
           ? {}
           : { model: commandOptions.model as string }),
+        ...skillSelection(commandOptions.skill),
       });
       writeResult(io, result, commandOptions.json === true);
     });
@@ -299,6 +305,7 @@ export function createCli(
     .option('--work-item <id>', 'WorkItem ID')
     .option('--account <id>', 'provider account ID')
     .option('--model <model>', 'provider model identifier')
+    .addOption(skillOption())
     .addOption(modeOption('read'))
     .option('--json', 'print machine-readable JSON')
     .action(async (providerText: string, instruction: string, commandOptions) => {
@@ -313,6 +320,7 @@ export function createCli(
         ...(commandOptions.model === undefined
           ? {}
           : { model: commandOptions.model as string }),
+        ...skillSelection(commandOptions.skill),
       });
       writeResult(io, result, commandOptions.json === true);
     });
@@ -563,9 +571,20 @@ export function createCli(
       .description(`Send to ${titleCase(provider)} or start its current session`)
       .argument('<message>', 'message or task')
       .option('--new', 'force a new WorkItem')
+      .addOption(skillOption())
       .addOption(modeOption('read'))
       .option('--json', 'print machine-readable JSON')
       .action(async (message: string, commandOptions) => {
+        const selectedSkills = skillSelection(commandOptions.skill);
+        if (
+          commandOptions.new !== true &&
+          selectedSkills.skills !== undefined
+        ) {
+          throw new RelayError(
+            'invalid_argument',
+            `--skill requires --new on the ${provider} shortcut.`,
+          );
+        }
         const result =
           commandOptions.new === true
             ? await core.delegate({
@@ -573,6 +592,7 @@ export function createCli(
                 task: message,
                 cwd: io.cwd(),
                 mode: commandOptions.mode as MutationMode,
+                ...selectedSkills,
               })
             : await sendOrDelegate(
                 core,
@@ -641,6 +661,40 @@ function modeOption(defaultValue: MutationMode): Option {
   return new Option('--mode <mode>', 'read or write')
     .choices(['read', 'write'])
     .default(defaultValue);
+}
+
+function skillOption(): Option {
+  return new Option(
+    '--skill <name>',
+    'repository Agent Skill to attach (repeatable)',
+  ).argParser((value: string, previous: string[] | undefined) => {
+    if (!SKILL_NAME_PATTERN.test(value)) {
+      throw new RelayError(
+        'invalid_argument',
+        `Invalid skill name ${JSON.stringify(value)}. Use lowercase kebab-case.`,
+      );
+    }
+    const selected = previous ?? [];
+    if (selected.includes(value)) {
+      throw new RelayError(
+        'invalid_argument',
+        `Skill ${value} was selected more than once.`,
+      );
+    }
+    if (selected.length >= MAX_SELECTED_SKILLS) {
+      throw new RelayError(
+        'invalid_argument',
+        `At most ${MAX_SELECTED_SKILLS} skills may be selected.`,
+      );
+    }
+    return [...selected, value];
+  });
+}
+
+function skillSelection(value: unknown): { skills?: readonly string[] } {
+  return Array.isArray(value) && value.length > 0
+    ? { skills: value as readonly string[] }
+    : {};
 }
 
 function writeHealth(

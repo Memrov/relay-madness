@@ -5,10 +5,26 @@ import * as z from 'zod/v4';
 import type { RelayApi } from './app.js';
 import { RelayError, redact } from './errors.js';
 import type { MutationMode, ProviderName } from './provider.js';
+import {
+  MAX_SELECTED_SKILLS,
+  SKILL_NAME_PATTERN,
+} from './skills.js';
 
 const providerSchema = z.enum(['claude', 'codex', 'jules']);
 const modeSchema = z.enum(['read', 'write']);
 const workItemSchema = z.string().min(1).default('current');
+const skillsSchema = z
+  .array(z.string().regex(SKILL_NAME_PATTERN))
+  .max(MAX_SELECTED_SKILLS)
+  .refine((skills) => new Set(skills).size === skills.length, {
+    message: 'Skill names must be unique.',
+  });
+const resolvedSkillSchema = z.object({
+  name: z.string().regex(SKILL_NAME_PATTERN),
+  path: z.string(),
+  sourceSha: z.string().regex(/^[0-9a-f]{40}$/i),
+  treeSha: z.string().regex(/^[0-9a-f]{40}$/i),
+});
 const outputSchema = z.object({
   workItem: z.string(),
   repo: z.string(),
@@ -46,6 +62,7 @@ const outputSchema = z.object({
       conflictFiles: z.array(z.string()),
     }),
   ).optional(),
+  skills: z.array(resolvedSkillSchema).optional(),
 });
 
 const accountsOutputSchema = z.object({
@@ -117,6 +134,7 @@ export function createRelayMcpServer(
           parentRunId: z.string().min(1).optional(),
           account: z.string().min(1).optional(),
           model: z.string().min(1).optional(),
+          skills: skillsSchema.optional(),
         })
         .strict(),
       outputSchema,
@@ -127,7 +145,17 @@ export function createRelayMcpServer(
         openWorldHint: true,
       },
     },
-    async ({ provider, task, workItem, title, mode, parentRunId, account, model }) => {
+    async ({
+      provider,
+      task,
+      workItem,
+      title,
+      mode,
+      parentRunId,
+      account,
+      model,
+      skills,
+    }) => {
       return await executeTool(async () => {
         const result = await delegateCurrentOrNew(core, {
           provider,
@@ -139,6 +167,7 @@ export function createRelayMcpServer(
           ...(parentRunId === undefined ? {} : { parentRunId }),
           ...(account === undefined ? {} : { accountId: account }),
           ...(model === undefined ? {} : { model }),
+          ...(skills === undefined ? {} : { skills }),
         });
         return publicRun(result);
       });
@@ -201,6 +230,7 @@ export function createRelayMcpServer(
           parentRunId: z.string().min(1).optional(),
           account: z.string().min(1).optional(),
           model: z.string().min(1).optional(),
+          skills: skillsSchema.optional(),
         })
         .strict(),
       outputSchema,
@@ -211,7 +241,16 @@ export function createRelayMcpServer(
         openWorldHint: true,
       },
     },
-    async ({ provider, instruction, workItem, mode, parentRunId, account, model }) => {
+    async ({
+      provider,
+      instruction,
+      workItem,
+      mode,
+      parentRunId,
+      account,
+      model,
+      skills,
+    }) => {
       return await executeTool(async () => {
         const result = await core.handoff({
           provider,
@@ -221,6 +260,7 @@ export function createRelayMcpServer(
           ...(parentRunId === undefined ? {} : { parentRunId }),
           ...(account === undefined ? {} : { accountId: account }),
           ...(model === undefined ? {} : { model }),
+          ...(skills === undefined ? {} : { skills }),
         });
         return publicRun(result);
       });
@@ -316,6 +356,7 @@ async function delegateCurrentOrNew(
     parentRunId?: string;
     accountId?: string;
     model?: string;
+    skills?: readonly string[];
     cwd: string;
   },
 ) {
@@ -330,6 +371,7 @@ async function delegateCurrentOrNew(
       : { parentRunId: input.parentRunId }),
     ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
     ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.skills === undefined ? {} : { skills: input.skills }),
   };
   if (input.workItem !== undefined && input.workItem !== 'current') {
     return await core.delegate({ ...base, workItemId: input.workItem });
@@ -362,6 +404,7 @@ function publicRun(result: Awaited<ReturnType<RelayApi['delegate']>>) {
     sha: result.artifact?.sha,
     pullRequest: result.artifact?.pullRequest,
     checks: result.artifact?.checks,
+    skills: result.run.skills.length === 0 ? undefined : result.run.skills,
   });
 }
 

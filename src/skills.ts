@@ -8,8 +8,8 @@ import { RelayError } from './errors.js';
 import { ProcessRunner, type ProcessResult } from './process-runner.js';
 
 const FULL_SHA = /^[0-9a-f]{40}$/i;
-const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const MAX_SKILLS = 32;
+export const SKILL_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+export const MAX_SELECTED_SKILLS = 32;
 const RESOLVED_SKILL_KEYS = ['name', 'path', 'sourceSha', 'treeSha'] as const;
 const PROTECTED_PATHS = [
   'AGENTS.md',
@@ -294,10 +294,10 @@ function validateSkillDocument(expectedName: string, source: string): void {
 }
 
 function validateResolvedSkills(value: readonly unknown[]): asserts value is readonly ResolvedSkill[] {
-  if (value.length > MAX_SKILLS) {
+  if (value.length > MAX_SELECTED_SKILLS) {
     throw new RelayError(
       'invalid_argument',
-      `At most ${MAX_SKILLS} skills may be selected.`,
+      `At most ${MAX_SELECTED_SKILLS} skills may be selected.`,
     );
   }
   const names = new Set<string>();
@@ -315,7 +315,7 @@ function validateResolvedSkills(value: readonly unknown[]): asserts value is rea
     }
     if (
       typeof candidate.name !== 'string' ||
-      !SKILL_NAME.test(candidate.name) ||
+      !SKILL_NAME_PATTERN.test(candidate.name) ||
       typeof candidate.path !== 'string' ||
       candidate.path !== `.agents/skills/${candidate.name}` ||
       typeof candidate.sourceSha !== 'string' ||
@@ -331,15 +331,15 @@ function validateResolvedSkills(value: readonly unknown[]): asserts value is rea
 }
 
 function assertSkillNames(names: readonly string[]): void {
-  if (names.length > MAX_SKILLS) {
+  if (names.length > MAX_SELECTED_SKILLS) {
     throw new RelayError(
       'invalid_argument',
-      `At most ${MAX_SKILLS} skills may be selected.`,
+      `At most ${MAX_SELECTED_SKILLS} skills may be selected.`,
     );
   }
   const seen = new Set<string>();
   for (const name of names) {
-    if (!SKILL_NAME.test(name)) {
+    if (!SKILL_NAME_PATTERN.test(name)) {
       throw new RelayError(
         'invalid_argument',
         `Invalid skill name ${JSON.stringify(name)}. Use lowercase kebab-case.`,

@@ -54,7 +54,7 @@ interface HandoffInput {
 }
 ```
 
-The CLI exposes repeatable `--skill <name>` flags on delegation, handoff, new-session, and provider shortcut commands. MCP adds an optional `skills: string[]` field to `relay_delegate` and `relay_handoff`. Strict schemas continue to reject unknown fields.
+The CLI exposes repeatable `--skill <name>` flags on delegation and handoff commands. Provider shortcut commands accept them only with `--new`, which prevents mutation of an existing session. The REPL accepts the explicit `/new [provider] --skill <name> -- <instruction>` and `/handoff <provider> --skill <name> -- <instruction>` forms. MCP adds an optional `skills: string[]` field to `relay_delegate` and `relay_handoff`. Strict schemas continue to reject unknown fields.
 
 `relay_send` does not change a session's skill set. A started provider session owns an immutable resolved skill selection. Continuing that session retains the provider conversation that already received the skill packet. To use a different selection, the caller starts a new provider session. This avoids hidden skill mutation during recovery and makes every session reproducible.
 
@@ -62,7 +62,7 @@ An omitted list and an empty list both mean no selected skills for a new session
 
 ## Trusted resolution
 
-The first skill-bearing session for a WorkItem pins `skill_source_sha` to the exact current SHA of the WorkItem base branch. Later skill-bearing sessions in that WorkItem reuse the same SHA, even if the base branch advances.
+The first successfully resolved skill selection for a WorkItem pins `skill_source_sha` to the exact current SHA of the WorkItem base branch. Later skill-bearing sessions in that WorkItem reuse the same SHA, even if the base branch advances.
 
 Relay resolves that base-branch SHA through GitHub, then fetches the exact object into the locator checkout without changing its branch or working tree. Git commands use the same hook-disabled process boundary as landing operations. The local repository is an object cache; GitHub remains the authority for the pinned ref.
 
@@ -176,9 +176,9 @@ Marketplace search, remote skill installation, signatures, publisher reputation,
 
 Skill failures use stable typed errors:
 
-- `invalid_input` for malformed or duplicate names;
+- `invalid_argument` for malformed or duplicate names;
 - `not_found` for a skill absent from the pinned source commit;
-- `invalid_provider_output` is never used for local skill parsing failures;
+- `provider_output_invalid` is reserved for structurally invalid Git command output, never YAML/frontmatter validation;
 - `instruction_surface_changed` for protected candidate modifications;
 - `state_conflict` when an existing immutable WorkItem or session skill pin would be replaced.
 
