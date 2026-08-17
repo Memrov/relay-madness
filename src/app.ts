@@ -17,6 +17,7 @@ import { CodexProvider } from './providers/codex.js';
 import { JulesProvider } from './providers/jules.js';
 import { RelayCore } from './relay-core.js';
 import { runRepl } from './repl.js';
+import { GitSkillResolver } from './skills.js';
 import {
   StateStore,
   type CandidateRecord,
@@ -108,6 +109,7 @@ export function createRelayApplication(options: {
     store,
     github,
     providers,
+    skillResolver: new GitSkillResolver(runner),
     storePrompts: env.RELAY_STORE_PROMPTS !== 'false',
   });
   const landing = new LandingCoordinator({ store, github, runner });

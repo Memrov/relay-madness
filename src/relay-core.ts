@@ -12,6 +12,11 @@ import type {
   ProviderName,
   ProviderRunStatus,
 } from './provider.js';
+import {
+  appendSkillPacket,
+  type ResolvedSkill,
+  type SkillResolver,
+} from './skills.js';
 import type {
   ArtifactInput,
   ArtifactRecord,
@@ -29,6 +34,7 @@ export interface RelayCoreDependencies {
   store: StateStore;
   github: GitHubClient;
   providers: ReadonlyMap<ProviderName, CloudProvider>;
+  skillResolver: SkillResolver;
   storePrompts?: boolean;
   now?: () => Date;
 }
@@ -50,6 +56,7 @@ export interface DelegateInput {
   workItemId?: string;
   mode?: MutationMode;
   parentRunId?: string;
+  skills?: readonly string[];
 }
 
 export interface SendInput {
@@ -72,6 +79,7 @@ export interface HandoffInput {
   cwd?: string;
   mode?: MutationMode;
   parentRunId?: string;
+  skills?: readonly string[];
 }
 
 export interface WorkItemSelector {
@@ -139,6 +147,7 @@ interface StartExecutionInput {
   startBranch: string;
   expectedBranch: string;
   pinnedSha?: string;
+  skills: readonly ResolvedSkill[];
 }
 
 const ACTIVE_RUN_STATUSES = new Set<ProviderRunStatus>(['queued', 'running']);
@@ -203,6 +212,7 @@ export class RelayCore {
   async delegate(input: DelegateInput): Promise<RelayRunResult> {
     const mode = input.mode ?? 'write';
     const context = await this.contextForDelegation(input);
+    const skills = await this.resolveSkills(context, input.skills);
     const prompt = buildDelegationPrompt({
       task: input.task,
       project: context.project,
@@ -225,6 +235,7 @@ export class RelayCore {
         context.workItem.currentBranch ?? context.workItem.baseBranch,
       expectedBranch:
         context.workItem.currentBranch ?? context.workItem.baseBranch,
+      skills,
     });
   }
 
@@ -281,6 +292,7 @@ export class RelayCore {
           context.workItem.currentBranch ?? context.workItem.baseBranch,
         expectedBranch:
           context.workItem.currentBranch ?? context.workItem.baseBranch,
+        skills: [],
       });
     }
 
@@ -299,6 +311,11 @@ export class RelayCore {
           ? {}
           : { pullRequest: artifact.pullRequest }),
       });
+      await this.assertInstructionSurfaceSafe(
+        context,
+        artifact?.sha,
+        session.skills,
+      );
       return await this.executeStart({
         provider: input.provider,
         ...(selectedAccount === undefined ? {} : { accountId: selectedAccount.id }),
@@ -315,6 +332,7 @@ export class RelayCore {
           context.workItem.currentBranch ?? context.workItem.baseBranch,
         expectedBranch:
           context.workItem.currentBranch ?? context.workItem.baseBranch,
+        skills: session.skills,
       });
     }
 
@@ -487,6 +505,8 @@ export class RelayCore {
     }
 
     const mode = input.mode ?? 'read';
+    const skills = await this.resolveSkills(context, input.skills);
+    await this.assertInstructionSurfaceSafe(context, artifact.sha, skills);
     const prompt = buildHandoffPacket({
       repo: context.project.repo,
       title: context.workItem.title,
@@ -517,6 +537,7 @@ export class RelayCore {
       startBranch: artifact.branch,
       expectedBranch: artifact.branch,
       ...(mode === 'read' ? { pinnedSha: artifact.sha } : {}),
+      skills,
     });
     return { ...result, prompt };
   }
@@ -887,6 +908,76 @@ export class RelayCore {
     return { project, workItem };
   }
 
+  private async resolveSkills(
+    context: WorkContext,
+    names: readonly string[] | undefined,
+  ): Promise<readonly ResolvedSkill[]> {
+    if (names === undefined || names.length === 0) return [];
+
+    let sourceSha = context.workItem.skillSourceSha;
+    if (sourceSha === undefined) {
+      sourceSha = await this.dependencies.github.getBranchSha(
+        context.project.repo,
+        context.workItem.baseBranch,
+      );
+      if (sourceSha === undefined) {
+        throw new RelayError(
+          'not_found',
+          `Base branch ${context.workItem.baseBranch} has no remote head for skill resolution.`,
+        );
+      }
+    }
+    const resolved = await this.dependencies.skillResolver.resolve({
+      repositoryPath: context.project.locatorPath,
+      sourceSha,
+      names,
+    });
+    this.dependencies.store.pinWorkItemSkillSource(
+      context.workItem.id,
+      sourceSha,
+    );
+    return resolved;
+  }
+
+  private async assertInstructionSurfaceSafe(
+    context: WorkContext,
+    candidateSha: string | undefined,
+    skills: readonly ResolvedSkill[],
+  ): Promise<void> {
+    const trustedSha = this.dependencies.store.getWorkItem(
+      context.workItem.id,
+    ).skillSourceSha;
+    if (trustedSha === undefined) {
+      if (skills.length === 0) return;
+      throw new RelayError(
+        'state_conflict',
+        `WorkItem ${context.workItem.id} has skills without a trusted source commit.`,
+        { workItemId: context.workItem.id },
+      );
+    }
+    if (skills.some((skill) => skill.sourceSha !== trustedSha)) {
+      throw new RelayError(
+        'state_conflict',
+        `WorkItem ${context.workItem.id} has inconsistent stored skill coordinates.`,
+        { workItemId: context.workItem.id },
+      );
+    }
+    if (candidateSha === undefined) return;
+    const changedPaths =
+      await this.dependencies.skillResolver.changedInstructionPaths({
+        repositoryPath: context.project.locatorPath,
+        trustedSha,
+        candidateSha,
+      });
+    if (changedPaths.length > 0) {
+      throw new RelayError(
+        'instruction_surface_changed',
+        'The candidate changes agent instruction surfaces and requires human review before another provider can continue.',
+        { changedPaths: [...changedPaths] },
+      );
+    }
+  }
+
   private async executeStart(
     input: StartExecutionInput,
   ): Promise<RelayRunResult> {
@@ -947,6 +1038,7 @@ export class RelayCore {
         : input.mode === 'write'
           ? `${input.prompt}\n\nTarget branch: ${expectedBranch}\nPush durable code changes only to the target GitHub branch. Do not merge.`
           : input.prompt;
+    const providerPrompt = appendSkillPacket(executionPrompt, input.skills);
     const pendingSession = this.dependencies.store.upsertSession({
       workItemId: input.workItem.id,
       provider: input.provider,
@@ -954,6 +1046,7 @@ export class RelayCore {
       providerSessionId: `pending:${randomUUID()}`,
       status: 'pending',
       branch: expectedBranch,
+      skills: input.skills,
     });
     let run: RunRecord;
     try {
@@ -962,7 +1055,7 @@ export class RelayCore {
         sessionId: pendingSession.id,
         provider: input.provider,
         type: input.type,
-        ...(this.storePrompts ? { prompt: executionPrompt } : {}),
+        ...(this.storePrompts ? { prompt: providerPrompt } : {}),
         mutationMode: input.mode,
         expectedBranch,
         ...(baseSha === undefined ? {} : { baselineSha: baseSha, baseSha }),
@@ -993,7 +1086,7 @@ export class RelayCore {
       run = this.dependencies.store.prepareRunLaunch(run.id, launchAttemptId);
       launchPrepared = true;
       const execution = await provider.start({
-        prompt: executionPrompt,
+        prompt: providerPrompt,
         cwd: input.project.locatorPath,
         mode: input.mode,
         startingBranch: input.startBranch,

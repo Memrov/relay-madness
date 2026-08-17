@@ -22,6 +22,12 @@ import type {
 } from '../src/provider.js';
 import { ProcessRunner } from '../src/process-runner.js';
 import { RelayCore } from '../src/relay-core.js';
+import type {
+  InstructionSurfaceInput,
+  ResolvedSkill,
+  ResolveSkillsInput,
+  SkillResolver,
+} from '../src/skills.js';
 import { StateStore } from '../src/state-store.js';
 
 const roots: string[] = [];
@@ -96,6 +102,31 @@ class FakeProvider implements CloudProvider {
   }
 }
 
+class FakeSkillResolver implements SkillResolver {
+  readonly resolutions: ResolveSkillsInput[] = [];
+  readonly instructionChecks: InstructionSurfaceInput[] = [];
+  changedPaths: readonly string[] = [];
+  resolutionError?: RelayError;
+
+  async resolve(input: ResolveSkillsInput): Promise<readonly ResolvedSkill[]> {
+    this.resolutions.push({ ...input, names: [...input.names] });
+    if (this.resolutionError !== undefined) throw this.resolutionError;
+    return input.names.map((name, index) => ({
+      name,
+      path: `.agents/skills/${name}`,
+      sourceSha: input.sourceSha,
+      treeSha: String(index + 1).repeat(40),
+    }));
+  }
+
+  async changedInstructionPaths(
+    input: InstructionSurfaceInput,
+  ): Promise<readonly string[]> {
+    this.instructionChecks.push({ ...input });
+    return this.changedPaths;
+  }
+}
+
 async function relayHarness(
   options: {
     githubScenario?: string;
@@ -117,6 +148,7 @@ async function relayHarness(
   const claude = new FakeProvider('claude');
   const codex = new FakeProvider('codex');
   const jules = new FakeProvider('jules');
+  const skillResolver = new FakeSkillResolver();
   for (const provider of [claude, codex, jules]) {
     provider.startStatus = options.providerStatus ?? 'running';
     provider.onStart = (input) => {
@@ -131,6 +163,7 @@ async function relayHarness(
       ['codex', codex],
       ['jules', jules],
     ]),
+    skillResolver,
     storePrompts: options.storePrompts ?? true,
     ...(options.now === undefined ? {} : { now: options.now }),
   });
@@ -142,6 +175,7 @@ async function relayHarness(
     claude,
     codex,
     jules,
+    skillResolver,
     setGithubScenario(scenario: string) {
       env.FAKE_GH_SCENARIO = scenario;
     },
@@ -972,6 +1006,272 @@ test('builds a handoff from the reconciled SHA without copying the original prom
   assert.match(result.prompt, new RegExp(`Source commit: ${'b'.repeat(40)}`));
   assert.match(result.prompt, /Instruction: Add edge-case tests/);
   assert.doesNotMatch(result.prompt, /secret transcript detail/);
+});
+
+test('pins, persists, and sends explicit skills before provider launch', async () => {
+  const harness = await relayHarness();
+
+  const result = await harness.core.delegate({
+    provider: 'claude',
+    task: 'Review auth',
+    title: 'Auth',
+    cwd: harness.cwd,
+    mode: 'read',
+    skills: ['write-tests', 'review-security'],
+  });
+
+  assert.deepEqual(harness.skillResolver.resolutions, [
+    {
+      repositoryPath: harness.cwd,
+      sourceSha: 'b'.repeat(40),
+      names: ['write-tests', 'review-security'],
+    },
+  ]);
+  assert.equal(result.workItem.skillSourceSha, 'b'.repeat(40));
+  assert.deepEqual(result.session.skills, result.run.skills);
+  assert.deepEqual(
+    result.run.skills.map(({ name }) => name),
+    ['write-tests', 'review-security'],
+  );
+  assert.match(
+    harness.claude.starts[0]?.prompt ?? '',
+    /Relay-selected skills[\s\S]*source commit: b{40}/,
+  );
+  assert.equal(
+    (harness.claude.starts[0]?.prompt.match(/Relay-selected skills/g) ?? [])
+      .length,
+    1,
+  );
+});
+
+test('reuses one WorkItem skill pin and identical coordinates across accounts', async () => {
+  const harness = await relayHarness();
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  addAccount(harness.store, { id: 'claude-b', provider: 'claude' });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'First review',
+    title: 'Shared review',
+    cwd: harness.cwd,
+    mode: 'read',
+    skills: ['review-security'],
+  });
+
+  harness.setGithubScenario('moved');
+  const second = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-b',
+    task: 'Independent review',
+    workItemId: first.workItem.id,
+    mode: 'read',
+    skills: ['review-security'],
+  });
+
+  assert.deepEqual(
+    harness.skillResolver.resolutions.map(({ sourceSha }) => sourceSha),
+    ['b'.repeat(40), 'b'.repeat(40)],
+  );
+  assert.deepEqual(first.session.skills, second.session.skills);
+  assert.equal(
+    harness.store.getWorkItem(first.workItem.id).skillSourceSha,
+    'b'.repeat(40),
+  );
+});
+
+test('rejects protected instruction changes before a skill-bearing handoff starts', async () => {
+  const harness = await relayHarness({ providerStatus: 'provider_complete' });
+  harness.claude.onStart = (input) => {
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
+    harness.setGithubScenario('published');
+  };
+  const original = await harness.core.delegate({
+    provider: 'claude',
+    task: 'Implement auth',
+    title: 'Auth',
+    cwd: harness.cwd,
+  });
+  harness.skillResolver.changedPaths = [
+    '.agents/skills/review-security/SKILL.md',
+  ];
+
+  await assert.rejects(
+    harness.core.handoff({
+      provider: 'codex',
+      instruction: 'Review it',
+      workItemId: original.workItem.id,
+      mode: 'read',
+      skills: ['review-security'],
+    }),
+    (error: unknown) =>
+      error instanceof RelayError &&
+      error.code === 'instruction_surface_changed' &&
+      (error.details?.changedPaths as readonly string[] | undefined)?.[0] ===
+        '.agents/skills/review-security/SKILL.md',
+  );
+  assert.equal(harness.codex.starts.length, 0);
+  assert.equal(
+    harness.store.getStatus(original.workItem.id).sessions.length,
+    1,
+  );
+});
+
+test('handoff does not inherit the source provider skill selection', async () => {
+  const harness = await relayHarness({ providerStatus: 'provider_complete' });
+  harness.claude.onStart = (input) => {
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
+    harness.setGithubScenario('published');
+  };
+  const original = await harness.core.delegate({
+    provider: 'claude',
+    task: 'Implement auth',
+    title: 'Auth',
+    cwd: harness.cwd,
+    skills: ['review-security'],
+  });
+
+  const handoff = await harness.core.handoff({
+    provider: 'jules',
+    instruction: 'Review it',
+    workItemId: original.workItem.id,
+    mode: 'read',
+  });
+
+  assert.deepEqual(handoff.session.skills, []);
+  assert.deepEqual(handoff.run.skills, []);
+  assert.doesNotMatch(harness.jules.starts[0]?.prompt ?? '', /Relay-selected skills/);
+  assert.equal(harness.skillResolver.resolutions.length, 1);
+});
+
+test('keeps instruction quarantine active when a later handoff selects no skills', async () => {
+  const harness = await relayHarness({ providerStatus: 'provider_complete' });
+  harness.claude.onStart = (input) => {
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
+    harness.setGithubScenario('published');
+  };
+  const original = await harness.core.delegate({
+    provider: 'claude',
+    task: 'Implement auth',
+    title: 'Auth',
+    cwd: harness.cwd,
+    skills: ['review-security'],
+  });
+  harness.skillResolver.changedPaths = ['AGENTS.md'];
+
+  await assert.rejects(
+    harness.core.handoff({
+      provider: 'codex',
+      instruction: 'Review it without a selected skill',
+      workItemId: original.workItem.id,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError &&
+      error.code === 'instruction_surface_changed',
+  );
+  assert.equal(harness.codex.starts.length, 0);
+});
+
+test('recovers with stored skill coordinates without resolving a newer base', async () => {
+  const harness = await relayHarness({ providerStatus: 'provider_complete' });
+  harness.claude.onStart = (input) => {
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
+    harness.setGithubScenario('published');
+  };
+  const delegated = await harness.core.delegate({
+    provider: 'claude',
+    task: 'Implement auth',
+    title: 'Auth',
+    cwd: harness.cwd,
+    skills: ['review-security'],
+  });
+  harness.store.upsertSession({
+    workItemId: delegated.workItem.id,
+    provider: 'claude',
+    providerSessionId: delegated.session.providerSessionId,
+    status: 'expired',
+  });
+  harness.setGithubScenario('moved');
+  harness.claude.onStart = (input) => {
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
+  };
+
+  const recovered = await harness.core.send({
+    provider: 'claude',
+    message: 'Continue',
+    workItemId: delegated.workItem.id,
+    mode: 'read',
+  });
+
+  assert.equal(harness.skillResolver.resolutions.length, 1);
+  assert.deepEqual(recovered.session.skills, delegated.session.skills);
+  assert.deepEqual(recovered.run.skills, delegated.run.skills);
+  assert.match(
+    harness.claude.starts[1]?.prompt ?? '',
+    new RegExp(`source commit: ${'b'.repeat(40)}`),
+  );
+  assert.equal(harness.skillResolver.instructionChecks.length, 1);
+});
+
+test('normal follow-up keeps stored skills without re-resolving or appending a packet', async () => {
+  const harness = await relayHarness();
+  const delegated = await harness.core.delegate({
+    provider: 'claude',
+    task: 'Review auth',
+    title: 'Auth',
+    cwd: harness.cwd,
+    mode: 'read',
+    skills: ['review-security'],
+  });
+
+  const followup = await harness.core.send({
+    provider: 'claude',
+    message: 'Check one more thing',
+    workItemId: delegated.workItem.id,
+    mode: 'read',
+  });
+
+  assert.equal(harness.skillResolver.resolutions.length, 1);
+  assert.deepEqual(followup.run.skills, delegated.run.skills);
+  assert.doesNotMatch(harness.claude.sends[0]?.message ?? '', /Relay-selected skills/);
+});
+
+test('skill resolution failure creates no session, run, lease, or provider launch', async () => {
+  const harness = await relayHarness();
+  const project = await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, {
+    id: 'claude-a',
+    provider: 'claude',
+    isDefault: true,
+  });
+  harness.skillResolver.resolutionError = new RelayError(
+    'not_found',
+    'Skill missing was not found.',
+  );
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      task: 'Review auth',
+      title: 'Auth',
+      workItemId: harness.store.createWorkItem({
+        projectId: project.id,
+        title: 'Auth',
+        baseBranch: 'main',
+        currentBranch: 'main',
+      }).id,
+      mode: 'read',
+      skills: ['missing'],
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'not_found',
+  );
+  const workItem = harness.store.getCurrentWorkItem(project.id)!;
+  const status = harness.store.getStatus(workItem.id);
+  assert.deepEqual(status.sessions, []);
+  assert.deepEqual(status.runs, []);
+  assert.equal(harness.claude.starts.length, 0);
+  assert.equal(harness.store.countActiveAccountLeases('claude-a'), 0);
 });
 
 test('does not hand off or report a stale artifact after its branch disappears', async () => {
