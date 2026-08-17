@@ -1101,6 +1101,45 @@ export class StateStore {
     }).immediate();
   }
 
+  rejectRunLaunch(id: string, attemptId: string): RunRecord {
+    return this.database.transaction(() => {
+      const run = this.getRun(id);
+      const owner = this.database
+        .prepare('SELECT launch_owner_id FROM provider_runs WHERE id = ?')
+        .get(id) as SqlRow;
+      if (
+        run.launchAttemptId !== attemptId ||
+        run.launchState !== 'prepared' ||
+        nullableString(owner.launch_owner_id) !== this.launchOwnerId
+      ) {
+        throw new RelayError(
+          'invalid_run_transition',
+          `Run ${id} does not have the prepared launch attempt ${attemptId}.`,
+        );
+      }
+      const rejectedAt = new Date().toISOString();
+      this.database
+        .prepare(
+          `UPDATE provider_runs
+           SET status = 'failed', finished_at = ?, launch_state = NULL,
+               launch_owner_id = NULL, launch_owner_pid = NULL
+           WHERE id = ?`,
+        )
+        .run(rejectedAt, id);
+      this.database
+        .prepare(
+          `UPDATE provider_sessions
+           SET status = 'failed', last_activity_at = ?
+           WHERE id = ? AND status = 'pending'`,
+        )
+        .run(rejectedAt, run.sessionId);
+      this.database
+        .prepare('DELETE FROM account_leases WHERE run_id = ?')
+        .run(id);
+      return this.getRun(id);
+    }).immediate();
+  }
+
   markRunLaunchUncertain(id: string, attemptId?: string): RunRecord {
     return this.database.transaction(() => {
       const run = this.getRun(id);

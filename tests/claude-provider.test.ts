@@ -59,8 +59,7 @@ test('starts a Claude cloud session and parses its documented URL', async () => 
   const execution = await provider.start({
     prompt: 'Implement auth',
     cwd,
-    startingBranch: 'relay/auth',
-    mode: 'write',
+    mode: 'read',
   });
 
   assert.deepEqual(execution, {
@@ -71,13 +70,77 @@ test('starts a Claude cloud session and parses its documented URL', async () => 
   assert.deepEqual(readCommands()[0], ['--cloud', 'Implement auth']);
 });
 
+test('starts Claude cloud through the interactive terminal it requires', async () => {
+  const { provider, cwd } = claudeForScenario('start-requires-tty');
+
+  const execution = await provider.start({
+    prompt: 'Inspect the repository',
+    cwd,
+    mode: 'read',
+  });
+
+  assert.deepEqual(execution, {
+    providerSessionId: 'session_abc123',
+    url: 'https://claude.ai/code/session_abc123',
+    status: 'running',
+  });
+});
+
+test('canonicalizes Claude cloud session links with CLI tracking metadata', async () => {
+  const { provider, cwd } = claudeForScenario('start-query-url');
+
+  const execution = await provider.start({
+    prompt: 'Inspect the repository',
+    cwd,
+    mode: 'read',
+  });
+
+  assert.deepEqual(execution, {
+    providerSessionId: 'session_abc123',
+    url: 'https://claude.ai/code/session_abc123',
+    status: 'running',
+  });
+});
+
+test('accepts documented cse cloud session IDs and their safe separators', async () => {
+  const { provider, cwd } = claudeForScenario('start-cse-url');
+
+  const execution = await provider.start({
+    prompt: 'Inspect the repository',
+    cwd,
+    mode: 'read',
+  });
+
+  assert.deepEqual(execution, {
+    providerSessionId: 'cse_abc-123_def',
+    url: 'https://claude.ai/code/cse_abc-123_def',
+    status: 'running',
+  });
+});
+
+test('selects the Claude session link after unrelated PTY output URLs', async () => {
+  const { provider, cwd } = claudeForScenario('start-prefixed-url');
+
+  const execution = await provider.start({
+    prompt: 'Inspect the repository',
+    cwd,
+    mode: 'read',
+  });
+
+  assert.deepEqual(execution, {
+    providerSessionId: 'session_abc123',
+    url: 'https://claude.ai/code/session_abc123',
+    status: 'running',
+  });
+});
+
 test('runs Claude with the selected config directory and model', async () => {
   const { provider, cwd, readCommands, readEnvironments } = claudeForScenario('start');
 
   await provider.start({
     prompt: 'Build it',
     cwd,
-    mode: 'write',
+    mode: 'read',
     profilePath: '/profiles/claude-a',
     model: 'opus',
   });
@@ -86,7 +149,28 @@ test('runs Claude with the selected config directory and model', async () => {
   assert.ok(readCommands()[0]?.includes('--model'));
 });
 
-test('sends a follow-up to the existing session', async () => {
+test('reports authentication independently of account-gated attachment', async () => {
+  const { provider } = claudeForScenario('start');
+
+  assert.deepEqual(await provider.authStatus(), {
+    authenticated: true,
+    method: 'claude.ai',
+  });
+  const capabilities = await provider.capabilities();
+  assert.equal(capabilities.start, true);
+  assert.equal(capabilities.interactiveAttach, false);
+  assert.equal(capabilities.structuredStatus, false);
+});
+
+test('advertises documented queue-and-exit cloud follow-up', async () => {
+  const { provider } = claudeForScenario('start');
+
+  const capabilities = await provider.capabilities();
+
+  assert.equal(capabilities.queueFollowup, true);
+});
+
+test('queues a follow-up to the existing Claude cloud session', async () => {
   const { provider, cwd, readCommands } = claudeForScenario('send');
 
   const execution = await provider.send!({
@@ -95,7 +179,11 @@ test('sends a follow-up to the existing session', async () => {
     cwd,
   });
 
-  assert.equal(execution.providerSessionId, 'session_abc123');
+  assert.deepEqual(execution, {
+    providerSessionId: 'session_abc123',
+    url: 'https://claude.ai/code/session_abc123',
+    status: 'running',
+  });
   assert.deepEqual(readCommands()[0], [
     '-p',
     'Fix the test',
@@ -106,18 +194,57 @@ test('sends a follow-up to the existing session', async () => {
   ]);
 });
 
-test('reports authentication and attach capability independently', async () => {
-  const { provider } = claudeForScenario('start');
+test('queues a follow-up using a documented cse session ID', async () => {
+  const { provider, cwd } = claudeForScenario('send-cse');
 
-  assert.deepEqual(await provider.authStatus(), {
-    authenticated: true,
-    method: 'claude.ai',
+  const execution = await provider.send!({
+    providerSessionId: 'cse_abc-123_def',
+    message: 'Continue',
+    cwd,
   });
+
+  assert.deepEqual(execution, {
+    providerSessionId: 'cse_abc-123_def',
+    url: 'https://claude.ai/code/cse_abc-123_def',
+    status: 'running',
+  });
+});
+
+test('rejects a Claude follow-up acknowledgement for another session', async () => {
+  const { provider, cwd } = claudeForScenario('send-mismatch');
+
+  await assert.rejects(
+    provider.send!({
+      providerSessionId: 'session_abc123',
+      message: 'Continue',
+      cwd,
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_output_invalid',
+  );
+});
+
+test('rejects a failed Claude cloud follow-up acknowledgement', async () => {
+  const { provider, cwd } = claudeForScenario('send-failed');
+
+  await assert.rejects(
+    provider.send!({
+      providerSessionId: 'session_abc123',
+      message: 'Continue',
+      cwd,
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_rejected',
+  );
+});
+
+test('does not infer account-gated attachment from the current CLI help', async () => {
+  const { provider } = claudeForScenario('current-help');
+
   const capabilities = await provider.capabilities();
+
   assert.equal(capabilities.start, true);
-  assert.equal(capabilities.queueFollowup, true);
-  assert.equal(capabilities.interactiveAttach, true);
-  assert.equal(capabilities.structuredStatus, false);
+  assert.equal(capabilities.interactiveAttach, false);
 });
 
 test('does not advertise cloud operations when only the Claude binary is installed', async () => {
@@ -146,7 +273,7 @@ test('rejects cloud output without a session identifier', async () => {
   const { provider, cwd } = claudeForScenario('malformed');
 
   await assert.rejects(
-    provider.start({ prompt: 'x', cwd, mode: 'write' }),
+    provider.start({ prompt: 'x', cwd, mode: 'read' }),
     (error: unknown) =>
       error instanceof RelayError &&
       error.code === 'provider_output_invalid',
@@ -157,33 +284,9 @@ test('rejects Claude cloud URLs outside the documented session route', async () 
   for (const scenario of ['invalid-url-host', 'invalid-url-path', 'invalid-url-id']) {
     const { provider, cwd } = claudeForScenario(scenario);
     await assert.rejects(
-      provider.start({ prompt: 'x', cwd, mode: 'write' }),
+      provider.start({ prompt: 'x', cwd, mode: 'read' }),
       (error: unknown) =>
         error instanceof RelayError && error.code === 'provider_output_invalid',
     );
   }
-});
-
-test('rejects a structured Claude session URL that does not match its session ID', async () => {
-  const { provider, cwd } = claudeForScenario('invalid-json-url');
-
-  await assert.rejects(
-    provider.send!({
-      providerSessionId: 'session_abc123',
-      message: 'Continue',
-      cwd,
-    }),
-    (error: unknown) =>
-      error instanceof RelayError && error.code === 'provider_output_invalid',
-  );
-});
-
-test('attaches with inherited provider-native terminal behavior', async () => {
-  const { provider, cwd, readCommands } = claudeForScenario('attach');
-
-  assert.equal(
-    await provider.attach!({ providerSessionId: 'session_abc123', cwd }),
-    0,
-  );
-  assert.deepEqual(readCommands()[0], ['--cloud', 'session_abc123']);
 });

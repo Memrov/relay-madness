@@ -1210,6 +1210,31 @@ test('derives run provider and account identity from its session', () => {
   store.close();
 });
 
+test('rejects a prepared launch with its pending session and account lease', () => {
+  const store = storeWithAccount('claude-rejected', 'claude');
+  const { session, run } = activeRunForAccount(store, {
+    accountId: 'claude-rejected',
+    provider: 'claude',
+    id: 'rejected-launch',
+    providerSessionId: 'pending:rejected-launch',
+    sessionStatus: 'pending',
+  });
+  store.acquireAccountLease('claude-rejected', run.id);
+  store.prepareRunLaunch(run.id, 'attempt-rejected-launch');
+
+  const rejected = store.rejectRunLaunch(run.id, 'attempt-rejected-launch');
+
+  assert.equal(rejected.status, 'failed');
+  assert.equal(rejected.launchState, undefined);
+  assert.equal(
+    store.getStatus(run.workItemId).sessions.find(({ id }) => id === session.id)
+      ?.status,
+    'failed',
+  );
+  assert.equal(store.countActiveAccountLeases('claude-rejected'), 0);
+  store.close();
+});
+
 test('quarantines an interrupted launch after reopening the state database', () => {
   const path = databasePath();
   const store = StateStore.open(path);

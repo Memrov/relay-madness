@@ -466,6 +466,14 @@ export class RelayCore {
         reconciled.artifact,
       );
     } catch (error) {
+      if (
+        launchPrepared &&
+        !launchCompleted &&
+        isProviderRejection(error)
+      ) {
+        run = this.dependencies.store.rejectRunLaunch(run.id, launchAttemptId);
+        throw error;
+      }
       if (launchPrepared && !launchCompleted) {
         run = this.dependencies.store.markRunLaunchUncertain(
           run.id,
@@ -1138,6 +1146,14 @@ export class RelayCore {
         reconciled.artifact,
       );
     } catch (error) {
+      if (
+        launchPrepared &&
+        !launchCompleted &&
+        isProviderRejection(error)
+      ) {
+        run = this.dependencies.store.rejectRunLaunch(run.id, launchAttemptId);
+        throw error;
+      }
       if (launchPrepared && !launchCompleted) {
         run = this.dependencies.store.markRunLaunchUncertain(
           run.id,
@@ -1485,6 +1501,10 @@ export class RelayCore {
       { cause },
     );
   }
+}
+
+function isProviderRejection(error: unknown): error is RelayError {
+  return error instanceof RelayError && error.code === 'provider_rejected';
 }
 
 function resultFor(
