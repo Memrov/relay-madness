@@ -30,12 +30,39 @@ if (args[0] === 'auth' && args[1] === 'status') {
   });
 } else if (
   args[0] === 'api' &&
-  args[1]?.includes('/commits/') &&
-  args[1]?.endsWith('/check-runs')
+  args.some(
+    (argument) =>
+      argument.includes('/commits/') && argument.endsWith('/check-runs'),
+  )
 ) {
   const mode = scenario.replace('commit-checks-', '');
   if (mode === 'unknown') {
-    output({ total_count: 0, check_runs: [] });
+    output([{ total_count: 0, check_runs: [] }]);
+  } else if (mode === 'multi-page') {
+    output([
+      {
+        total_count: 2,
+        check_runs: [
+          {
+            name: 'first-page',
+            status: 'completed',
+            conclusion: 'success',
+            html_url: 'https://github.com/acme/web/actions/runs/1',
+          },
+        ],
+      },
+      {
+        total_count: 2,
+        check_runs: [
+          {
+            name: 'second-page',
+            status: 'completed',
+            conclusion: 'failure',
+            html_url: 'https://github.com/acme/web/actions/runs/2',
+          },
+        ],
+      },
+    ]);
   } else {
     const checkRuns = [
       {
@@ -55,10 +82,12 @@ if (args[0] === 'auth' && args[1] === 'status') {
         html_url: 'https://github.com/acme/web/actions/runs/2',
       });
     }
-    output({
-      total_count: checkRuns.length,
-      check_runs: checkRuns,
-    });
+    output([
+      {
+        total_count: checkRuns.length,
+        check_runs: checkRuns,
+      },
+    ]);
   }
 } else if (
   args[0] === 'api' &&

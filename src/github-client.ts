@@ -352,16 +352,26 @@ export class GitHubClient {
         'Commit checks require a full 40-character SHA.',
       );
     }
-    const result = await this.runJson(
-      ['api', `repos/${repo}/commits/${sha}/check-runs`],
-      commitChecksSchema,
+    const pages = await this.runJson(
+      [
+        'api',
+        '--paginate',
+        '--slurp',
+        `repos/${repo}/commits/${sha}/check-runs`,
+      ],
+      z.array(commitChecksSchema),
     );
-    if (result.total_count === 0 || result.check_runs.length === 0) {
+    const checkRuns = pages.flatMap((page) => page.check_runs);
+    const reportedCount = pages.reduce(
+      (count, page) => Math.max(count, page.total_count),
+      0,
+    );
+    if (reportedCount === 0 || checkRuns.length < reportedCount) {
       return 'unknown';
     }
     const successful = new Set(['success', 'neutral', 'skipped']);
     if (
-      result.check_runs.some(
+      checkRuns.some(
         (check) =>
           check.status === 'completed' &&
           (check.conclusion === null ||
@@ -370,7 +380,7 @@ export class GitHubClient {
     ) {
       return 'failing';
     }
-    if (result.check_runs.some((check) => check.status !== 'completed')) {
+    if (checkRuns.some((check) => check.status !== 'completed')) {
       return 'pending';
     }
     return 'passing';
@@ -418,13 +428,13 @@ export class GitHubClient {
         `repos/${input.repo}/pulls`,
         '--method',
         'POST',
-        '--field',
+        '--raw-field',
         `head=${input.head}`,
-        '--field',
+        '--raw-field',
         `base=${input.base}`,
-        '--field',
+        '--raw-field',
         `title=${input.title}`,
-        '--field',
+        '--raw-field',
         `body=${input.body}`,
       ],
       createdPullRequestSchema,

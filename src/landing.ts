@@ -73,7 +73,10 @@ export class LandingCoordinator {
 
   private async prepare(candidate: CandidateRecord): Promise<LandingResult> {
     const { project, workItem } = this.context(candidate);
-    const integrationBranch = workItem.currentBranch ?? workItem.baseBranch;
+    const integrationBranch = candidate.integrationBranch;
+    if (!isSafeIntegrationBranch(integrationBranch, workItem.baseBranch)) {
+      return this.status(candidate.runId, 'stale');
+    }
     const sourceHead = await this.remoteSha(
       project.locatorPath,
       candidate.sourceBranch,
@@ -107,23 +110,29 @@ export class LandingCoordinator {
       return this.status(candidate.runId, 'stale');
     }
 
-    const conflicts = await this.preflightMerge(
+    const preflight = await this.preflightMerge(
       project.locatorPath,
       integrationHead,
       candidate.sourceSha,
     );
-    if (conflicts !== undefined) {
-      return this.status(candidate.runId, 'conflict', { conflictFiles: conflicts });
+    if (preflight.conflictFiles !== undefined) {
+      return this.status(candidate.runId, 'conflict', {
+        conflictFiles: preflight.conflictFiles,
+      });
     }
 
     const stagingBranch = stageBranch(candidate.runId, integrationHead);
     const existingStage = await this.remoteSha(project.locatorPath, stagingBranch);
     if (existingStage !== undefined) {
+      await this.fetchCommit(project.locatorPath, existingStage);
       if (
-        candidate.stagingBranch === stagingBranch &&
-        candidate.stagingSha === existingStage &&
-        candidate.integrationBaseSha === integrationHead &&
-        candidate.integrationRefExisted === integrationRefExisted
+        await this.isRecoverableStage(
+          project.locatorPath,
+          candidate,
+          existingStage,
+          integrationHead,
+          preflight.treeSha,
+        )
       ) {
         return resultFor(
           this.dependencies.store.recordCandidateStage(candidate.runId, {
@@ -159,13 +168,9 @@ export class LandingCoordinator {
         'user.email=relay@localhost',
         'commit',
         '-m',
-        `Relay candidate ${candidate.runId}`,
+        candidateCommitSubject(candidate.runId),
         '-m',
-        [
-          `Relay-Run: ${candidate.runId}`,
-          `Relay-Source-SHA: ${candidate.sourceSha}`,
-          `Relay-Base-SHA: ${candidate.baseSha}`,
-        ].join('\n'),
+        candidateCommitTrailers(candidate),
       );
       const stagingSha = (
         await this.git(worktreePath, 'rev-parse', 'HEAD')
@@ -201,8 +206,9 @@ export class LandingCoordinator {
 
   private async finish(candidate: CandidateRecord): Promise<LandingResult> {
     const { project, workItem } = this.context(candidate);
-    const integrationBranch = workItem.currentBranch ?? workItem.baseBranch;
+    const integrationBranch = candidate.integrationBranch;
     if (
+      !isSafeIntegrationBranch(integrationBranch, workItem.baseBranch) ||
       candidate.stagingBranch === undefined ||
       candidate.stagingSha === undefined ||
       candidate.integrationBaseSha === undefined ||
@@ -369,9 +375,12 @@ export class LandingCoordinator {
     repositoryPath: string,
     integrationSha: string,
     sourceSha: string,
-  ): Promise<readonly string[] | undefined> {
+  ): Promise<{
+    treeSha: string;
+    conflictFiles?: readonly string[];
+  }> {
     try {
-      await this.git(
+      const result = await this.git(
         repositoryPath,
         'merge-tree',
         '--write-tree',
@@ -381,7 +390,14 @@ export class LandingCoordinator {
         integrationSha,
         sourceSha,
       );
-      return undefined;
+      const treeSha = result.stdout.split('\0', 1)[0];
+      if (!isFullSha(treeSha)) {
+        throw new RelayError(
+          'provider_output_invalid',
+          'Git returned an invalid preflight merge tree.',
+        );
+      }
+      return { treeSha };
     } catch (error) {
       if (!isGitFailure(error)) throw error;
       const fields = String(error.details?.stdout ?? '').split('\0');
@@ -389,8 +405,28 @@ export class LandingCoordinator {
       const files = fields.filter((path) => path !== '');
       if (!isFullSha(tree)) throw error;
       if (files.length === 0) throw error;
-      return [...new Set(files)].sort();
+      return { treeSha: tree, conflictFiles: [...new Set(files)].sort() };
     }
+  }
+
+  private async isRecoverableStage(
+    repositoryPath: string,
+    candidate: CandidateRecord,
+    stagingSha: string,
+    integrationBaseSha: string,
+    expectedTreeSha: string,
+  ): Promise<boolean> {
+    if (!(await this.isCommit(repositoryPath, stagingSha))) return false;
+    const [parents, tree, message] = await Promise.all([
+      this.git(repositoryPath, 'show', '-s', '--format=%P', stagingSha),
+      this.git(repositoryPath, 'show', '-s', '--format=%T', stagingSha),
+      this.git(repositoryPath, 'show', '-s', '--format=%B', stagingSha),
+    ]);
+    return (
+      parents.stdout.trim() === integrationBaseSha &&
+      tree.stdout.trim() === expectedTreeSha &&
+      message.stdout.trimEnd() === candidateCommitMessage(candidate)
+    );
   }
 
   private async cleanTemporaryWorktree(
@@ -432,6 +468,33 @@ function resultFor(candidate: CandidateRecord): LandingResult {
 function stageBranch(runId: string, integrationSha: string): string {
   const prefix = runId.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 12);
   return `relay/stage/${prefix || 'candidate'}-${integrationSha.slice(0, 8)}`;
+}
+
+function candidateCommitSubject(runId: string): string {
+  return `Relay candidate ${runId}`;
+}
+
+function candidateCommitTrailers(candidate: CandidateRecord): string {
+  return [
+    `Relay-Run: ${candidate.runId}`,
+    `Relay-Source-SHA: ${candidate.sourceSha}`,
+    `Relay-Base-SHA: ${candidate.baseSha}`,
+  ].join('\n');
+}
+
+function candidateCommitMessage(candidate: CandidateRecord): string {
+  return `${candidateCommitSubject(candidate.runId)}\n\n${candidateCommitTrailers(candidate)}`;
+}
+
+function isSafeIntegrationBranch(branch: string, baseBranch: string): boolean {
+  return (
+    branch.length > 0 &&
+    branch !== baseBranch &&
+    branch !== 'relay/run' &&
+    !branch.startsWith('relay/run/') &&
+    branch !== 'relay/stage' &&
+    !branch.startsWith('relay/stage/')
+  );
 }
 
 function isFullSha(value: string | undefined): value is string {

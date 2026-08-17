@@ -141,6 +141,25 @@ function createPopulatedV3Database(): string {
   return path;
 }
 
+function createPopulatedV4DatabaseWithRunBranch(): string {
+  const path = createPopulatedV3Database();
+  const database = new Database(path);
+  database.exec(`
+    ALTER TABLE provider_sessions ADD COLUMN account_id TEXT REFERENCES provider_accounts(id);
+    ALTER TABLE provider_runs ADD COLUMN account_id TEXT REFERENCES provider_accounts(id);
+    ALTER TABLE provider_runs ADD COLUMN model TEXT;
+    ALTER TABLE provider_runs ADD COLUMN base_sha TEXT;
+    ALTER TABLE provider_runs ADD COLUMN result_sha TEXT;
+    INSERT INTO schema_migrations (version, applied_at)
+      VALUES (4, '2026-08-16T00:03:00.000Z');
+    UPDATE work_items
+      SET current_branch = 'relay/run/work-v3/legacy-run'
+      WHERE id = 'work-v3';
+  `);
+  database.close();
+  return path;
+}
+
 function storeWithAccount(
   id: string,
   provider: 'claude' | 'codex' | 'jules',
@@ -460,9 +479,33 @@ test('persists one immutable ready candidate from a complete write run', () => {
   assert.equal(candidate?.sourceBranch, 'relay/run/work-1/candidate-run');
   assert.equal(candidate?.sourceSha, 'b'.repeat(40));
   assert.equal(candidate?.baseSha, 'a'.repeat(40));
+  assert.equal(candidate?.integrationBranch, workItem.integrationBranch);
   assert.deepEqual(candidate?.conflictFiles, []);
   assert.equal(repeated?.sourceSha, 'b'.repeat(40));
   assert.equal(store.getCandidate(run.id)?.sourceSha, 'b'.repeat(40));
+  store.close();
+});
+
+test('reserves a dedicated integration branch for a read-first WorkItem', () => {
+  const store = openStore();
+  const project = store.upsertProject({
+    repo: 'acme/read-first',
+    defaultBranch: 'main',
+    locatorPath: '/tmp/read-first',
+  });
+
+  const workItem = store.createWorkItem({
+    id: 'read-first-work',
+    projectId: project.id,
+    title: 'Read first',
+    baseBranch: 'main',
+    currentBranch: 'main',
+  });
+
+  assert.equal(workItem.currentBranch, 'main');
+  assert.match(workItem.integrationBranch, /^relay\/work\//);
+  assert.notEqual(workItem.integrationBranch, workItem.baseBranch);
+  assert.equal(workItem.integrationBranch.startsWith('relay/run/'), false);
   store.close();
 });
 
@@ -598,7 +641,7 @@ test('applies ordered schema migrations', () => {
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3, 4, 5],
+    [1, 2, 3, 4, 5, 6],
   );
   assert.ok(runColumns.some(({ name }) => name === 'baseline_sha'));
   assert.ok(runColumns.some(({ name }) => name === 'account_id'));
@@ -609,11 +652,23 @@ test('applies ordered schema migrations', () => {
     artifactColumns.some(({ name }) => name === 'verification_status'),
   );
   assert.ok(candidateColumns.some(({ name }) => name === 'integration_base_sha'));
+  assert.ok(candidateColumns.some(({ name }) => name === 'integration_branch'));
   assert.ok(
     candidateColumns.some(({ name }) => name === 'integration_ref_existed'),
   );
   assert.ok(candidateColumns.some(({ name }) => name === 'conflict_paths_json'));
   assert.ok(landingLeaseColumns.some(({ name }) => name === 'expires_at'));
+});
+
+test('migrates a version-four relay run branch to a dedicated integration branch', () => {
+  const store = StateStore.open(createPopulatedV4DatabaseWithRunBranch());
+
+  const workItem = store.getWorkItem('work-v3');
+  assert.match(workItem.integrationBranch, /^relay\/work\//);
+  assert.equal(workItem.integrationBranch.startsWith('relay/run/'), false);
+  assert.notEqual(workItem.integrationBranch, workItem.baseBranch);
+  assert.equal(workItem.currentBranch, workItem.integrationBranch);
+  store.close();
 });
 
 test('migrates a populated version-three database without deleting legacy runs', () => {

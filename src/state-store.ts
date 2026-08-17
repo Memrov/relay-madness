@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
@@ -80,6 +80,7 @@ export interface WorkItemRecord {
   projectId: string;
   title: string;
   baseBranch: string;
+  integrationBranch: string;
   currentBranch?: string;
   currentSha?: string;
   pullRequest?: number;
@@ -176,6 +177,7 @@ export interface CandidateRecord {
   sourceBranch: string;
   sourceSha: string;
   baseSha: string;
+  integrationBranch: string;
   stagingBranch?: string;
   stagingSha?: string;
   integrationBaseSha?: string;
@@ -570,19 +572,30 @@ export class StateStore {
     return this.database.transaction(() => {
       const id = input.id ?? randomUUID();
       const now = new Date().toISOString();
+      const integrationBranch = isDedicatedIntegrationBranch(
+        input.currentBranch,
+        input.baseBranch,
+      )
+        ? input.currentBranch
+        : integrationBranchFor(id, input.baseBranch);
+      const currentBranch = isRelayCandidateBranch(input.currentBranch)
+        ? integrationBranch
+        : input.currentBranch;
       this.database
         .prepare(
           `INSERT INTO work_items (
-            id, project_id, title, base_branch, current_branch, status,
+            id, project_id, title, base_branch, integration_branch,
+            current_branch, status,
             created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)`,
         )
         .run(
           id,
           input.projectId,
           input.title,
           input.baseBranch,
-          input.currentBranch ?? null,
+          integrationBranch,
+          currentBranch ?? null,
           now,
           now,
         );
@@ -963,9 +976,13 @@ export class StateStore {
       const row = this.requiredRow(
         this.database
           .prepare(
-            `SELECT id, work_item_id, mutation_mode, expected_branch, base_sha,
-                    result_sha
-             FROM provider_runs WHERE id = ?`,
+            `SELECT provider_runs.id, provider_runs.work_item_id,
+                    provider_runs.mutation_mode, provider_runs.expected_branch,
+                    provider_runs.base_sha, provider_runs.result_sha,
+                    work_items.base_branch, work_items.integration_branch
+             FROM provider_runs
+             JOIN work_items ON work_items.id = provider_runs.work_item_id
+             WHERE provider_runs.id = ?`,
           )
           .get(runId),
         `Run ${runId} was not found.`,
@@ -973,6 +990,7 @@ export class StateStore {
       const sourceBranch = nullableString(row.expected_branch);
       const baseSha = nullableString(row.base_sha);
       const sourceSha = nullableString(row.result_sha);
+      const integrationBranch = nullableString(row.integration_branch);
       if (
         row.mutation_mode !== 'write' ||
         sourceBranch === undefined ||
@@ -981,7 +999,11 @@ export class StateStore {
         sourceSha === undefined ||
         !isFullSha(baseSha) ||
         !isFullSha(sourceSha) ||
-        baseSha === sourceSha
+        baseSha === sourceSha ||
+        !isDedicatedIntegrationBranch(
+          integrationBranch,
+          String(row.base_branch),
+        )
       ) {
         return undefined;
       }
@@ -991,10 +1013,19 @@ export class StateStore {
         .prepare(
           `INSERT INTO candidates (
             run_id, work_item_id, status, source_branch, source_sha, base_sha,
-            conflict_paths_json, created_at, updated_at
-          ) VALUES (?, ?, 'ready', ?, ?, ?, '[]', ?, ?)`,
+            integration_branch, conflict_paths_json, created_at, updated_at
+          ) VALUES (?, ?, 'ready', ?, ?, ?, ?, '[]', ?, ?)`,
         )
-        .run(runId, row.work_item_id, sourceBranch, sourceSha, baseSha, now, now);
+        .run(
+          runId,
+          row.work_item_id,
+          sourceBranch,
+          sourceSha,
+          baseSha,
+          integrationBranch,
+          now,
+          now,
+        );
       return this.getCandidate(runId);
     }).immediate();
   }
@@ -1472,6 +1503,51 @@ export class StateStore {
         this.recordMigration(5);
       }).immediate();
     }
+    if (!applied.has(6)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          ALTER TABLE work_items ADD COLUMN integration_branch TEXT;
+          ALTER TABLE candidates ADD COLUMN integration_branch TEXT;
+        `);
+        const workItems = this.database
+          .prepare('SELECT id, base_branch, current_branch FROM work_items')
+          .all() as SqlRow[];
+        const updateWorkItem = this.database.prepare(
+          `UPDATE work_items
+           SET integration_branch = ?, current_branch = ?, updated_at = ?
+           WHERE id = ?`,
+        );
+        const now = new Date().toISOString();
+        for (const row of workItems) {
+          const id = String(row.id);
+          const baseBranch = String(row.base_branch);
+          const currentBranch = nullableString(row.current_branch);
+          const integrationBranch = isDedicatedIntegrationBranch(
+            currentBranch,
+            baseBranch,
+          )
+            ? currentBranch
+            : integrationBranchFor(id, baseBranch);
+          updateWorkItem.run(
+            integrationBranch,
+            isRelayCandidateBranch(currentBranch) || currentBranch === undefined
+              ? integrationBranch
+              : currentBranch,
+            now,
+            id,
+          );
+        }
+        this.database.exec(`
+          UPDATE candidates
+          SET integration_branch = (
+            SELECT work_items.integration_branch
+            FROM work_items
+            WHERE work_items.id = candidates.work_item_id
+          );
+        `);
+        this.recordMigration(6);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -1574,6 +1650,7 @@ export class StateStore {
       projectId: String(row.project_id),
       title: String(row.title),
       baseBranch: String(row.base_branch),
+      integrationBranch: String(row.integration_branch),
       status: String(row.status) as WorkItemRecord['status'],
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
@@ -1658,6 +1735,7 @@ export class StateStore {
       sourceBranch: String(row.source_branch),
       sourceSha: String(row.source_sha),
       baseSha: String(row.base_sha),
+      integrationBranch: String(row.integration_branch),
       conflictFiles: parseStringArray(row.conflict_paths_json),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
@@ -1683,6 +1761,38 @@ function nullableString(value: unknown): string | undefined {
 
 function isFullSha(value: string): boolean {
   return /^[0-9a-f]{40}$/i.test(value);
+}
+
+function isRelayCandidateBranch(branch: string | undefined): boolean {
+  return (
+    branch === 'relay/run' ||
+    branch?.startsWith('relay/run/') === true ||
+    branch === 'relay/stage' ||
+    branch?.startsWith('relay/stage/') === true
+  );
+}
+
+function isDedicatedIntegrationBranch(
+  branch: string | undefined,
+  baseBranch: string,
+): branch is string {
+  return (
+    branch !== undefined &&
+    branch.length > 0 &&
+    branch !== baseBranch &&
+    !isRelayCandidateBranch(branch)
+  );
+}
+
+function integrationBranchFor(workItemId: string, baseBranch: string): string {
+  const label = workItemId
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32);
+  const digest = createHash('sha256').update(workItemId).digest('hex').slice(0, 12);
+  const branch = `relay/work/${label || 'work'}-${digest}`;
+  return branch === baseBranch ? `${branch}-integration` : branch;
 }
 
 function parseStringArray(value: unknown): readonly string[] {

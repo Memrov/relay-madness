@@ -141,6 +141,26 @@ test('creates a missing integration branch only after its staged SHA passes chec
   );
 });
 
+test('lands a read-first WorkItem on its reserved integration branch, never base', async () => {
+  const fixture = await createLandingRepository({
+    checks: 'passing',
+    integrationExists: false,
+    workItemCurrentBranch: 'main',
+  });
+
+  const staged = await fixture.lander.land(fixture.runId);
+  assert.equal(staged.status, 'staged');
+  assert.match(fixture.integrationBranch, /^relay\/work\//);
+  assert.notEqual(fixture.integrationBranch, 'main');
+  assert.equal(fixture.remoteSha('main'), fixture.integrationBefore);
+  assert.equal(fixture.remoteSha(fixture.integrationBranch), undefined);
+
+  const landed = await fixture.lander.land(fixture.runId);
+  assert.equal(landed.status, 'landed');
+  assert.equal(fixture.remoteSha(fixture.integrationBranch), staged.stagingSha);
+  assert.equal(fixture.remoteSha('main'), fixture.integrationBefore);
+});
+
 test('leaves integration unchanged on textual conflict', async () => {
   const fixture = await createConflictingLandingRepository();
 
@@ -201,6 +221,88 @@ test('does not overwrite an integration head that moved after staging', async ()
   assert.equal(fixture.github.pullRequests.length, 0);
 });
 
+test('finishes on the candidate integration branch after WorkItem current branch changes', async () => {
+  const fixture = await createLandingRepository({ checks: 'passing' });
+  const staged = await fixture.lander.land(fixture.runId);
+  const changedBranch = 'relay/work/changed-after-stage';
+  git(
+    fixture.checkout,
+    'push',
+    'origin',
+    `${fixture.integrationBefore}:refs/heads/${changedBranch}`,
+  );
+  fixture.store.saveArtifact({
+    workItemId: fixture.workItemId,
+    branch: changedBranch,
+    sha: fixture.integrationBefore,
+    status: 'published',
+    checks: 'unknown',
+  });
+
+  const landed = await fixture.lander.land(fixture.runId);
+
+  assert.equal(landed.status, 'landed');
+  assert.equal(fixture.remoteSha(fixture.integrationBranch), staged.stagingSha);
+  assert.equal(fixture.remoteSha(changedBranch), fixture.integrationBefore);
+  assert.equal(fixture.github.pullRequests[0]?.head, fixture.integrationBranch);
+});
+
+test('recovers an exact staged commit after a push-to-database crash boundary', async () => {
+  const fixture = await createLandingRepository();
+  const recordCandidateStage =
+    fixture.store.recordCandidateStage.bind(fixture.store);
+  let injectFailure = true;
+  fixture.store.recordCandidateStage = (runId, input) => {
+    if (injectFailure) {
+      injectFailure = false;
+      throw new Error('injected database boundary failure');
+    }
+    return recordCandidateStage(runId, input);
+  };
+
+  await assert.rejects(
+    fixture.lander.land(fixture.runId),
+    /injected database boundary failure/,
+  );
+  assert.equal(fixture.store.getCandidate(fixture.runId)?.status, 'ready');
+  assert.match(
+    git(
+      fixture.remote,
+      'for-each-ref',
+      '--format=%(refname:short)',
+      'refs/heads/relay/stage',
+    ),
+    /^relay\/stage\//,
+  );
+
+  const recovered = await fixture.lander.land(fixture.runId);
+
+  assert.equal(recovered.status, 'staged');
+  assert.equal(
+    fixture.remoteSha(recovered.stagingBranch!),
+    recovered.stagingSha,
+  );
+});
+
+test('rejects a preexisting stage ref without exact candidate provenance', async () => {
+  const fixture = await createLandingRepository();
+  const stagingBranch = `relay/stage/run-1-${fixture.integrationBefore.slice(0, 8)}`;
+  git(fixture.checkout, 'switch', '-c', stagingBranch, fixture.integrationBefore);
+  writeFileSync(join(fixture.checkout, 'src', 'untrusted.ts'), 'export {}\n');
+  git(fixture.checkout, 'add', '.');
+  git(fixture.checkout, 'commit', '-m', 'Untrusted staged commit');
+  git(fixture.checkout, 'push', '-u', 'origin', stagingBranch);
+
+  const result = await fixture.lander.land(fixture.runId);
+
+  assert.equal(result.status, 'stale');
+  assert.notEqual(fixture.remoteSha(stagingBranch), fixture.sourceSha);
+  assert.equal(
+    fixture.remoteSha(fixture.integrationBranch),
+    fixture.integrationBefore,
+  );
+});
+
 test('serializes two landing attempts for the same WorkItem', async () => {
   const fixture = await createLandingRepository();
 
@@ -253,6 +355,7 @@ async function createLandingRepository(
     conflict?: boolean;
     integrationExists?: boolean;
     resultSha?: string;
+    workItemCurrentBranch?: string;
   } = {},
 ): Promise<LandingFixture> {
   const root = mkdtempSync(join(tmpdir(), 'relay-landing-test-'));
@@ -312,7 +415,7 @@ async function createLandingRepository(
     projectId: project.id,
     title: 'Authentication',
     baseBranch: 'main',
-    currentBranch: integrationBranch,
+    currentBranch: options.workItemCurrentBranch ?? integrationBranch,
   });
   const session = store.upsertSession({
     workItemId: workItem.id,
@@ -331,7 +434,8 @@ async function createLandingRepository(
     baseSha: git(checkout, 'rev-parse', 'main'),
     resultSha: options.resultSha ?? sourceSha,
   });
-  assert.ok(store.createCandidateForRun(run.id));
+  const candidate = store.createCandidateForRun(run.id);
+  assert.ok(candidate);
 
   const runner = new RecordingRunner();
   const github = new FakeLandingGitHub(remote, options.checks);
@@ -348,7 +452,7 @@ async function createLandingRepository(
     workItemId: workItem.id,
     sourceBranch,
     sourceSha,
-    integrationBranch,
+    integrationBranch: candidate.integrationBranch,
     integrationBefore,
     remoteSha: (branch) => remoteSha(remote, branch),
   };

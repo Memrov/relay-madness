@@ -270,6 +270,18 @@ test('summarizes checks for the exact commit SHA', async () => {
   assert.equal(await unknown.getCommitChecks('acme/web', sha), 'unknown');
 });
 
+test('inspects every commit-check page before classifying the SHA', async () => {
+  const { github, readCommands } = githubForScenario('commit-checks-multi-page');
+  const sha = 'e'.repeat(40);
+
+  assert.equal(await github.getCommitChecks('acme/web', sha), 'failing');
+  const command = readCommands().find((args) =>
+    args.some((argument) => argument.includes('/check-runs')),
+  );
+  assert.ok(command?.includes('--paginate'));
+  assert.ok(command?.includes('--slurp'));
+});
+
 test('reuses one correctly targeted integration pull request', async () => {
   const { github, readCommands } = githubForScenario('published');
 
@@ -307,4 +319,25 @@ test('creates an integration pull request only when no matching head exists', as
       (args) => args[0] === 'api' && args.includes('--method') && args.includes('POST'),
     ),
   );
+});
+
+test('passes pull request strings literally through raw GitHub fields', async () => {
+  const { github, readCommands } = githubForScenario('no-pr');
+
+  await github.ensurePullRequest({
+    repo: 'acme/web',
+    head: 'relay/auth',
+    base: 'main',
+    title: '@/tmp/untrusted-title',
+    body: '007',
+  });
+
+  const command = readCommands().find(
+    (args) => args[0] === 'api' && args.includes('POST'),
+  );
+  assert.ok(command);
+  assert.equal(command.includes('--field'), false);
+  assert.ok(command.includes('--raw-field'));
+  assert.ok(command.includes('title=@/tmp/untrusted-title'));
+  assert.ok(command.includes('body=007'));
 });
