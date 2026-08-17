@@ -577,6 +577,57 @@ test('stores project configuration by account and rejects credentials', () => {
   store.close();
 });
 
+test('rejects credential carrier key segments without persisting either configuration', () => {
+  const store = openStore();
+  const { project } = seed(store);
+  store.upsertProviderAccount({
+    id: 'codex-a',
+    provider: 'codex',
+    label: 'Codex',
+    profilePath: '/profiles/codex-a',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+
+  const sensitiveSettings: ReadonlyArray<Readonly<Record<string, unknown>>> = [
+    { environment: { SESSION: 'do-not-store' } },
+    { env: { SESSION: 'do-not-store' } },
+    { cookie: 'do-not-store' },
+    { cookies: 'do-not-store' },
+    { keychain: 'do-not-store' },
+    { accessToken: 'do-not-store' },
+    { apiKey: 'do-not-store' },
+    { credentialReference: 'do-not-store' },
+  ];
+
+  for (const settings of sensitiveSettings) {
+    assert.throws(
+      () => store.setProviderAccountConfig(project.id, 'codex-a', settings),
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'invalid_argument',
+    );
+    assert.equal(store.getProviderAccountConfig(project.id, 'codex-a'), undefined);
+
+    assert.throws(
+      () => store.setProviderConfig(project.id, 'codex', settings),
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'invalid_argument',
+    );
+    assert.equal(store.getProviderConfig(project.id, 'codex'), undefined);
+  }
+
+  store.setProviderAccountConfig(project.id, 'codex-a', {
+    environmentId: 'env_123',
+    monkey: 'safe',
+  });
+  assert.deepEqual(store.getProviderAccountConfig(project.id, 'codex-a'), {
+    environmentId: 'env_123',
+    monkey: 'safe',
+  });
+  store.close();
+});
+
 test('rejects provider settings that look like credentials', () => {
   const store = openStore();
   const { project } = seed(store);

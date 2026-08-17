@@ -162,8 +162,25 @@ export interface WorkItemStatus {
 
 type SqlRow = Record<string, unknown>;
 
-const SENSITIVE_SETTING =
-  /token|secret|key|authorization|credential|password/i;
+const SENSITIVE_SETTING_SEGMENTS = new Set([
+  'authorization',
+  'authorizations',
+  'cookie',
+  'cookies',
+  'credential',
+  'credentials',
+  'key',
+  'keychain',
+  'keychains',
+  'password',
+  'passwords',
+  'secret',
+  'secrets',
+  'token',
+  'tokens',
+]);
+
+const ENVIRONMENT_REFERENCE_SEGMENTS = new Set(['id', 'identifier']);
 
 const RUN_TRANSITIONS: Readonly<
   Record<ProviderRunStatus, ReadonlySet<ProviderRunStatus>>
@@ -1266,7 +1283,7 @@ export class StateStore {
 }
 
 function containsSensitiveSetting(value: unknown, key = ''): boolean {
-  if (key !== '' && SENSITIVE_SETTING.test(key)) return true;
+  if (key !== '' && isSensitiveSettingKey(key)) return true;
   if (Array.isArray(value)) {
     return value.some((entry) => containsSensitiveSetting(entry));
   }
@@ -1276,6 +1293,30 @@ function containsSensitiveSetting(value: unknown, key = ''): boolean {
     );
   }
   return false;
+}
+
+function isSensitiveSettingKey(key: string): boolean {
+  const segments = normalizedKeySegments(key);
+  return (
+    segments.some((segment) => SENSITIVE_SETTING_SEGMENTS.has(segment)) ||
+    segments.some(
+      (segment, index) =>
+        (segment === 'environment' || segment === 'env') &&
+        !(
+          index === segments.length - 2 &&
+          ENVIRONMENT_REFERENCE_SEGMENTS.has(segments[index + 1] ?? '')
+        ),
+    )
+  );
+}
+
+function normalizedKeySegments(key: string): readonly string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((segment) => segment !== '');
 }
 
 function isValidDate(value: Date): boolean {
