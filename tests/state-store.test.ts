@@ -598,6 +598,11 @@ test('rejects credential carrier key segments without persisting either configur
     { keychain: 'do-not-store' },
     { accessToken: 'do-not-store' },
     { apiKey: 'do-not-store' },
+    { 'api-key': 'do-not-store' },
+    { apiKeys: 'do-not-store' },
+    { apikey: 'do-not-store' },
+    { accesskey: 'do-not-store' },
+    { accesstoken: 'do-not-store' },
     { credentialReference: 'do-not-store' },
   ];
 

@@ -170,6 +170,7 @@ const SENSITIVE_SETTING_SEGMENTS = new Set([
   'credential',
   'credentials',
   'key',
+  'keys',
   'keychain',
   'keychains',
   'password',
@@ -178,6 +179,15 @@ const SENSITIVE_SETTING_SEGMENTS = new Set([
   'secrets',
   'token',
   'tokens',
+]);
+
+const SENSITIVE_SETTING_COMPOUND_ALIASES = new Set([
+  'apikey',
+  'apikeys',
+  'accesskey',
+  'accesskeys',
+  'accesstoken',
+  'accesstokens',
 ]);
 
 const ENVIRONMENT_REFERENCE_SEGMENTS = new Set(['id', 'identifier']);
@@ -1299,6 +1309,7 @@ function isSensitiveSettingKey(key: string): boolean {
   const segments = normalizedKeySegments(key);
   return (
     segments.some((segment) => SENSITIVE_SETTING_SEGMENTS.has(segment)) ||
+    SENSITIVE_SETTING_COMPOUND_ALIASES.has(segments.join('')) ||
     segments.some(
       (segment, index) =>
         (segment === 'environment' || segment === 'env') &&
