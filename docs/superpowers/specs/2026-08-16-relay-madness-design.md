@@ -91,9 +91,9 @@ A Project binds a GitHub repository to its default branch, local locator checkou
 
 ### WorkItem
 
-A WorkItem is one logical development objective. It owns the base branch, deterministic target branch, current full commit SHA, pull-request number, status, and provider sessions.
+A WorkItem is one logical development objective. It owns the base branch, reserved integration branch, current full commit SHA, pull-request number, status, and provider sessions.
 
-Only one mutating run may hold a WorkItem lease. Multiple read-only reviews may run concurrently when all are pinned to the same immutable SHA.
+Concurrent write runs are allowed only when each owns a distinct Relay-generated `relay/run/...` result branch. Provider-account capacity leases limit active execution, while a single landing lease serializes updates to each WorkItem integration branch. Read-only work remains pinned to its observed SHA. These state changes are transactionally coordinated so separate Relay processes cannot race past the configured capacity or landing boundary.
 
 ### ProviderSession
 
@@ -101,13 +101,25 @@ A ProviderSession records a provider’s logical session or task identity. It do
 
 ### ProviderRun
 
-A ProviderRun records one message, delegation, handoff, inspection, or publication attempt. Every run receives a Relay-generated correlation ID, parent run ID, origin, delegation depth, deadline, and mutation mode.
+A ProviderRun records one message, delegation, handoff, inspection, or publication attempt. Every run receives a Relay-generated correlation ID, optional parent run ID, origin, delegation depth, mutation mode, expected branch, and the relevant baseline or pinned SHA.
 
 Callers may not override Relay-generated lineage fields.
 
+### Provider accounts and usage telemetry
+
+A ProviderAccount holds a provider, label, local profile reference, status, concurrency capacity, and optional default flag. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are references only: Relay never stores provider credentials. macOS Claude authentication uses Keychain, so multiple Claude profiles should use isolated Linux bridge environments rather than attempting a shared macOS credential store.
+
+Weekly usage snapshots are caller-supplied advisory scheduling telemetry keyed by account and model. Relay records a finite 0–100 remaining percentage and normalized reset timestamp, but does not scrape provider interfaces, infer usage, or use snapshots to select an account or model. Users must follow provider terms, never share credentials, and must not use Relay to bypass quotas, protective limits, or account controls.
+
+### Candidate landing
+
+Every eligible completed write creates one immutable candidate from its isolated append-only `relay/run/...` branch. Landing is intentionally staged: the first `land(runId)` call creates an exact-SHA staging branch and checks it; the second fast-forwards only the WorkItem integration branch when that same staging SHA passes. Each WorkItem has one integration PR. Landing never merges the base branch or `main`; final base-branch merge remains the separate interactive human-approved flow.
+
+Relay verifies the branches and commits it observes, but its branch instructions and prompts do not authorize GitHub writes. A provider's native GitHub identity is a trusted writer unless repository administrators configure GitHub rulesets and least-privileged provider identities that restrict it to `relay/run/*`. Base and integration ref protection is a GitHub server-side responsibility; Relay does not claim local authorization enforcement it cannot provide.
+
 ### ArtifactSnapshot
 
-An ArtifactSnapshot records a full commit SHA, branch, pull request, draft state, mergeability, review decision, and normalized check summary observed from GitHub at a specific time.
+An ArtifactSnapshot records a full commit SHA, branch, publication or verification status, pull request, draft state, mergeability, review decision, and normalized check summary observed from GitHub at a specific time. Snapshots are historical; current operations reconcile GitHub again and clear canonical WorkItem SHA/PR fields if the expected branch has disappeared.
 
 ## State machine
 
@@ -125,9 +137,9 @@ queued
         └─> expired
 ```
 
-`provider_complete` means only that the provider reports completion. `published` means Relay found the expected remote ref or pull request. `verified` means Relay resolved the exact full SHA and recorded current GitHub checks.
+`provider_complete` means only that the provider reports completion. `published` means Relay found the expected remote ref at a full SHA. `verified` means Relay also found an open PR whose head branch and head SHA exactly match that ref and recorded its current required checks. A write run does not advance from provider completion when the expected branch still has the same SHA Relay observed before dispatch.
 
-A lost or expired provider session can be replaced. Recovery starts a new ProviderSession using a handoff packet built from the last verified ArtifactSnapshot.
+A lost or expired provider session can be replaced. Recovery first reconciles the expected GitHub branch, then starts a new ProviderSession from the currently observable published state. It does not reuse a stale SHA after a branch disappears.
 
 ## Provider contract
 
@@ -146,23 +158,23 @@ interface CloudProvider {
 }
 ```
 
-Capabilities are probed at runtime and cached briefly. The schema distinguishes `start`, `structuredStart`, `queueFollowup`, `interactiveAttach`, `structuredStatus`, `events`, `selectBranch`, `publishPullRequest`, `cancel`, and `subscriptionAuth`.
+Capabilities are probed at runtime. The schema distinguishes `start`, `structuredStart`, `queueFollowup`, `interactiveAttach`, `structuredStatus`, `events`, `selectBranch`, `publishPullRequest`, `cancel`, and `subscriptionAuth`.
 
 Higher-level code checks capabilities before selecting a path. An unsupported operation returns a typed `capability_unavailable` result; Relay does not emulate undocumented provider behavior.
 
 ### Claude adapter
 
-The Claude adapter invokes the authenticated `claude` CLI. It starts a cloud session from the project locator checkout, sends queue-and-exit follow-ups by session ID, and attaches interactively when the installed CLI supports attachment. It parses structured JSON when available and accepts documented Claude session URLs as a fallback identifier source.
+The Claude adapter invokes the authenticated `claude` CLI. It capability-probes cloud start, queue-and-exit follow-up, model selection, profile isolation, and interactive attachment rather than treating binary presence as support. It parses structured JSON when available and accepts only documented Claude session URLs as a fallback identifier source. Claude operations remain read-only until the CLI exposes exact Relay-controlled result-branch publication.
 
 Because Claude can complete without an automatically discoverable branch or pull request, publication and reconciliation remain separate phases.
 
 ### Jules adapter
 
-The Jules adapter uses the official REST API for session creation, follow-up messages, plan approval, inspection, activities, and automatic pull-request mode. It reads `JULES_API_KEY` at execution time and never persists the key. Jules API instability is isolated inside the adapter and tested against recorded schema-shaped fixtures.
+The Jules adapter uses the official REST API for read-only session creation, follow-up messages, plan approval, inspection, and activities. It reads `JULES_API_KEY` at execution time and never persists the key. Relay rejects Jules write mode because `AUTO_CREATE_PR` publishes to a Jules-selected branch rather than the exact Relay-controlled result ref. Jules API instability is isolated inside the adapter and tested against recorded schema-shaped fixtures.
 
 ### Codex adapter
 
-The Codex adapter invokes the authenticated `codex` CLI. It supports cloud task submission, listing, status inspection, and diff retrieval using a stored project environment ID. Programmatic follow-up is reported unavailable until OpenAI publishes a stable command or API. `relay chat codex` launches the native cloud interface as the interactive escape hatch.
+The Codex adapter invokes the authenticated `codex` CLI. It supports cloud task submission to an exact Relay-controlled result branch, listing, and status inspection using a stored project environment ID. Programmatic follow-up is reported unavailable until OpenAI publishes a stable command or API. `relay chat codex` launches the native cloud interface as the interactive escape hatch.
 
 ## Handoffs
 
@@ -179,7 +191,7 @@ Instruction: Review for correctness, security, and regressions.
 Expected output: Report findings against the pinned commit. Do not merge.
 ```
 
-Mutating handoffs allocate a new provider-specific target branch unless the previous writer has released the WorkItem lease. Read-only handoffs remain pinned to the source SHA and must report when the pull-request head moves during the review.
+Mutating handoffs allocate a new Relay-generated `relay/run/...` result branch and consume capacity on the selected provider account. Read-only handoffs remain pinned to the source SHA and must report when the pull-request head moves during the review.
 
 ## GitHub behavior
 
@@ -214,34 +226,38 @@ SQLite is the only Relay-owned durable store. The database contains:
 - `work_items`;
 - `provider_sessions`;
 - `provider_runs`;
+- `provider_accounts` and `account_leases`;
 - `artifact_snapshots`;
-- `work_item_leases`.
+- `candidates` and `landing_leases`.
 
 Foreign keys are enabled. Mutating state transitions run in transactions. The database and containing directory are created with user-only permissions.
 
-Prompts are stored only when the user has not enabled `privacy.storePrompts=false`. Provider credentials, environment variables containing credentials, raw process environments, and authentication output are never stored. Diagnostic output redacts values whose keys match token, secret, key, authorization, or credential patterns.
+Prompts are stored unless Relay was launched with `RELAY_STORE_PROMPTS=false`. Provider credentials, environment variables containing credentials, raw process environments, and authentication output are never stored. Diagnostic output redacts values whose keys match token, secret, key, authorization, or credential patterns.
 
 ## Recursion and resource controls
 
 Relay owns delegation lineage and enforces these defaults:
 
 - maximum delegation depth: 2;
-- maximum active mutating runs per WorkItem: 1;
-- maximum active read-only runs per WorkItem: 3;
+- configured provider-account capacity for active execution;
+- one unique `relay/run/...` result branch per concurrent write run;
+- one serialized landing lease per WorkItem integration branch;
 - maximum total runs per WorkItem: 20;
-- default run deadline: 60 minutes;
+- expired account and landing lease reclamation: 60 minutes;
 - explicit repository and provider membership in the Project.
 
 Provider cloud environments do not receive Relay bridge credentials. A delegated provider therefore cannot silently call back into Relay unless a future, explicitly configured deployment grants that capability.
 
 ## MCP surface
 
-`relay mcp` runs a STDIO server using the official TypeScript MCP SDK. It exposes four tools:
+`relay mcp` runs a STDIO server using the official TypeScript MCP SDK. It exposes six tools:
 
 - `relay_delegate` starts durable coding work;
 - `relay_send` continues a reusable provider session;
 - `relay_handoff` reconciles GitHub and transfers work to another provider;
 - `relay_status` returns provider and GitHub state.
+- `relay_accounts` read-only returns account ID, label, provider, status, capacity, active lease count, and latest model usage; it never returns profile paths.
+- `relay_land` is destructive because it mutates the WorkItem integration branch. It accepts only a run ID, returns candidate status and exact SHAs, and never merges `main`.
 
 All inputs use strict schemas and reject unknown fields. WorkItem and provider access is resolved by Relay Core rather than reimplemented in the MCP layer. Tool responses use stable machine-readable error codes and concise human-readable text.
 
@@ -251,7 +267,7 @@ The first release does not expose `relay_merge` through MCP and does not expose 
 
 Errors cross boundaries as typed Relay errors with a stable code, actionable message, and optional redacted cause. The CLI maps them to nonzero exit codes and concise terminal output. MCP maps them to structured tool errors.
 
-Provider subprocesses have explicit deadlines, preserve stdout and stderr separately, and include the executable plus argument names in diagnostics without printing prompts or credentials. Malformed provider output is retained only in redacted debug logs when debug logging is enabled.
+Provider subprocesses support explicit deadlines, preserve stdout and stderr separately, and report typed failures. Structured output is schema-validated, and diagnostic objects redact credential-shaped keys.
 
 Reconciliation failures do not discard provider results. They leave the run in `provider_complete`, `awaiting_publish`, or `published` with a recorded reason so the user can recover.
 
@@ -268,7 +284,7 @@ The suite covers:
 - Jules request and response schemas;
 - subprocess timeouts and redaction;
 - state migrations and transactional transitions;
-- WorkItem mutation leases;
+- provider-account capacity, isolated result branches, and serialized landing;
 - immutable handoff packets;
 - missing and moved GitHub branches;
 - pull-request and check normalization;
@@ -283,7 +299,7 @@ Real-account tests are opt-in, never run in public CI, and require explicit envi
 
 Runtime dependencies are limited to the official MCP TypeScript packages, Zod, Commander, and `better-sqlite3`. Process execution, HTTP requests, identifiers, paths, and the REPL use Node standard-library APIs.
 
-Existing open-source orchestrators may be studied for interoperability patterns. Code is copied only when its license is compatible with Apache-2.0, the copied portion materially reduces risk, and required attribution is preserved in `NOTICE`. GPL, AGPL, source-available, or unknown-license code is not incorporated into the core package.
+Existing open-source orchestrators may be studied for interoperability patterns. Code is copied only when its license is compatible with Apache-2.0, the copied portion materially reduces risk, and required attribution is preserved in `NOTICE`. MIT and Apache-2.0 source is never copied without that attribution. GPL, AGPL, source-available, or unknown-license code is not incorporated into the core package.
 
 ## Repository and release shape
 
