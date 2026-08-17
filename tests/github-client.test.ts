@@ -53,6 +53,20 @@ test('detects the repository and default branch through gh JSON', async () => {
   });
 });
 
+test('reports GitHub CLI authentication independently', async () => {
+  const authenticated = githubForScenario('project').github;
+  const loggedOut = githubForScenario('logged-out').github;
+
+  assert.deepEqual(await authenticated.authStatus(), {
+    authenticated: true,
+    method: 'gh CLI',
+  });
+  assert.deepEqual(await loggedOut.authStatus(), {
+    authenticated: false,
+    detail: 'GitHub CLI is not authenticated.',
+  });
+});
+
 test('reconciles an explicit branch to a full SHA and pull request', async () => {
   const { github } = githubForScenario('published');
 

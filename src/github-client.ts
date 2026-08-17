@@ -2,6 +2,7 @@ import * as z from 'zod/v4';
 
 import { RelayError } from './errors.js';
 import { ProcessRunner, type RunOptions } from './process-runner.js';
+import type { AuthStatus } from './provider.js';
 import type { CheckSummary } from './state-store.js';
 
 const projectSchema = z.object({
@@ -80,6 +81,31 @@ export class GitHubClient {
     private readonly runner: ProcessRunner,
     private readonly options: GitHubClientOptions = {},
   ) {}
+
+  async authStatus(): Promise<AuthStatus> {
+    try {
+      await this.runner.run(
+        'gh',
+        ['auth', 'status', '--active'],
+        this.runOptions(),
+      );
+      return { authenticated: true, method: 'gh CLI' };
+    } catch (error) {
+      if (
+        error instanceof RelayError &&
+        (error.code === 'command_not_found' || error.code === 'process_failed')
+      ) {
+        return {
+          authenticated: false,
+          detail:
+            error.code === 'command_not_found'
+              ? 'GitHub CLI is not installed.'
+              : 'GitHub CLI is not authenticated.',
+        };
+      }
+      throw error;
+    }
+  }
 
   async detectProject(cwd: string): Promise<DetectedProject> {
     const project = await this.runJson(

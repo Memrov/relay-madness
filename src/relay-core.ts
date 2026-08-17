@@ -93,6 +93,7 @@ export interface DoctorProviderReport {
 }
 
 export interface DoctorReport {
+  github: AuthStatus;
   providers: Readonly<Record<ProviderName, DoctorProviderReport>>;
 }
 
@@ -123,19 +124,25 @@ export class RelayCore {
   }
 
   async doctor(): Promise<DoctorReport> {
-    const entries = await Promise.all(
-      (['claude', 'codex', 'jules'] as const).map(async (name) => {
-        const provider = this.provider(name);
-        return [
-          name,
-          {
-            auth: await provider.authStatus(),
-            capabilities: await provider.capabilities(),
-          },
-        ] as const;
-      }),
-    );
-    return { providers: Object.fromEntries(entries) as DoctorReport['providers'] };
+    const [github, entries] = await Promise.all([
+      this.dependencies.github.authStatus(),
+      Promise.all(
+        (['claude', 'codex', 'jules'] as const).map(async (name) => {
+          const provider = this.provider(name);
+          return [
+            name,
+            {
+              auth: await provider.authStatus(),
+              capabilities: await provider.capabilities(),
+            },
+          ] as const;
+        }),
+      ),
+    ]);
+    return {
+      github,
+      providers: Object.fromEntries(entries) as DoctorReport['providers'],
+    };
   }
 
   async initialize(input: InitializeInput): Promise<ProjectRecord> {
