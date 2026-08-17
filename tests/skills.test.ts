@@ -12,12 +12,26 @@ import { dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 
 import { RelayError } from '../src/errors.js';
+import { ProcessRunner } from '../src/process-runner.js';
 import {
   appendSkillPacket,
   GitSkillResolver,
 } from '../src/skills.js';
 
 const roots: string[] = [];
+
+class RecordingRunner extends ProcessRunner {
+  readonly commands: Array<{ command: string; args: readonly string[] }> = [];
+
+  override async run(
+    command: string,
+    args: readonly string[],
+    options: Parameters<ProcessRunner['run']>[2] = {},
+  ) {
+    this.commands.push({ command, args: [...args] });
+    return await super.run(command, args, options);
+  }
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) {
@@ -63,7 +77,8 @@ test('resolves ordered repository skills from an exact commit without touching t
     'not valid frontmatter\n',
   );
 
-  const resolved = await new GitSkillResolver().resolve({
+  const runner = new RecordingRunner();
+  const resolved = await new GitSkillResolver(runner).resolve({
     repositoryPath: fixture.checkout,
     sourceSha,
     names: ['write-tests', 'review-security'],
@@ -94,6 +109,20 @@ test('resolves ordered repository skills from an exact commit without touching t
     ),
     'not valid frontmatter\n',
   );
+  assert.ok(
+    runner.commands.every(
+      ({ command, args }) =>
+        command === 'git' &&
+        args[0] === '-c' &&
+        args[1]?.startsWith('core.hooksPath=/') === true,
+    ),
+  );
+  assert.equal(
+    runner.commands.some(({ args }) =>
+      args.some((argument) => ['checkout', 'reset', 'merge'].includes(argument)),
+    ),
+    false,
+  );
 });
 
 test('rejects malformed names, duplicates, absent skills, and invalid frontmatter', async () => {
@@ -102,6 +131,21 @@ test('rejects malformed names, duplicates, absent skills, and invalid frontmatte
     fixture.checkout,
     'mismatch',
     `---\nname: another-name\ndescription: Does not match.\n---\n`,
+  );
+  writeSkill(
+    fixture.checkout,
+    'no-frontmatter',
+    '# Missing YAML frontmatter\n',
+  );
+  writeSkill(
+    fixture.checkout,
+    'yaml-alias',
+    `---\nname: &skill yaml-alias\ndescription: *skill\n---\n`,
+  );
+  writeSkill(
+    fixture.checkout,
+    'custom-tag',
+    `---\nname: custom-tag\ndescription: !private Review security.\n---\n`,
   );
   writeSkill(
     fixture.checkout,
@@ -139,7 +183,14 @@ test('rejects malformed names, duplicates, absent skills, and invalid frontmatte
     }),
     'not_found',
   );
-  for (const name of ['mismatch', 'missing-description', 'malformed-yaml']) {
+  for (const name of [
+    'mismatch',
+    'missing-description',
+    'malformed-yaml',
+    'no-frontmatter',
+    'yaml-alias',
+    'custom-tag',
+  ]) {
     await rejectsWithCode(
       resolver.resolve({
         repositoryPath: fixture.checkout,
