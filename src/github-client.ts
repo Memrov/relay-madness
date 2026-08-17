@@ -47,6 +47,30 @@ const checkSchema = z.object({
   link: z.string(),
 });
 
+const commitChecksSchema = z.object({
+  total_count: z.number().int().nonnegative(),
+  check_runs: z.array(
+    z.object({
+      name: z.string(),
+      status: z.string(),
+      conclusion: z.string().nullable(),
+      html_url: z.url(),
+    }),
+  ),
+});
+
+const createdPullRequestSchema = z.object({
+  number: z.number().int().positive(),
+  html_url: z.url(),
+  state: z.string(),
+  head: z.object({
+    ref: z.string(),
+    sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  }),
+  base: z.object({ ref: z.string() }),
+  draft: z.boolean(),
+});
+
 export interface DetectedProject {
   repo: string;
   defaultBranch: string;
@@ -72,8 +96,22 @@ export interface MergeInput {
   repo: string;
   pullRequest: number;
   expectedSha: string;
+  expectedBaseBranch: string;
   strategy: MergeStrategy;
   approved: boolean;
+}
+
+export interface EnsurePullRequestInput {
+  repo: string;
+  head: string;
+  base: string;
+  title: string;
+  body: string;
+}
+
+export interface PullRequestIdentity {
+  number: number;
+  url: string;
 }
 
 interface GitHubClientOptions {
@@ -146,6 +184,7 @@ export class GitHubClient {
   async reconcile(input: {
     repo: string;
     branch: string;
+    expectedBaseBranch: string;
     pullRequest?: number;
   }): Promise<GitHubArtifact> {
     const branchSha = await this.getBranchSha(input.repo, input.branch);
@@ -212,6 +251,11 @@ export class GitHubClient {
         { branchSha, pullRequestSha: view.data.headRefOid },
       );
     }
+    this.validatePullRequestBase(
+      pullRequestNumber,
+      view.data.baseRefName,
+      input.expectedBaseBranch,
+    );
     const artifact: GitHubArtifact = {
       status: 'verified',
       branch: input.branch,
@@ -244,6 +288,11 @@ export class GitHubClient {
     }
 
     const view = await this.inspectPullRequest(input.repo, input.pullRequest);
+    this.validatePullRequestBase(
+      input.pullRequest,
+      view.data.baseRefName,
+      input.expectedBaseBranch,
+    );
     if (view.data.headRefOid !== input.expectedSha) {
       throw new RelayError(
         'head_moved',
@@ -296,6 +345,105 @@ export class GitHubClient {
     );
   }
 
+  async getCommitChecks(repo: string, sha: string): Promise<CheckSummary> {
+    if (!/^[0-9a-f]{40}$/i.test(sha)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Commit checks require a full 40-character SHA.',
+      );
+    }
+    const result = await this.runJson(
+      ['api', `repos/${repo}/commits/${sha}/check-runs`],
+      commitChecksSchema,
+    );
+    if (result.total_count === 0 || result.check_runs.length === 0) {
+      return 'unknown';
+    }
+    const successful = new Set(['success', 'neutral', 'skipped']);
+    if (
+      result.check_runs.some(
+        (check) =>
+          check.status === 'completed' &&
+          (check.conclusion === null ||
+            !successful.has(check.conclusion.toLowerCase())),
+      )
+    ) {
+      return 'failing';
+    }
+    if (result.check_runs.some((check) => check.status !== 'completed')) {
+      return 'pending';
+    }
+    return 'passing';
+  }
+
+  async ensurePullRequest(
+    input: EnsurePullRequestInput,
+  ): Promise<PullRequestIdentity> {
+    const existing = await this.runJson(
+      [
+        'pr',
+        'list',
+        '--repo',
+        input.repo,
+        '--head',
+        input.head,
+        '--state',
+        'open',
+        '--json',
+        'number,url,state,headRefName,headRefOid,baseRefName,isDraft',
+      ],
+      z.array(pullRequestSchema),
+    );
+    if (existing.length > 1) {
+      throw new RelayError(
+        'github_state_mismatch',
+        `Integration branch ${input.head} has more than one open pull request.`,
+      );
+    }
+    const current = existing[0];
+    if (current !== undefined) {
+      if (current.headRefName !== input.head) {
+        throw new RelayError(
+          'github_state_mismatch',
+          `Pull request #${current.number} does not belong to branch ${input.head}.`,
+        );
+      }
+      this.validatePullRequestBase(current.number, current.baseRefName, input.base);
+      return { number: current.number, url: current.url };
+    }
+
+    const created = await this.runJson(
+      [
+        'api',
+        `repos/${input.repo}/pulls`,
+        '--method',
+        'POST',
+        '--field',
+        `head=${input.head}`,
+        '--field',
+        `base=${input.base}`,
+        '--field',
+        `title=${input.title}`,
+        '--field',
+        `body=${input.body}`,
+      ],
+      createdPullRequestSchema,
+    );
+    if (created.head.ref !== input.head || created.base.ref !== input.base) {
+      throw new RelayError(
+        'github_state_mismatch',
+        'GitHub created a pull request with unexpected branches.',
+        {
+          expectedHead: input.head,
+          observedHead: created.head.ref,
+          expectedBase: input.base,
+          observedBase: created.base.ref,
+        },
+      );
+    }
+    return { number: created.number, url: created.html_url };
+  }
+
   private async inspectPullRequest(repo: string, pullRequest: number) {
     const data = await this.runJson(
       [
@@ -311,6 +459,20 @@ export class GitHubClient {
     );
     const checks = await this.requiredChecks(repo, pullRequest);
     return { data, checks };
+  }
+
+  private validatePullRequestBase(
+    pullRequest: number,
+    observed: string,
+    expected: string,
+  ): void {
+    if (observed !== expected) {
+      throw new RelayError(
+        'github_state_mismatch',
+        `Pull request #${pullRequest} targets ${observed}, not WorkItem base ${expected}.`,
+        { expectedBaseBranch: expected, observedBaseBranch: observed },
+      );
+    }
   }
 
   private async requiredChecks(

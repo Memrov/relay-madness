@@ -159,6 +159,33 @@ export interface ArtifactRecord extends ArtifactInput {
   observedAt: string;
 }
 
+export type CandidateStatus =
+  | 'ready'
+  | 'staged'
+  | 'landed'
+  | 'conflict'
+  | 'checks_failed'
+  | 'stale'
+  | 'discarded';
+
+export interface CandidateRecord {
+  id: string;
+  runId: string;
+  workItemId: string;
+  status: CandidateStatus;
+  sourceBranch: string;
+  sourceSha: string;
+  baseSha: string;
+  stagingBranch?: string;
+  stagingSha?: string;
+  integrationBaseSha?: string;
+  integrationRefExisted?: boolean;
+  landedSha?: string;
+  conflictFiles: readonly string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WorkItemStatus {
   workItem: WorkItemRecord;
   sessions: readonly SessionRecord[];
@@ -929,6 +956,162 @@ export class StateStore {
       .run(workItemId, runId);
   }
 
+  createCandidateForRun(runId: string): CandidateRecord | undefined {
+    return this.database.transaction(() => {
+      const existing = this.getCandidate(runId);
+      if (existing !== undefined) return existing;
+      const row = this.requiredRow(
+        this.database
+          .prepare(
+            `SELECT id, work_item_id, mutation_mode, expected_branch, base_sha,
+                    result_sha
+             FROM provider_runs WHERE id = ?`,
+          )
+          .get(runId),
+        `Run ${runId} was not found.`,
+      );
+      const sourceBranch = nullableString(row.expected_branch);
+      const baseSha = nullableString(row.base_sha);
+      const sourceSha = nullableString(row.result_sha);
+      if (
+        row.mutation_mode !== 'write' ||
+        sourceBranch === undefined ||
+        !sourceBranch.startsWith('relay/run/') ||
+        baseSha === undefined ||
+        sourceSha === undefined ||
+        !isFullSha(baseSha) ||
+        !isFullSha(sourceSha) ||
+        baseSha === sourceSha
+      ) {
+        return undefined;
+      }
+
+      const now = new Date().toISOString();
+      this.database
+        .prepare(
+          `INSERT INTO candidates (
+            run_id, work_item_id, status, source_branch, source_sha, base_sha,
+            conflict_paths_json, created_at, updated_at
+          ) VALUES (?, ?, 'ready', ?, ?, ?, '[]', ?, ?)`,
+        )
+        .run(runId, row.work_item_id, sourceBranch, sourceSha, baseSha, now, now);
+      return this.getCandidate(runId);
+    }).immediate();
+  }
+
+  getCandidate(runId: string): CandidateRecord | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM candidates WHERE run_id = ?')
+      .get(runId) as SqlRow | undefined;
+    return row === undefined ? undefined : this.candidateFromRow(row);
+  }
+
+  recordCandidateStage(
+    runId: string,
+    input: {
+      stagingBranch: string;
+      stagingSha: string;
+      integrationBaseSha: string;
+      integrationRefExisted: boolean;
+    },
+  ): CandidateRecord {
+    if (
+      !isFullSha(input.stagingSha) ||
+      !isFullSha(input.integrationBaseSha) ||
+      input.stagingBranch.length === 0
+    ) {
+      throw new RelayError('invalid_argument', 'Candidate staging fields are invalid.');
+    }
+    const result = this.database
+      .prepare(
+        `UPDATE candidates SET status = 'staged', staging_branch = ?,
+           staging_sha = ?, integration_base_sha = ?, integration_ref_existed = ?,
+           landed_sha = NULL,
+           conflict_paths_json = '[]', updated_at = ? WHERE run_id = ?`,
+      )
+      .run(
+        input.stagingBranch,
+        input.stagingSha,
+        input.integrationBaseSha,
+        Number(input.integrationRefExisted),
+        new Date().toISOString(),
+        runId,
+      );
+    if (result.changes !== 1) {
+      throw new RelayError('not_found', `Candidate ${runId} was not found.`);
+    }
+    return this.getCandidate(runId)!;
+  }
+
+  setCandidateStatus(
+    runId: string,
+    status: Exclude<CandidateStatus, 'ready' | 'staged'>,
+    input: { landedSha?: string; conflictFiles?: readonly string[] } = {},
+  ): CandidateRecord {
+    if (input.landedSha !== undefined && !isFullSha(input.landedSha)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Candidate landed SHA must contain exactly 40 hexadecimal characters.',
+      );
+    }
+    const result = this.database
+      .prepare(
+        `UPDATE candidates SET status = ?, landed_sha = ?,
+           conflict_paths_json = ?, updated_at = ? WHERE run_id = ?`,
+      )
+      .run(
+        status,
+        input.landedSha ?? null,
+        JSON.stringify(input.conflictFiles ?? []),
+        new Date().toISOString(),
+        runId,
+      );
+    if (result.changes !== 1) {
+      throw new RelayError('not_found', `Candidate ${runId} was not found.`);
+    }
+    return this.getCandidate(runId)!;
+  }
+
+  acquireLandingLease(
+    workItemId: string,
+    runId: string,
+    now = new Date(),
+  ): void {
+    if (!isValidDate(now)) {
+      throw new RelayError('invalid_argument', 'Lease time must be a valid date.');
+    }
+    this.database.transaction(() => {
+      const nowText = now.toISOString();
+      this.database
+        .prepare('DELETE FROM landing_leases WHERE expires_at <= ?')
+        .run(nowText);
+      const existing = this.database
+        .prepare('SELECT run_id FROM landing_leases WHERE work_item_id = ?')
+        .get(workItemId) as { run_id: string } | undefined;
+      if (existing !== undefined) {
+        throw new RelayError(
+          'work_item_locked',
+          `WorkItem ${workItemId} already has an active landing attempt.`,
+        );
+      }
+      const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+      this.database
+        .prepare(
+          `INSERT INTO landing_leases (work_item_id, run_id, acquired_at, expires_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(workItemId, runId, nowText, expiresAt);
+    }).immediate();
+  }
+
+  releaseLandingLease(workItemId: string, runId: string): void {
+    this.database
+      .prepare(
+        'DELETE FROM landing_leases WHERE work_item_id = ? AND run_id = ?',
+      )
+      .run(workItemId, runId);
+  }
+
   saveArtifact(input: ArtifactInput): ArtifactRecord {
     if (!/^[0-9a-f]{40}$/i.test(input.sha)) {
       throw new RelayError(
@@ -960,18 +1143,20 @@ export class StateStore {
           input.draft === undefined ? null : Number(input.draft),
           observedAt,
         );
-      this.database
-        .prepare(
-          `UPDATE work_items SET current_branch = ?, current_sha = ?,
-             pull_request = ?, updated_at = ? WHERE id = ?`,
-        )
-        .run(
-          input.branch,
-          input.sha,
-          input.pullRequest ?? null,
-          observedAt,
-          input.workItemId,
-        );
+      if (!input.branch.startsWith('relay/run/')) {
+        this.database
+          .prepare(
+            `UPDATE work_items SET current_branch = ?, current_sha = ?,
+               pull_request = ?, updated_at = ? WHERE id = ?`,
+          )
+          .run(
+            input.branch,
+            input.sha,
+            input.pullRequest ?? null,
+            observedAt,
+            input.workItemId,
+          );
+      }
       return this.artifactFromRow(
         this.requiredRow(
           this.database
@@ -1254,6 +1439,39 @@ export class StateStore {
         throw new Error('Migration 4 left foreign-key violations.');
       }
     }
+    if (!applied.has(5)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          CREATE TABLE candidates (
+            run_id TEXT PRIMARY KEY REFERENCES provider_runs(id) ON DELETE CASCADE,
+            work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK(status IN (
+              'ready','staged','landed','conflict','checks_failed','stale','discarded'
+            )),
+            source_branch TEXT NOT NULL,
+            source_sha TEXT NOT NULL,
+            base_sha TEXT NOT NULL,
+            staging_branch TEXT,
+            staging_sha TEXT,
+            integration_base_sha TEXT,
+            integration_ref_existed INTEGER CHECK(integration_ref_existed IN (0,1)),
+            landed_sha TEXT,
+            conflict_paths_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          CREATE INDEX candidates_work_item_status
+            ON candidates(work_item_id, status, created_at);
+          CREATE TABLE landing_leases (
+            work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL REFERENCES provider_runs(id) ON DELETE CASCADE,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+          );
+        `);
+        this.recordMigration(5);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -1430,6 +1648,49 @@ export class StateStore {
     if (row.draft !== null) record.draft = Boolean(row.draft);
     return record;
   }
+
+  private candidateFromRow(row: SqlRow): CandidateRecord {
+    const record: CandidateRecord = {
+      id: String(row.run_id),
+      runId: String(row.run_id),
+      workItemId: String(row.work_item_id),
+      status: String(row.status) as CandidateStatus,
+      sourceBranch: String(row.source_branch),
+      sourceSha: String(row.source_sha),
+      baseSha: String(row.base_sha),
+      conflictFiles: parseStringArray(row.conflict_paths_json),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+    if (row.staging_branch !== null) {
+      record.stagingBranch = String(row.staging_branch);
+    }
+    if (row.staging_sha !== null) record.stagingSha = String(row.staging_sha);
+    if (row.integration_base_sha !== null) {
+      record.integrationBaseSha = String(row.integration_base_sha);
+    }
+    if (row.integration_ref_existed !== null) {
+      record.integrationRefExisted = Boolean(row.integration_ref_existed);
+    }
+    if (row.landed_sha !== null) record.landedSha = String(row.landed_sha);
+    return record;
+  }
+}
+
+function nullableString(value: unknown): string | undefined {
+  return value === null || value === undefined ? undefined : String(value);
+}
+
+function isFullSha(value: string): boolean {
+  return /^[0-9a-f]{40}$/i.test(value);
+}
+
+function parseStringArray(value: unknown): readonly string[] {
+  const parsed: unknown = JSON.parse(String(value));
+  if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== 'string')) {
+    throw new Error('Candidate conflict paths are malformed.');
+  }
+  return parsed as string[];
 }
 
 function containsSensitiveSetting(value: unknown, key = ''): boolean {

@@ -477,13 +477,21 @@ export class RelayCore {
   ): Promise<ArtifactRecord | undefined> {
     const context = await this.resolveWorkItem(input);
     const status = this.dependencies.store.getStatus(context.workItem.id);
-    const run = [...status.runs]
-      .reverse()
-      .find((candidate) =>
-        ['provider_complete', 'awaiting_publish', 'published'].includes(
-          candidate.status,
-        ),
-      );
+    const latestArtifactIsIntegration =
+      status.artifact?.branch === context.workItem.currentBranch &&
+      context.workItem.pullRequest !== undefined;
+    const run = latestArtifactIsIntegration
+      ? undefined
+      : [...status.runs]
+          .reverse()
+          .find((candidate) =>
+            [
+              'provider_complete',
+              'awaiting_publish',
+              'published',
+              'verified',
+            ].includes(candidate.status),
+          );
     const branch =
       run?.expectedBranch ??
       context.workItem.currentBranch ??
@@ -492,6 +500,7 @@ export class RelayCore {
       const observed = await this.dependencies.github.reconcile({
         repo: context.project.repo,
         branch,
+        expectedBaseBranch: context.workItem.baseBranch,
         ...(context.workItem.pullRequest === undefined
           ? {}
           : { pullRequest: context.workItem.pullRequest }),
@@ -642,6 +651,7 @@ export class RelayCore {
       repo: context.project.repo,
       pullRequest: artifact.pullRequest,
       expectedSha: artifact.sha,
+      expectedBaseBranch: context.workItem.baseBranch,
       strategy: input.strategy,
       approved: input.approved,
     });
@@ -879,6 +889,7 @@ export class RelayCore {
     const observed = await this.dependencies.github.reconcile({
       repo: context.project.repo,
       branch,
+      expectedBaseBranch: context.workItem.baseBranch,
       ...(pullRequest === undefined ? {} : { pullRequest }),
     });
 
@@ -895,6 +906,7 @@ export class RelayCore {
     }
     if (run.mutationMode === 'write' && observed.sha !== undefined) {
       run = this.dependencies.store.setRunResultSha(run.id, observed.sha);
+      this.dependencies.store.createCandidateForRun(run.id);
     }
     const artifact = this.persistArtifact(context.workItem.id, observed);
 
@@ -929,7 +941,9 @@ export class RelayCore {
     observed: Awaited<ReturnType<GitHubClient['reconcile']>>,
   ): ArtifactRecord | undefined {
     if (observed.sha === undefined) {
-      this.dependencies.store.markArtifactMissing(workItemId, observed.branch);
+      if (!isResultBranch(observed.branch)) {
+        this.dependencies.store.markArtifactMissing(workItemId, observed.branch);
+      }
       return undefined;
     }
     const input: ArtifactInput = {

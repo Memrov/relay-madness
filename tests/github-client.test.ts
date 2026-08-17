@@ -73,6 +73,7 @@ test('reconciles an explicit branch to a full SHA and pull request', async () =>
   const state = await github.reconcile({
     repo: 'acme/web',
     branch: 'relay/auth',
+    expectedBaseBranch: 'main',
   });
 
   assert.equal(state.status, 'verified');
@@ -87,6 +88,7 @@ test('reports an explicit missing branch as awaiting publish', async () => {
   const state = await github.reconcile({
     repo: 'acme/web',
     branch: 'relay/auth',
+    expectedBaseBranch: 'main',
   });
 
   assert.deepEqual(state, {
@@ -100,7 +102,11 @@ test('rejects pull-request truth from a different head SHA', async () => {
   const { github } = githubForScenario('pr-head-mismatch');
 
   await assert.rejects(
-    github.reconcile({ repo: 'acme/web', branch: 'relay/auth' }),
+    github.reconcile({
+      repo: 'acme/web',
+      branch: 'relay/auth',
+      expectedBaseBranch: 'main',
+    }),
     /does not match the expected branch SHA/,
   );
 });
@@ -113,6 +119,7 @@ test('rejects a stored pull request for a different branch', async () => {
       repo: 'acme/web',
       branch: 'relay/auth',
       pullRequest: 143,
+      expectedBaseBranch: 'main',
     }),
     /does not belong to branch relay\/auth/,
   );
@@ -126,6 +133,7 @@ test('refuses merge without explicit approval', async () => {
       repo: 'acme/web',
       pullRequest: 143,
       expectedSha: 'b'.repeat(40),
+      expectedBaseBranch: 'main',
       strategy: 'squash',
       approved: false,
     }),
@@ -142,6 +150,7 @@ test('refuses merge when the observed head differs from the approved SHA', async
       repo: 'acme/web',
       pullRequest: 143,
       expectedSha: 'a'.repeat(40),
+      expectedBaseBranch: 'main',
       strategy: 'squash',
       approved: true,
     }),
@@ -158,6 +167,7 @@ test('refuses merge while required checks are failing', async () => {
       repo: 'acme/web',
       pullRequest: 143,
       expectedSha: 'b'.repeat(40),
+      expectedBaseBranch: 'main',
       strategy: 'squash',
       approved: true,
     }),
@@ -174,6 +184,7 @@ test('refuses merge when the pull request is no longer open', async () => {
       repo: 'acme/web',
       pullRequest: 143,
       expectedSha: 'b'.repeat(40),
+      expectedBaseBranch: 'main',
       strategy: 'squash',
       approved: true,
     }),
@@ -189,6 +200,7 @@ test('uses the full expected SHA when every merge gate passes', async () => {
     repo: 'acme/web',
     pullRequest: 143,
     expectedSha: 'b'.repeat(40),
+    expectedBaseBranch: 'main',
     strategy: 'squash',
     approved: true,
   });
@@ -206,4 +218,93 @@ test('uses the full expected SHA when every merge gate passes', async () => {
     '--match-head-commit',
     'b'.repeat(40),
   ]);
+});
+
+test('rejects reconciliation when a pull request targets another base branch', async () => {
+  const { github } = githubForScenario('published');
+
+  await assert.rejects(
+    github.reconcile({
+      repo: 'acme/web',
+      branch: 'relay/auth',
+      expectedBaseBranch: 'release',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'github_state_mismatch',
+  );
+});
+
+test('rejects final merge when the pull request targets another base branch', async () => {
+  const { github, readCommands } = githubForScenario('mergeable');
+
+  await assert.rejects(
+    github.merge({
+      repo: 'acme/web',
+      pullRequest: 143,
+      expectedSha: 'b'.repeat(40),
+      expectedBaseBranch: 'release',
+      strategy: 'squash',
+      approved: true,
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'github_state_mismatch',
+  );
+  assert.equal(
+    readCommands().some((args) => args[0] === 'pr' && args[1] === 'merge'),
+    false,
+  );
+});
+
+test('summarizes checks for the exact commit SHA', async () => {
+  const passing = githubForScenario('commit-checks-passing').github;
+  const pending = githubForScenario('commit-checks-pending').github;
+  const failing = githubForScenario('commit-checks-failing').github;
+  const mixed = githubForScenario('commit-checks-mixed').github;
+  const unknown = githubForScenario('commit-checks-unknown').github;
+  const sha = 'e'.repeat(40);
+
+  assert.equal(await passing.getCommitChecks('acme/web', sha), 'passing');
+  assert.equal(await pending.getCommitChecks('acme/web', sha), 'pending');
+  assert.equal(await failing.getCommitChecks('acme/web', sha), 'failing');
+  assert.equal(await mixed.getCommitChecks('acme/web', sha), 'failing');
+  assert.equal(await unknown.getCommitChecks('acme/web', sha), 'unknown');
+});
+
+test('reuses one correctly targeted integration pull request', async () => {
+  const { github, readCommands } = githubForScenario('published');
+
+  const pullRequest = await github.ensurePullRequest({
+    repo: 'acme/web',
+    head: 'relay/auth',
+    base: 'main',
+    title: 'Relay integration',
+    body: 'Prepared by Relay.',
+  });
+
+  assert.equal(pullRequest.number, 143);
+  assert.equal(
+    readCommands().some(
+      (args) => args[0] === 'api' && args.includes('--method') && args.includes('POST'),
+    ),
+    false,
+  );
+});
+
+test('creates an integration pull request only when no matching head exists', async () => {
+  const { github, readCommands } = githubForScenario('no-pr');
+
+  const pullRequest = await github.ensurePullRequest({
+    repo: 'acme/web',
+    head: 'relay/auth',
+    base: 'main',
+    title: 'Relay integration',
+    body: 'Prepared by Relay.',
+  });
+
+  assert.equal(pullRequest.number, 144);
+  assert.ok(
+    readCommands().some(
+      (args) => args[0] === 'api' && args.includes('--method') && args.includes('POST'),
+    ),
+  );
 });

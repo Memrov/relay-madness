@@ -433,6 +433,7 @@ test('marks provider completion as awaiting publish until GitHub resolves the br
 
 test('records a full verified SHA after a provider publishes', async () => {
   const harness = await relayHarness({
+    githubScenario: 'base-a',
     providerStatus: 'provider_complete',
   });
   harness.claude.onStart = (input) => {
@@ -451,6 +452,12 @@ test('records a full verified SHA after a provider publishes', async () => {
   assert.equal(result.artifact?.sha, 'b'.repeat(40));
   assert.equal(result.artifact?.pullRequest, 143);
   assert.equal(result.artifact?.status, 'verified');
+  assert.match(result.workItem.currentBranch ?? '', /^relay\/work\//);
+  assert.notEqual(result.workItem.currentBranch, result.run.expectedBranch);
+  assert.equal(
+    harness.store.getCandidate(result.run.id)?.sourceSha,
+    'b'.repeat(40),
+  );
 });
 
 test('credits a completed isolated result branch even when its commit equals the base SHA', async () => {
@@ -589,7 +596,7 @@ test('reconciles a mutating handoff against its isolated result branch', async (
   assert.equal(artifact?.status, 'verified');
   assert.equal(
     harness.store.getWorkItem(original.workItem.id).currentBranch,
-    handoff.run.expectedBranch,
+    original.workItem.currentBranch,
   );
 });
 

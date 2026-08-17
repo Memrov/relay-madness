@@ -435,6 +435,125 @@ test('round-trips run publication expectations', () => {
   store.close();
 });
 
+test('persists one immutable ready candidate from a complete write run', () => {
+  const store = openStore();
+  const { workItem, session } = seed(store);
+  const run = store.createRun({
+    id: 'candidate-run',
+    sessionId: session.id,
+    provider: 'claude',
+    type: 'delegation',
+    mutationMode: 'write',
+    expectedBranch: 'relay/run/work-1/candidate-run',
+    baseSha: 'a'.repeat(40),
+    resultSha: 'b'.repeat(40),
+  });
+
+  const candidate = store.createCandidateForRun(run.id);
+  store.setRunResultSha(run.id, 'c'.repeat(40));
+  const repeated = store.createCandidateForRun(run.id);
+
+  assert.equal(candidate?.id, run.id);
+  assert.equal(candidate?.runId, run.id);
+  assert.equal(candidate?.workItemId, workItem.id);
+  assert.equal(candidate?.status, 'ready');
+  assert.equal(candidate?.sourceBranch, 'relay/run/work-1/candidate-run');
+  assert.equal(candidate?.sourceSha, 'b'.repeat(40));
+  assert.equal(candidate?.baseSha, 'a'.repeat(40));
+  assert.deepEqual(candidate?.conflictFiles, []);
+  assert.equal(repeated?.sourceSha, 'b'.repeat(40));
+  assert.equal(store.getCandidate(run.id)?.sourceSha, 'b'.repeat(40));
+  store.close();
+});
+
+test('does not create candidates from messages, missing branches, or unchanged bases', () => {
+  const store = openStore();
+  const { session } = seed(store);
+  const inputs = [
+    {
+      id: 'message-only',
+      mutationMode: 'write' as const,
+      prompt: `Published commit ${'b'.repeat(40)} in PR #123`,
+      baseSha: 'a'.repeat(40),
+    },
+    {
+      id: 'missing-branch',
+      mutationMode: 'write' as const,
+      baseSha: 'a'.repeat(40),
+      resultSha: 'b'.repeat(40),
+    },
+    {
+      id: 'unchanged',
+      mutationMode: 'write' as const,
+      expectedBranch: 'relay/run/work-1/unchanged',
+      baseSha: 'a'.repeat(40),
+      resultSha: 'a'.repeat(40),
+    },
+    {
+      id: 'read-run',
+      mutationMode: 'read' as const,
+      expectedBranch: 'relay/run/work-1/read-run',
+      baseSha: 'a'.repeat(40),
+      resultSha: 'b'.repeat(40),
+    },
+  ];
+
+  for (const input of inputs) {
+    const run = store.createRun({
+      sessionId: session.id,
+      provider: 'claude',
+      type: 'message',
+      ...input,
+    });
+    assert.equal(store.createCandidateForRun(run.id), undefined);
+  }
+  store.close();
+});
+
+test('allows only one landing lease per WorkItem and reclaims it after sixty minutes', () => {
+  const store = openStore();
+  const { workItem, session } = seed(store);
+  const first = store.createRun({
+    id: 'landing-a',
+    sessionId: session.id,
+    provider: 'claude',
+    type: 'delegation',
+    mutationMode: 'write',
+  });
+  const second = store.createRun({
+    id: 'landing-b',
+    sessionId: session.id,
+    provider: 'claude',
+    type: 'delegation',
+    mutationMode: 'write',
+  });
+
+  store.acquireLandingLease(
+    workItem.id,
+    first.id,
+    new Date('2026-08-16T12:00:00Z'),
+  );
+  assert.throws(
+    () =>
+      store.acquireLandingLease(
+        workItem.id,
+        second.id,
+        new Date('2026-08-16T12:00:01Z'),
+      ),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'work_item_locked',
+  );
+  assert.doesNotThrow(() =>
+    store.acquireLandingLease(
+      workItem.id,
+      second.id,
+      new Date('2026-08-16T13:00:01Z'),
+    ),
+  );
+  store.releaseLandingLease(workItem.id, second.id);
+  store.close();
+});
+
 test('prefers an existing active session over newer pending or failed attempts', () => {
   const store = openStore();
   const { workItem, session } = seed(store);
@@ -469,11 +588,17 @@ test('applies ordered schema migrations', () => {
   const artifactColumns = database.pragma(
     'table_info(artifact_snapshots)',
   ) as Array<{ name: string }>;
+  const candidateColumns = database.pragma('table_info(candidates)') as Array<{
+    name: string;
+  }>;
+  const landingLeaseColumns = database.pragma(
+    'table_info(landing_leases)',
+  ) as Array<{ name: string }>;
   database.close();
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3, 4],
+    [1, 2, 3, 4, 5],
   );
   assert.ok(runColumns.some(({ name }) => name === 'baseline_sha'));
   assert.ok(runColumns.some(({ name }) => name === 'account_id'));
@@ -483,6 +608,12 @@ test('applies ordered schema migrations', () => {
   assert.ok(
     artifactColumns.some(({ name }) => name === 'verification_status'),
   );
+  assert.ok(candidateColumns.some(({ name }) => name === 'integration_base_sha'));
+  assert.ok(
+    candidateColumns.some(({ name }) => name === 'integration_ref_existed'),
+  );
+  assert.ok(candidateColumns.some(({ name }) => name === 'conflict_paths_json'));
+  assert.ok(landingLeaseColumns.some(({ name }) => name === 'expires_at'));
 });
 
 test('migrates a populated version-three database without deleting legacy runs', () => {
