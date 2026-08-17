@@ -19,6 +19,8 @@ export type RelayErrorCode =
   | 'provider_output_invalid'
   | 'remote_request_failed'
   | 'run_budget_exceeded'
+  | 'state_conflict'
+  | 'instruction_surface_changed'
   | 'work_item_locked';
 
 export class RelayError extends Error {
