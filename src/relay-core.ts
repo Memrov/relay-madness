@@ -10,6 +10,7 @@ import type {
   ProviderCapabilities,
   ProviderExecution,
   ProviderName,
+  ProviderRunStatus,
 } from './provider.js';
 import type {
   ArtifactInput,
@@ -116,6 +117,7 @@ interface StartExecutionInput {
   parentRunId?: string;
   startBranch: string;
   expectedBranch: string;
+  pinnedSha?: string;
 }
 
 const ACTIVE_RUN_STATUSES = new Set(['queued', 'running']);
@@ -177,6 +179,7 @@ export class RelayCore {
       task: input.task,
       project: context.project,
       workItem: context.workItem,
+      mode,
     });
     return await this.executeStart({
       provider: input.provider,
@@ -201,18 +204,26 @@ export class RelayCore {
       context.workItem.id,
       input.provider,
     );
+    if (session?.status === 'pending') {
+      throw new RelayError(
+        'work_item_locked',
+        `${input.provider} session creation is already in progress for this WorkItem.`,
+      );
+    }
     if (session === undefined) {
+      const mode = input.mode ?? 'read';
       return await this.executeStart({
         provider: input.provider,
         prompt: buildDelegationPrompt({
           task: input.message,
           project: context.project,
           workItem: context.workItem,
+          mode,
         }),
         type: 'message',
         project: context.project,
         workItem: context.workItem,
-        mode: input.mode ?? 'read',
+        mode,
         ...(input.parentRunId === undefined
           ? {}
           : { parentRunId: input.parentRunId }),
@@ -224,9 +235,9 @@ export class RelayCore {
     }
 
     if (session.status === 'expired' || session.status === 'failed') {
-      const artifact = this.dependencies.store.getLatestArtifact(
-        context.workItem.id,
-      );
+      const artifact = await this.reconcile({
+        workItemId: context.workItem.id,
+      });
       const recoveryPrompt = buildRecoveryPrompt({
         repo: context.project.repo,
         title: context.workItem.title,
@@ -265,13 +276,27 @@ export class RelayCore {
 
     const mode = input.mode ?? 'read';
     const lineage = this.lineage(input.parentRunId, input.provider);
-    this.assertReadCapacity(context.workItem.id, mode);
+    const expectedBranch =
+      context.workItem.currentBranch ?? context.workItem.baseBranch;
+    const baselineSha = await this.dependencies.github.getBranchSha(
+      context.project.repo,
+      expectedBranch,
+    );
+    const executionMessage =
+      mode === 'read' && baselineSha !== undefined
+        ? `${input.message}\n\nPinned commit: ${baselineSha}\nDo not push or merge.`
+        : input.message;
     let run = this.dependencies.store.createRun({
       sessionId: session.id,
       provider: input.provider,
       type: 'message',
-      ...(this.storePrompts ? { prompt: input.message } : {}),
+      ...(this.storePrompts ? { prompt: executionMessage } : {}),
       mutationMode: mode,
+      expectedBranch,
+      ...(baselineSha === undefined ? {} : { baselineSha }),
+      ...(mode === 'read' && baselineSha !== undefined
+        ? { pinnedSha: baselineSha }
+        : {}),
       ...lineage,
     });
     let leaseHeld = false;
@@ -288,7 +313,7 @@ export class RelayCore {
       const config = this.providerConfig(context.project.id, input.provider);
       const execution = await provider.send({
         providerSessionId: session.providerSessionId,
-        message: input.message,
+        message: executionMessage,
         cwd: context.project.locatorPath,
         ...optionalString(config, 'environmentId'),
       });
@@ -297,7 +322,7 @@ export class RelayCore {
         workItemId: context.workItem.id,
         provider: input.provider,
         providerSessionId: session.providerSessionId,
-        status: execution.status === 'failed' ? 'failed' : 'active',
+        status: sessionStatusFor(execution.status),
         ...(context.workItem.currentBranch === undefined
           ? {}
           : { branch: context.workItem.currentBranch }),
@@ -307,7 +332,7 @@ export class RelayCore {
       const reconciled = await this.reconcileRun(
         context,
         run,
-        context.workItem.currentBranch ?? context.workItem.baseBranch,
+        expectedBranch,
       );
       run = reconciled.run;
       if (!ACTIVE_RUN_STATUSES.has(run.status) && leaseHeld) {
@@ -323,6 +348,7 @@ export class RelayCore {
         context.workItem.id,
         session.id,
         run.id,
+        reconciled.artifact,
       );
     } catch (error) {
       if (!providerAccepted) {
@@ -342,14 +368,13 @@ export class RelayCore {
 
   async handoff(input: HandoffInput): Promise<HandoffResult> {
     const context = await this.resolveWorkItem(input);
-    await this.reconcile({ workItemId: context.workItem.id });
-    const artifact = this.dependencies.store.getLatestArtifact(
-      context.workItem.id,
-    );
+    const artifact = await this.reconcile({
+      workItemId: context.workItem.id,
+    });
     if (artifact === undefined) {
       throw new RelayError(
         'not_found',
-        `WorkItem ${context.workItem.id} has no verified GitHub artifact to hand off.`,
+        `WorkItem ${context.workItem.id} has no current published GitHub artifact to hand off.`,
       );
     }
 
@@ -386,6 +411,7 @@ export class RelayCore {
         : { parentRunId: input.parentRunId }),
       startBranch: artifact.branch,
       expectedBranch: targetBranch ?? artifact.branch,
+      ...(mode === 'read' ? { pinnedSha: artifact.sha } : {}),
     });
     return { ...result, prompt };
   }
@@ -402,7 +428,10 @@ export class RelayCore {
           candidate.status,
         ),
       );
-    const branch = context.workItem.currentBranch ?? context.workItem.baseBranch;
+    const branch =
+      run?.expectedBranch ??
+      context.workItem.currentBranch ??
+      context.workItem.baseBranch;
     if (run === undefined) {
       const observed = await this.dependencies.github.reconcile({
         repo: context.project.repo,
@@ -420,10 +449,12 @@ export class RelayCore {
     const context = await this.resolveWorkItem(input);
     const before = this.dependencies.store.getStatus(context.workItem.id);
     const currentByProvider = new Map<ProviderName, SessionRecord>();
-    for (const session of [...before.sessions].reverse()) {
-      if (!currentByProvider.has(session.provider)) {
-        currentByProvider.set(session.provider, session);
-      }
+    for (const name of ['claude', 'codex', 'jules'] as const) {
+      const session = this.dependencies.store.getSession(
+        context.workItem.id,
+        name,
+      );
+      if (session !== undefined) currentByProvider.set(name, session);
     }
 
     for (const [name, session] of currentByProvider) {
@@ -447,27 +478,58 @@ export class RelayCore {
         status: inspection.status,
         ...(inspection.url === undefined ? {} : { url: inspection.url }),
       };
+      this.dependencies.store.upsertSession({
+        workItemId: context.workItem.id,
+        provider: name,
+        providerSessionId: session.providerSessionId,
+        status: sessionStatusFor(execution.status),
+        ...(session.branch === undefined ? {} : { branch: session.branch }),
+        ...(inspection.url === undefined
+          ? session.providerUrl === undefined
+            ? {}
+            : { providerUrl: session.providerUrl }
+          : { providerUrl: inspection.url }),
+      });
       const updated = this.applyProviderStatus(run, execution);
-      if (!ACTIVE_RUN_STATUSES.has(updated.status)) {
-        await this.reconcileRun(
-          context,
-          updated,
-          context.workItem.currentBranch ?? context.workItem.baseBranch,
-        );
+      if (ACTIVE_RUN_STATUSES.has(updated.status)) {
         if (updated.mutationMode === 'write') {
-          this.dependencies.store.releaseMutationLease(
+          this.dependencies.store.acquireMutationLease(
             context.workItem.id,
             updated.id,
           );
         }
+      } else {
+        try {
+          await this.reconcileRun(
+            context,
+            updated,
+            updated.expectedBranch ??
+              context.workItem.currentBranch ??
+              context.workItem.baseBranch,
+          );
+        } finally {
+          if (updated.mutationMode === 'write') {
+            this.dependencies.store.releaseMutationLease(
+              context.workItem.id,
+              updated.id,
+            );
+          }
+        }
       }
     }
 
-    await this.reconcile({ workItemId: context.workItem.id });
-    return {
+    const artifact = await this.reconcile({
+      workItemId: context.workItem.id,
+    });
+    const stored = this.dependencies.store.getStatus(context.workItem.id);
+    const result: RelayStatus = {
       project: context.project,
-      ...this.dependencies.store.getStatus(context.workItem.id),
+      workItem: stored.workItem,
+      sessions: stored.sessions,
+      runs: stored.runs,
     };
+    if (artifact !== undefined) result.artifact = artifact;
+    return result;
   }
 
   async sessions(input: WorkItemSelector): Promise<readonly SessionRecord[]> {
@@ -520,10 +582,9 @@ export class RelayCore {
 
   async merge(input: MergeRequest): Promise<void> {
     const context = await this.resolveWorkItem(input);
-    await this.reconcile({ workItemId: context.workItem.id });
-    const artifact = this.dependencies.store.getLatestArtifact(
-      context.workItem.id,
-    );
+    const artifact = await this.reconcile({
+      workItemId: context.workItem.id,
+    });
     if (artifact?.pullRequest === undefined) {
       throw new RelayError(
         'merge_not_ready',
@@ -554,7 +615,10 @@ export class RelayCore {
     const project = await this.initialize({ cwd: input.cwd });
     const id = randomUUID();
     const title = input.title ?? sentenceTitle(input.task);
-    const currentBranch = `relay/${slug(title)}-${id.slice(0, 8)}`;
+    const currentBranch =
+      (input.mode ?? 'write') === 'read'
+        ? project.defaultBranch
+        : `relay/${slug(title)}-${id.slice(0, 8)}`;
     const workItem = this.dependencies.store.createWorkItem({
       id,
       projectId: project.id,
@@ -604,22 +668,55 @@ export class RelayCore {
   ): Promise<RelayRunResult> {
     const provider = this.provider(input.provider);
     const lineage = this.lineage(input.parentRunId, input.provider);
-    this.assertReadCapacity(input.workItem.id, input.mode);
+    const baselineSha = await this.dependencies.github.getBranchSha(
+      input.project.repo,
+      input.expectedBranch,
+    );
+    if (
+      input.mode === 'read' &&
+      input.pinnedSha !== undefined &&
+      baselineSha !== input.pinnedSha
+    ) {
+      throw new RelayError(
+        'head_moved',
+        `Branch ${input.expectedBranch} moved before the delegated review started.`,
+        { expectedSha: input.pinnedSha, observedSha: baselineSha },
+      );
+    }
+    const pinnedSha =
+      input.mode === 'read' ? input.pinnedSha ?? baselineSha : undefined;
+    const executionPrompt =
+      input.mode === 'read' && pinnedSha !== undefined
+        ? `${input.prompt}\nPinned commit: ${pinnedSha}`
+        : input.prompt;
     const pendingSession = this.dependencies.store.upsertSession({
       workItemId: input.workItem.id,
       provider: input.provider,
       providerSessionId: `pending:${randomUUID()}`,
-      status: 'active',
+      status: 'pending',
       branch: input.expectedBranch,
     });
-    let run = this.dependencies.store.createRun({
-      sessionId: pendingSession.id,
-      provider: input.provider,
-      type: input.type,
-      ...(this.storePrompts ? { prompt: input.prompt } : {}),
-      mutationMode: input.mode,
-      ...lineage,
-    });
+    let run: RunRecord;
+    try {
+      run = this.dependencies.store.createRun({
+        sessionId: pendingSession.id,
+        provider: input.provider,
+        type: input.type,
+        ...(this.storePrompts ? { prompt: executionPrompt } : {}),
+        mutationMode: input.mode,
+        expectedBranch: input.expectedBranch,
+        ...(baselineSha === undefined ? {} : { baselineSha }),
+        ...(pinnedSha === undefined ? {} : { pinnedSha }),
+        ...lineage,
+      });
+    } catch (error) {
+      this.dependencies.store.activateSession(pendingSession.id, {
+        providerSessionId: pendingSession.providerSessionId,
+        status: 'failed',
+        branch: input.expectedBranch,
+      });
+      throw error;
+    }
     let leaseHeld = false;
     let providerExecution: ProviderExecution | undefined;
     try {
@@ -633,7 +730,7 @@ export class RelayCore {
       run = this.dependencies.store.transitionRun(run.id, 'running');
       const config = this.providerConfig(input.project.id, input.provider);
       const execution = await provider.start({
-        prompt: input.prompt,
+        prompt: executionPrompt,
         cwd: input.project.locatorPath,
         mode: input.mode,
         branch: input.startBranch,
@@ -647,7 +744,7 @@ export class RelayCore {
         pendingSession.id,
         {
           providerSessionId: execution.providerSessionId,
-          status: execution.status === 'failed' ? 'failed' : 'active',
+          status: sessionStatusFor(execution.status),
           branch: input.expectedBranch,
           ...(execution.url === undefined ? {} : { providerUrl: execution.url }),
         },
@@ -672,6 +769,7 @@ export class RelayCore {
         input.workItem.id,
         session.id,
         run.id,
+        reconciled.artifact,
       );
     } catch (error) {
       if (providerExecution === undefined) {
@@ -685,7 +783,7 @@ export class RelayCore {
         run = this.dependencies.store.getRun(run.id);
         this.dependencies.store.activateSession(pendingSession.id, {
           providerSessionId: providerExecution.providerSessionId,
-          status: providerExecution.status === 'failed' ? 'failed' : 'active',
+          status: sessionStatusFor(providerExecution.status),
           branch: input.expectedBranch,
           ...(providerExecution.url === undefined
             ? {}
@@ -708,20 +806,45 @@ export class RelayCore {
     branch: string,
   ): Promise<{ run: RunRecord; artifact?: ArtifactRecord }> {
     let run = this.dependencies.store.getRun(originalRun.id);
+    const pullRequest =
+      context.workItem.currentBranch === branch
+        ? context.workItem.pullRequest
+        : undefined;
     const observed = await this.dependencies.github.reconcile({
       repo: context.project.repo,
       branch,
-      ...(context.workItem.pullRequest === undefined
-        ? {}
-        : { pullRequest: context.workItem.pullRequest }),
+      ...(pullRequest === undefined ? {} : { pullRequest }),
     });
     const artifact = this.persistArtifact(context.workItem.id, observed);
+
+    if (
+      run.mutationMode === 'read' &&
+      run.pinnedSha !== undefined &&
+      observed.sha !== undefined &&
+      observed.sha !== run.pinnedSha
+    ) {
+      throw new RelayError(
+        'head_moved',
+        `Branch ${branch} moved while the read-only run was inspecting it.`,
+        { expectedSha: run.pinnedSha, observedSha: observed.sha },
+      );
+    }
 
     if (observed.status === 'awaiting_publish') {
       if (run.status === 'provider_complete') {
         run = this.dependencies.store.transitionRun(run.id, 'awaiting_publish');
       }
       return { run };
+    }
+    if (
+      run.mutationMode === 'write' &&
+      run.baselineSha !== undefined &&
+      observed.sha === run.baselineSha
+    ) {
+      if (run.status === 'provider_complete') {
+        run = this.dependencies.store.transitionRun(run.id, 'awaiting_publish');
+      }
+      return artifact === undefined ? { run } : { run, artifact };
     }
     if (run.status === 'provider_complete' || run.status === 'awaiting_publish') {
       run = this.dependencies.store.transitionRun(run.id, 'published');
@@ -736,11 +859,15 @@ export class RelayCore {
     workItemId: string,
     observed: Awaited<ReturnType<GitHubClient['reconcile']>>,
   ): ArtifactRecord | undefined {
-    if (observed.sha === undefined) return undefined;
+    if (observed.sha === undefined) {
+      this.dependencies.store.markArtifactMissing(workItemId, observed.branch);
+      return undefined;
+    }
     const input: ArtifactInput = {
       workItemId,
       branch: observed.branch,
       sha: observed.sha,
+      status: observed.status === 'verified' ? 'verified' : 'published',
       checks: observed.checks,
     };
     if (observed.pullRequest !== undefined) {
@@ -808,22 +935,6 @@ export class RelayCore {
     };
   }
 
-  private assertReadCapacity(workItemId: string, mode: MutationMode): void {
-    if (mode !== 'read') return;
-    const activeReaders = this.dependencies.store
-      .getStatus(workItemId)
-      .runs.filter(
-        (run) =>
-          run.mutationMode === 'read' && ACTIVE_RUN_STATUSES.has(run.status),
-      ).length;
-    if (activeReaders >= 3) {
-      throw new RelayError(
-        'work_item_locked',
-        `WorkItem ${workItemId} already has three active read-only runs.`,
-      );
-    }
-  }
-
   private provider(name: ProviderName): CloudProvider {
     const provider = this.dependencies.providers.get(name);
     if (provider === undefined) {
@@ -846,6 +957,7 @@ function resultFor(
   workItemId: string,
   sessionId: string,
   runId: string,
+  artifact?: ArtifactRecord,
 ): RelayRunResult {
   const status = store.getStatus(workItemId);
   const session = status.sessions.find((candidate) => candidate.id === sessionId);
@@ -859,7 +971,7 @@ function resultFor(
     session,
     run,
   };
-  if (status.artifact !== undefined) result.artifact = status.artifact;
+  if (artifact !== undefined) result.artifact = artifact;
   return result;
 }
 
@@ -867,15 +979,34 @@ function buildDelegationPrompt(input: {
   task: string;
   project: ProjectRecord;
   workItem: WorkItemRecord;
+  mode: MutationMode;
 }): string {
-  return [
+  const lines = [
     input.task,
     '',
     `Repository: ${input.project.repo}`,
     `Base branch: ${input.workItem.baseBranch}`,
-    `Target branch: ${input.workItem.currentBranch ?? input.workItem.baseBranch}`,
-    'Push durable code changes to the target GitHub branch. Do not merge.',
-  ].join('\n');
+  ];
+  if (input.mode === 'write') {
+    lines.push(
+      `Target branch: ${input.workItem.currentBranch ?? input.workItem.baseBranch}`,
+      'Push durable code changes to the target GitHub branch. Do not merge.',
+    );
+  } else {
+    lines.push(
+      `Inspect branch: ${input.workItem.currentBranch ?? input.workItem.baseBranch}`,
+      'Inspect and report findings. Do not push or merge.',
+    );
+  }
+  return lines.join('\n');
+}
+
+function sessionStatusFor(
+  status: ProviderRunStatus,
+): SessionRecord['status'] {
+  if (status === 'expired') return 'expired';
+  if (status === 'failed' || status === 'cancelled') return 'failed';
+  return 'active';
 }
 
 function optionalString(

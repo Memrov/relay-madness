@@ -64,16 +64,18 @@ export function createRelayMcpServer(
       },
     },
     async ({ provider, task, workItem, title, mode, parentRunId }) => {
-      const result = await delegateCurrentOrNew(core, {
-        provider,
-        task,
-        mode,
-        cwd,
-        ...(workItem === undefined ? {} : { workItem }),
-        ...(title === undefined ? {} : { title }),
-        ...(parentRunId === undefined ? {} : { parentRunId }),
+      return await executeTool(async () => {
+        const result = await delegateCurrentOrNew(core, {
+          provider,
+          task,
+          mode,
+          cwd,
+          ...(workItem === undefined ? {} : { workItem }),
+          ...(title === undefined ? {} : { title }),
+          ...(parentRunId === undefined ? {} : { parentRunId }),
+        });
+        return publicRun(result);
       });
-      return toolResult(publicRun(result));
     },
   );
 
@@ -101,21 +103,23 @@ export function createRelayMcpServer(
       },
     },
     async ({ provider, message, workItem, mode, parentRunId }) => {
-      const result = await core.send({
-        provider,
-        message,
-        mode,
-        ...selection(workItem, cwd),
-        ...(parentRunId === undefined ? {} : { parentRunId }),
+      return await executeTool(async () => {
+        const result = await core.send({
+          provider,
+          message,
+          mode,
+          ...selection(workItem, cwd),
+          ...(parentRunId === undefined ? {} : { parentRunId }),
+        });
+        return publicRun(result);
       });
-      return toolResult(publicRun(result));
     },
   );
 
   server.registerTool(
     'relay_handoff',
     {
-      title: 'Hand verified work to another provider',
+      title: 'Hand published work to another provider',
       description:
         'Pin current GitHub state and send a compact handoff packet to another provider.',
       inputSchema: z
@@ -136,14 +140,16 @@ export function createRelayMcpServer(
       },
     },
     async ({ provider, instruction, workItem, mode, parentRunId }) => {
-      const result = await core.handoff({
-        provider,
-        instruction,
-        mode,
-        ...selection(workItem, cwd),
-        ...(parentRunId === undefined ? {} : { parentRunId }),
+      return await executeTool(async () => {
+        const result = await core.handoff({
+          provider,
+          instruction,
+          mode,
+          ...selection(workItem, cwd),
+          ...(parentRunId === undefined ? {} : { parentRunId }),
+        });
+        return publicRun(result);
       });
-      return toolResult(publicRun(result));
     },
   );
 
@@ -163,8 +169,10 @@ export function createRelayMcpServer(
       },
     },
     async ({ workItem }) => {
-      const status = await core.status(selection(workItem, cwd));
-      return toolResult(publicStatus(status));
+      return await executeTool(async () => {
+        const status = await core.status(selection(workItem, cwd));
+        return publicStatus(status);
+      });
     },
   );
 
@@ -240,9 +248,16 @@ function publicRun(result: Awaited<ReturnType<RelayApi['delegate']>>) {
 }
 
 function publicStatus(status: Awaited<ReturnType<RelayApi['status']>>) {
-  const providerStates = Object.fromEntries(
-    status.sessions.map((session) => [session.provider, session.status]),
-  );
+  const providerStates: Partial<Record<ProviderName, string>> = {};
+  for (const session of status.sessions) {
+    const current = providerStates[session.provider];
+    if (
+      current === undefined ||
+      sessionPriority(session.status) <= sessionPriority(current)
+    ) {
+      providerStates[session.provider] = session.status;
+    }
+  }
   return compact({
     workItem: status.workItem.id,
     repo: status.project.repo,
@@ -256,6 +271,12 @@ function publicStatus(status: Awaited<ReturnType<RelayApi['status']>>) {
   });
 }
 
+function sessionPriority(status: string): number {
+  if (status === 'active') return 0;
+  if (status === 'pending') return 1;
+  return 2;
+}
+
 function compact<T extends Readonly<Record<string, unknown>>>(value: T) {
   return Object.fromEntries(
     Object.entries(value).filter(([, entry]) => entry !== undefined),
@@ -267,6 +288,35 @@ function toolResult(output: Readonly<Record<string, unknown>>) {
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(safe) }],
     structuredContent: safe,
+  };
+}
+
+async function executeTool(
+  operation: () => Promise<Readonly<Record<string, unknown>>>,
+) {
+  try {
+    return toolResult(await operation());
+  } catch (error) {
+    return toolError(error);
+  }
+}
+
+function toolError(error: unknown) {
+  const publicError =
+    error instanceof RelayError
+      ? compact({
+          code: error.code,
+          message: error.message,
+          details: error.details,
+        })
+      : {
+          code: 'unexpected_error',
+          message: 'Relay operation failed.',
+        };
+  const safe = redact({ error: publicError });
+  return {
+    isError: true,
+    content: [{ type: 'text' as const, text: JSON.stringify(safe) }],
   };
 }
 

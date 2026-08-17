@@ -26,6 +26,8 @@ This is an experimental, pre-1.0 project. Provider cloud CLIs and APIs can chang
 - Codex supports cloud task creation and structured inspection; scripted cloud follow-up is intentionally unavailable until OpenAI documents a stable surface.
 - Handoffs contain a repository, branch, full commit SHA, PR, and instruction—not another model's transcript.
 - GitHub reconciliation distinguishes `provider_complete`, `awaiting_publish`, `published`, and `verified`.
+- A completed write is credited only when its expected remote branch appears or advances beyond the SHA observed before dispatch.
+- Read-only work is pinned to the branch SHA observed at dispatch and fails visibly if that head moves.
 - A one-writer lease prevents two mutating providers from racing on one WorkItem; up to three read-only reviews can run concurrently.
 - Merge is CLI-only, interactive, and bound to the exact approved head SHA.
 - The local MCP server exposes exactly four strict tools. It cannot merge.
@@ -57,6 +59,8 @@ npm link
 ```
 
 Relay stores coordination state in `$XDG_STATE_HOME/relay-madness/relay.db`, or `~/.local/state/relay-madness/relay.db` when `XDG_STATE_HOME` is unset.
+
+Git installs run the TypeScript build through the package's `prepare` lifecycle, so the `relay` binary is present even though generated `dist/` files are not committed.
 
 ## Set up a project
 
@@ -168,7 +172,7 @@ No `relay_merge` MCP tool exists.
 - `relay_handoff`
 - `relay_status`
 
-Each input schema rejects unknown fields. Responses expose Relay run lineage and compact GitHub state, but not provider session IDs or prompts.
+Each input schema rejects unknown fields. Responses expose Relay run lineage and compact GitHub state, but not provider session IDs or prompts. Relay failures are returned as typed, redacted MCP tool errors.
 
 Generic JSON configuration for Claude Code, VS Code, Cursor, and other STDIO MCP hosts:
 
@@ -207,7 +211,7 @@ See [SECURITY.md](SECURITY.md) for reporting and trust boundaries.
 
 ## Architecture
 
-Both terminal and MCP clients call the same `RelayCore`. Adapters translate provider protocols and expose honest capabilities. `StateStore` persists coordination in SQLite. `GitHubClient` verifies explicit refs, full SHAs, PR state, required checks, and safe merge preconditions.
+Both terminal and MCP clients call the same `RelayCore`. Adapters translate provider protocols and expose honest capabilities. `StateStore` persists coordination in SQLite through ordered migrations. `GitHubClient` verifies explicit refs, full SHAs, matching open PR heads, required checks, and safe merge preconditions. Historical snapshots remain available locally, while status, handoff, recovery, and merge always refresh current GitHub state and never act on a stale snapshot.
 
 The core safety limits are:
 
@@ -227,7 +231,7 @@ The implementation uses the official [MCP TypeScript SDK](https://github.com/mod
 
 ## Tests
 
-Public CI never contacts a provider account. Fake `claude`, `codex`, and `gh` executables plus schema-complete Jules HTTP fixtures cover parsing, session reuse, recovery, reconciliation failures, handoffs, locks, recursion limits, merge gates, the CLI, and a real in-memory MCP client/server exchange.
+Public CI never contacts a provider account. Fake `claude`, `codex`, and `gh` executables plus schema-complete Jules HTTP fixtures cover parsing, session reuse, recovery, reconciliation failures, branch advancement, pinned reads, handoffs, transactional locks, recursion limits, merge gates, the CLI, package installation, and a real in-memory MCP client/server exchange.
 
 ```sh
 npm run check

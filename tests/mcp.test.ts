@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 
 import type { RelayApi } from '../src/app.js';
+import { RelayError } from '../src/errors.js';
 import { createRelayMcpServer } from '../src/mcp.js';
 
 const sha = 'b'.repeat(40);
@@ -25,6 +26,7 @@ function fakeCore() {
     workItemId: 'work_1',
     branch: 'relay/auth',
     sha,
+    status: 'verified',
     pullRequest: 143,
     checks: 'passing',
     observedAt: '2026-08-16T00:00:00.000Z',
@@ -183,6 +185,43 @@ test('returns compact GitHub and provider status', async () => {
   }
 });
 
+test('reports the reusable provider session instead of a failed replacement', async () => {
+  const { core } = fakeCore();
+  const originalStatus = core.status;
+  const coreWithHistory = {
+    ...core,
+    status: async (...args: Parameters<RelayApi['status']>) => {
+      const status = await originalStatus(...args);
+      return {
+        ...status,
+        sessions: [
+          ...status.sessions,
+          {
+            ...status.sessions[0]!,
+            id: 'failed-replacement',
+            providerSessionId: 'hidden-failed-id',
+            status: 'failed' as const,
+            lastActivityAt: '2026-08-16T00:01:00.000Z',
+          },
+        ],
+      };
+    },
+  } as RelayApi;
+  const { client, close } = await connectedMcp(coreWithHistory);
+  try {
+    const response = await client.callTool({
+      name: 'relay_status',
+      arguments: { workItem: 'current' },
+    });
+    assert.deepEqual(
+      (response.structuredContent as { providers?: unknown }).providers,
+      { jules: 'active' },
+    );
+  } finally {
+    await close();
+  }
+});
+
 test('rejects unknown input fields before reaching Relay Core', async () => {
   const { core, calls } = fakeCore();
   const { client, close } = await connectedMcp(core);
@@ -193,6 +232,43 @@ test('rejects unknown input fields before reaching Relay Core', async () => {
     });
     assert.equal(response.isError, true);
     assert.equal(calls.status, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('returns typed, redacted Relay errors to MCP clients', async () => {
+  const { core } = fakeCore();
+  const throwingCore = {
+    ...core,
+    send: async () => {
+      throw new RelayError('work_item_locked', 'WorkItem is busy.', {
+        apiToken: 'must-not-leak',
+      });
+    },
+  } as RelayApi;
+  const { client, close } = await connectedMcp(throwingCore);
+  try {
+    const response = await client.callTool({
+      name: 'relay_send',
+      arguments: {
+        provider: 'claude',
+        workItem: 'current',
+        message: 'Continue',
+      },
+    });
+    assert.equal(response.isError, true);
+    assert.equal(response.structuredContent, undefined);
+    const text = response.content[0];
+    assert.equal(text?.type, 'text');
+    if (text?.type !== 'text') assert.fail('Expected text error content.');
+    assert.deepEqual(JSON.parse(text.text), {
+      error: {
+        code: 'work_item_locked',
+        message: 'WorkItem is busy.',
+        details: { apiToken: '[REDACTED]' },
+      },
+    });
   } finally {
     await close();
   }

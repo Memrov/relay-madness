@@ -30,6 +30,7 @@ const statusFixture = {
     workItemId: 'work_1',
     branch: 'relay/auth',
     sha,
+    status: 'verified',
     pullRequest: 143,
     checks: 'passing',
     mergeable: true,

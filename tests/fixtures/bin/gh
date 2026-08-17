@@ -27,27 +27,40 @@ if (args[0] === 'auth' && args[1] === 'status') {
   if (scenario === 'error') {
     process.stderr.write('gh: forbidden (HTTP 403)');
     process.exitCode = 1;
-  } else if (scenario === 'missing') {
+  } else if (
+    scenario === 'missing' ||
+    (scenario === 'target-missing' && args[1]?.includes('-jules-'))
+  ) {
     process.stderr.write('gh: Not Found (HTTP 404)');
     process.exitCode = 1;
   } else {
     output({ ref: 'refs/heads/relay/auth', object: { sha, type: 'commit' } });
   }
 } else if (args[0] === 'pr' && args[1] === 'list') {
+  const requestedHead = args[args.indexOf('--head') + 1] ?? 'relay/auth';
   output([
     {
       number: 143,
       url: 'https://github.com/acme/web/pull/143',
       state: 'OPEN',
-      headRefName: 'relay/auth',
+      headRefName: requestedHead,
       headRefOid: sha,
       baseRefName: 'main',
       isDraft: false,
     },
   ]);
 } else if (args[0] === 'pr' && args[1] === 'view') {
+  const headRefName =
+    scenario === 'pr-branch-mismatch'
+      ? 'relay/unrelated'
+      : process.env.FAKE_GH_BRANCH ?? 'relay/auth';
   output({
-    headRefOid: sha,
+    number: 143,
+    url: 'https://github.com/acme/web/pull/143',
+    state: scenario === 'closed' ? 'CLOSED' : 'OPEN',
+    headRefName,
+    baseRefName: 'main',
+    headRefOid: scenario === 'pr-head-mismatch' ? 'd'.repeat(40) : sha,
     isDraft: scenario === 'draft',
     mergeable: 'MERGEABLE',
     mergeStateStatus: 'CLEAN',

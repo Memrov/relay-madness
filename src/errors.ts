@@ -4,6 +4,7 @@ export type RelayErrorCode =
   | 'configuration_missing'
   | 'delegation_depth_exceeded'
   | 'head_moved'
+  | 'github_state_mismatch'
   | 'invalid_argument'
   | 'invalid_run_transition'
   | 'merge_not_approved'

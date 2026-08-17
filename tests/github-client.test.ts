@@ -96,6 +96,28 @@ test('reports an explicit missing branch as awaiting publish', async () => {
   });
 });
 
+test('rejects pull-request truth from a different head SHA', async () => {
+  const { github } = githubForScenario('pr-head-mismatch');
+
+  await assert.rejects(
+    github.reconcile({ repo: 'acme/web', branch: 'relay/auth' }),
+    /does not match the expected branch SHA/,
+  );
+});
+
+test('rejects a stored pull request for a different branch', async () => {
+  const { github } = githubForScenario('pr-branch-mismatch');
+
+  await assert.rejects(
+    github.reconcile({
+      repo: 'acme/web',
+      branch: 'relay/auth',
+      pullRequest: 143,
+    }),
+    /does not belong to branch relay\/auth/,
+  );
+});
+
 test('refuses merge without explicit approval', async () => {
   const { github } = githubForScenario('mergeable');
 
@@ -130,6 +152,22 @@ test('refuses merge when the observed head differs from the approved SHA', async
 
 test('refuses merge while required checks are failing', async () => {
   const { github } = githubForScenario('failing');
+
+  await assert.rejects(
+    github.merge({
+      repo: 'acme/web',
+      pullRequest: 143,
+      expectedSha: 'b'.repeat(40),
+      strategy: 'squash',
+      approved: true,
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'merge_not_ready',
+  );
+});
+
+test('refuses merge when the pull request is no longer open', async () => {
+  const { github } = githubForScenario('closed');
 
   await assert.rejects(
     github.merge({

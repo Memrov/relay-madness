@@ -50,7 +50,7 @@ export interface SessionInput {
   provider: ProviderName;
   providerSessionId: string;
   providerUrl?: string;
-  status: 'active' | 'complete' | 'failed' | 'expired';
+  status: 'pending' | 'active' | 'complete' | 'failed' | 'expired';
   branch?: string;
 }
 
@@ -76,6 +76,9 @@ export interface RunInput {
   originProvider?: ProviderName;
   delegationDepth?: number;
   parentRunId?: string;
+  expectedBranch?: string;
+  baselineSha?: string;
+  pinnedSha?: string;
 }
 
 export interface RunRecord extends RunInput {
@@ -94,6 +97,7 @@ export interface ArtifactInput {
   workItemId: string;
   branch: string;
   sha: string;
+  status: 'published' | 'verified';
   pullRequest?: number;
   checks: CheckSummary;
   mergeable?: boolean;
@@ -151,8 +155,8 @@ export class StateStore {
     const parent = dirname(databasePath);
     if (!existsSync(parent)) {
       mkdirSync(parent, { recursive: true, mode: 0o700 });
+      chmodSync(parent, 0o700);
     }
-    chmodSync(parent, 0o700);
 
     const database = new Database(databasePath);
     chmodSync(databasePath, 0o600);
@@ -353,7 +357,11 @@ export class StateStore {
     const row = this.database
       .prepare(
         `SELECT * FROM provider_sessions WHERE work_item_id = ? AND provider = ?
-         ORDER BY last_activity_at DESC, rowid DESC LIMIT 1`,
+         ORDER BY CASE status
+           WHEN 'active' THEN 0
+           WHEN 'pending' THEN 1
+           ELSE 2
+         END, last_activity_at DESC, rowid DESC LIMIT 1`,
       )
       .get(workItemId, provider) as SqlRow | undefined;
     return row === undefined ? undefined : this.sessionFromRow(row);
@@ -368,29 +376,45 @@ export class StateStore {
       branch?: string;
     },
   ): SessionRecord {
-    const now = new Date().toISOString();
-    const result = this.database
-      .prepare(
-        `UPDATE provider_sessions SET provider_session_id = ?, provider_url = ?,
-           status = ?, branch = ?, last_activity_at = ? WHERE id = ?`,
-      )
-      .run(
-        input.providerSessionId,
-        input.providerUrl ?? null,
-        input.status,
-        input.branch ?? null,
-        now,
-        id,
+    return this.database.transaction(() => {
+      const current = this.requiredRow(
+        this.database
+          .prepare('SELECT work_item_id, provider FROM provider_sessions WHERE id = ?')
+          .get(id),
+        `Session ${id} was not found.`,
       );
-    if (result.changes !== 1) {
-      throw new RelayError('not_found', `Session ${id} was not found.`);
-    }
-    return this.sessionFromRow(
-      this.requiredRow(
-        this.database.prepare('SELECT * FROM provider_sessions WHERE id = ?').get(id),
-        `Session ${id} was not found after activation.`,
-      ),
-    );
+      const now = new Date().toISOString();
+      if (input.status === 'active') {
+        this.database
+          .prepare(
+            `UPDATE provider_sessions SET status = 'expired'
+             WHERE work_item_id = ? AND provider = ? AND id <> ?
+               AND status = 'active'`,
+          )
+          .run(current.work_item_id, current.provider, id);
+      }
+      this.database
+        .prepare(
+          `UPDATE provider_sessions SET provider_session_id = ?, provider_url = ?,
+             status = ?, branch = ?, last_activity_at = ? WHERE id = ?`,
+        )
+        .run(
+          input.providerSessionId,
+          input.providerUrl ?? null,
+          input.status,
+          input.branch ?? null,
+          now,
+          id,
+        );
+      return this.sessionFromRow(
+        this.requiredRow(
+          this.database
+            .prepare('SELECT * FROM provider_sessions WHERE id = ?')
+            .get(id),
+          `Session ${id} was not found after activation.`,
+        ),
+      );
+    })();
   }
 
   listSessions(workItemId: string): readonly SessionRecord[] {
@@ -418,6 +442,21 @@ export class StateStore {
           `WorkItem ${workItemId} has reached its 20-run budget.`,
         );
       }
+      if (input.mutationMode === 'read') {
+        const row = this.database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM provider_runs
+             WHERE work_item_id = ? AND mutation_mode = 'read'
+               AND status IN ('queued', 'running')`,
+          )
+          .get(workItemId) as { count: number };
+        if (row.count >= 3) {
+          throw new RelayError(
+            'work_item_locked',
+            `WorkItem ${workItemId} already has three active read-only runs.`,
+          );
+        }
+      }
 
       const id = randomUUID();
       const now = new Date().toISOString();
@@ -427,8 +466,8 @@ export class StateStore {
           `INSERT INTO provider_runs (
             id, session_id, work_item_id, provider, type, prompt, status,
             mutation_mode, correlation_id, origin_provider, delegation_depth,
-            parent_run_id, started_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
+            parent_run_id, expected_branch, baseline_sha, pinned_sha, started_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -442,10 +481,13 @@ export class StateStore {
           input.originProvider ?? null,
           input.delegationDepth ?? 0,
           input.parentRunId ?? null,
+          input.expectedBranch ?? null,
+          input.baselineSha ?? null,
+          input.pinnedSha ?? null,
           now,
         );
       return this.getRun(id);
-    })();
+    }).immediate();
   }
 
   transitionRun(id: string, status: ProviderRunStatus): RunRecord {
@@ -483,9 +525,26 @@ export class StateStore {
         .prepare('DELETE FROM work_item_leases WHERE expires_at <= ?')
         .run(nowText);
       const existing = this.database
-        .prepare('SELECT run_id FROM work_item_leases WHERE work_item_id = ?')
-        .get(workItemId) as { run_id: string } | undefined;
-      if (existing !== undefined && existing.run_id !== runId) {
+        .prepare(
+          `SELECT leases.run_id, owner.session_id
+           FROM work_item_leases AS leases
+           JOIN provider_runs AS owner ON owner.id = leases.run_id
+           WHERE leases.work_item_id = ?`,
+        )
+        .get(workItemId) as
+        | { run_id: string; session_id: string }
+        | undefined;
+      const candidate = this.requiredRow(
+        this.database
+          .prepare('SELECT session_id FROM provider_runs WHERE id = ?')
+          .get(runId),
+        `Run ${runId} was not found.`,
+      );
+      if (
+        existing !== undefined &&
+        existing.run_id !== runId &&
+        existing.session_id !== String(candidate.session_id)
+      ) {
         throw new RelayError(
           'work_item_locked',
           `WorkItem ${workItemId} already has an active writer.`,
@@ -502,7 +561,7 @@ export class StateStore {
              expires_at = excluded.expires_at`,
         )
         .run(workItemId, runId, nowText, expiresAt);
-    })();
+    }).immediate();
   }
 
   releaseMutationLease(workItemId: string, runId: string): void {
@@ -527,15 +586,16 @@ export class StateStore {
       this.database
         .prepare(
           `INSERT INTO artifact_snapshots (
-            id, work_item_id, branch, sha, pull_request, checks, mergeable,
+            id, work_item_id, branch, sha, verification_status, pull_request, checks, mergeable,
             review_decision, draft, observed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
           input.workItemId,
           input.branch,
           input.sha,
+          input.status,
           input.pullRequest ?? null,
           input.checks,
           input.mergeable === undefined ? null : Number(input.mergeable),
@@ -576,6 +636,19 @@ export class StateStore {
     return row === undefined ? undefined : this.artifactFromRow(row);
   }
 
+  markArtifactMissing(workItemId: string, branch: string): WorkItemRecord {
+    const result = this.database
+      .prepare(
+        `UPDATE work_items SET current_branch = ?, current_sha = NULL,
+           pull_request = NULL, updated_at = ? WHERE id = ?`,
+      )
+      .run(branch, new Date().toISOString(), workItemId);
+    if (result.changes !== 1) {
+      throw new RelayError('not_found', `WorkItem ${workItemId} was not found.`);
+    }
+    return this.getWorkItem(workItemId);
+  }
+
   getStatus(workItemId: string): WorkItemStatus {
     const artifact = this.getLatestArtifact(workItemId);
     const status: WorkItemStatus = {
@@ -606,7 +679,18 @@ export class StateStore {
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL
-      );
+      )
+    `);
+    const applied = new Set(
+      (
+        this.database
+          .prepare('SELECT version FROM schema_migrations')
+          .all() as Array<{ version: number }>
+      ).map(({ version }) => version),
+    );
+    if (!applied.has(1)) {
+      this.database.transaction(() => {
+        this.database.exec(`
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         repo TEXT NOT NULL UNIQUE,
@@ -679,12 +763,29 @@ export class StateStore {
         acquired_at TEXT NOT NULL,
         expires_at TEXT NOT NULL
       );
-    `);
+        `);
+        this.recordMigration(1);
+      }).immediate();
+    }
+    if (!applied.has(2)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          ALTER TABLE provider_runs ADD COLUMN expected_branch TEXT;
+          ALTER TABLE provider_runs ADD COLUMN baseline_sha TEXT;
+          ALTER TABLE provider_runs ADD COLUMN pinned_sha TEXT;
+          ALTER TABLE artifact_snapshots ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'published';
+        `);
+        this.recordMigration(2);
+      }).immediate();
+    }
+  }
+
+  private recordMigration(version: number): void {
     this.database
       .prepare(
-        'INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)',
+        'INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)',
       )
-      .run(new Date().toISOString());
+      .run(version, new Date().toISOString());
   }
 
   private requiredRow(row: unknown, message: string): SqlRow {
@@ -756,6 +857,11 @@ export class StateStore {
       record.originProvider = String(row.origin_provider) as ProviderName;
     }
     if (row.parent_run_id !== null) record.parentRunId = String(row.parent_run_id);
+    if (row.expected_branch !== null) {
+      record.expectedBranch = String(row.expected_branch);
+    }
+    if (row.baseline_sha !== null) record.baselineSha = String(row.baseline_sha);
+    if (row.pinned_sha !== null) record.pinnedSha = String(row.pinned_sha);
     if (row.finished_at !== null) record.finishedAt = String(row.finished_at);
     return record;
   }
@@ -766,6 +872,7 @@ export class StateStore {
       workItemId: String(row.work_item_id),
       branch: String(row.branch),
       sha: String(row.sha),
+      status: String(row.verification_status) as ArtifactRecord['status'],
       checks: String(row.checks) as CheckSummary,
       observedAt: String(row.observed_at),
     };

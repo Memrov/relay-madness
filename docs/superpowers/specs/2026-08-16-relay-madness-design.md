@@ -93,7 +93,7 @@ A Project binds a GitHub repository to its default branch, local locator checkou
 
 A WorkItem is one logical development objective. It owns the base branch, deterministic target branch, current full commit SHA, pull-request number, status, and provider sessions.
 
-Only one mutating run may hold a WorkItem lease. Multiple read-only reviews may run concurrently when all are pinned to the same immutable SHA.
+Only one mutating provider session may hold a WorkItem lease. Follow-up turns in that session transfer the lease to the newest run. Up to three read-only reviews may run concurrently when each is pinned to the SHA observed at dispatch. These limits are enforced inside immediate SQLite transactions so separate Relay processes cannot race past them.
 
 ### ProviderSession
 
@@ -101,13 +101,13 @@ A ProviderSession records a provider’s logical session or task identity. It do
 
 ### ProviderRun
 
-A ProviderRun records one message, delegation, handoff, inspection, or publication attempt. Every run receives a Relay-generated correlation ID, optional parent run ID, origin, delegation depth, and mutation mode.
+A ProviderRun records one message, delegation, handoff, inspection, or publication attempt. Every run receives a Relay-generated correlation ID, optional parent run ID, origin, delegation depth, mutation mode, expected branch, and the relevant baseline or pinned SHA.
 
 Callers may not override Relay-generated lineage fields.
 
 ### ArtifactSnapshot
 
-An ArtifactSnapshot records a full commit SHA, branch, pull request, draft state, mergeability, review decision, and normalized check summary observed from GitHub at a specific time.
+An ArtifactSnapshot records a full commit SHA, branch, publication or verification status, pull request, draft state, mergeability, review decision, and normalized check summary observed from GitHub at a specific time. Snapshots are historical; current operations reconcile GitHub again and clear canonical WorkItem SHA/PR fields if the expected branch has disappeared.
 
 ## State machine
 
@@ -125,9 +125,9 @@ queued
         └─> expired
 ```
 
-`provider_complete` means only that the provider reports completion. `published` means Relay found the expected remote ref or pull request. `verified` means Relay resolved the exact full SHA and recorded current GitHub checks.
+`provider_complete` means only that the provider reports completion. `published` means Relay found the expected remote ref at a full SHA. `verified` means Relay also found an open PR whose head branch and head SHA exactly match that ref and recorded its current required checks. A write run does not advance from provider completion when the expected branch still has the same SHA Relay observed before dispatch.
 
-A lost or expired provider session can be replaced. Recovery starts a new ProviderSession using a handoff packet built from the last verified ArtifactSnapshot.
+A lost or expired provider session can be replaced. Recovery first reconciles the expected GitHub branch, then starts a new ProviderSession from the currently observable published state. It does not reuse a stale SHA after a branch disappears.
 
 ## Provider contract
 

@@ -27,7 +27,12 @@ const pullRequestSchema = z.object({
 });
 
 const pullRequestViewSchema = z.object({
+  number: z.number().int().positive(),
+  url: z.url(),
+  state: z.string(),
+  headRefName: z.string(),
   headRefOid: z.string().regex(/^[0-9a-f]{40}$/i),
+  baseRefName: z.string(),
   isDraft: z.boolean(),
   mergeable: z.string(),
   mergeStateStatus: z.string(),
@@ -125,26 +130,31 @@ export class GitHubClient {
     };
   }
 
+  async getBranchSha(repo: string, branch: string): Promise<string | undefined> {
+    try {
+      const reference = await this.runJson(
+        ['api', `repos/${repo}/git/ref/heads/${branch}`],
+        refSchema,
+      );
+      return reference.object.sha;
+    } catch (error) {
+      if (isNotFound(error)) return undefined;
+      throw error;
+    }
+  }
+
   async reconcile(input: {
     repo: string;
     branch: string;
     pullRequest?: number;
   }): Promise<GitHubArtifact> {
-    let reference: z.infer<typeof refSchema>;
-    try {
-      reference = await this.runJson(
-        ['api', `repos/${input.repo}/git/ref/heads/${input.branch}`],
-        refSchema,
-      );
-    } catch (error) {
-      if (isNotFound(error)) {
-        return {
-          status: 'awaiting_publish',
-          branch: input.branch,
-          checks: 'unknown',
-        };
-      }
-      throw error;
+    const branchSha = await this.getBranchSha(input.repo, input.branch);
+    if (branchSha === undefined) {
+      return {
+        status: 'awaiting_publish',
+        branch: input.branch,
+        checks: 'unknown',
+      };
     }
 
     const pullRequest =
@@ -159,7 +169,7 @@ export class GitHubClient {
                 '--head',
                 input.branch,
                 '--state',
-                'all',
+                'open',
                 '--json',
                 'number,url,state,headRefName,headRefOid,baseRefName,isDraft',
               ],
@@ -173,23 +183,46 @@ export class GitHubClient {
       return {
         status: 'published',
         branch: input.branch,
-        sha: reference.object.sha,
+        sha: branchSha,
         checks: 'unknown',
       };
     }
 
     const view = await this.inspectPullRequest(input.repo, pullRequestNumber);
+    if (view.data.state !== 'OPEN') {
+      throw new RelayError(
+        'github_state_mismatch',
+        `Pull request #${pullRequestNumber} is not open.`,
+      );
+    }
+    if (view.data.headRefName !== input.branch) {
+      throw new RelayError(
+        'github_state_mismatch',
+        `Pull request #${pullRequestNumber} does not belong to branch ${input.branch}.`,
+        {
+          expectedBranch: input.branch,
+          observedBranch: view.data.headRefName,
+        },
+      );
+    }
+    if (view.data.headRefOid !== branchSha) {
+      throw new RelayError(
+        'github_state_mismatch',
+        `Pull request #${pullRequestNumber} does not match the expected branch SHA.`,
+        { branchSha, pullRequestSha: view.data.headRefOid },
+      );
+    }
     const artifact: GitHubArtifact = {
       status: 'verified',
       branch: input.branch,
-      sha: reference.object.sha,
+      sha: view.data.headRefOid,
       pullRequest: pullRequestNumber,
       checks: view.checks,
       draft: view.data.isDraft,
       mergeable: view.data.mergeable === 'MERGEABLE',
       mergeStateStatus: view.data.mergeStateStatus,
     };
-    if (pullRequest?.url !== undefined) artifact.pullRequestUrl = pullRequest.url;
+    artifact.pullRequestUrl = view.data.url;
     if (view.data.reviewDecision !== null && view.data.reviewDecision !== undefined) {
       artifact.reviewDecision = view.data.reviewDecision;
     }
@@ -226,6 +259,7 @@ export class GitHubClient {
       view.data.mergeStateStatus,
     );
     if (
+      view.data.state !== 'OPEN' ||
       view.data.isDraft ||
       view.data.mergeable !== 'MERGEABLE' ||
       mergeStateBlocks ||
@@ -237,6 +271,7 @@ export class GitHubClient {
         `Pull request #${input.pullRequest} has not passed every merge gate.`,
         {
           checks: view.checks,
+          state: view.data.state,
           draft: view.data.isDraft,
           mergeable: view.data.mergeable,
           mergeStateStatus: view.data.mergeStateStatus,
@@ -270,7 +305,7 @@ export class GitHubClient {
         '--repo',
         repo,
         '--json',
-        'headRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup',
+        'number,url,state,headRefName,headRefOid,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup',
       ],
       pullRequestViewSchema,
     );
