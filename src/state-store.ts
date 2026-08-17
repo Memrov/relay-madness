@@ -139,6 +139,8 @@ export interface RunRecord extends RunInput {
   delegationDepth: number;
   startedAt: string;
   finishedAt?: string;
+  launchAttemptId?: string;
+  launchState?: 'prepared' | 'accepted' | 'uncertain';
 }
 
 export type CheckSummary = 'passing' | 'failing' | 'pending' | 'unknown';
@@ -216,6 +218,9 @@ const SENSITIVE_SETTING_SEGMENTS = new Set([
   'tokens',
 ]);
 
+const LAUNCH_UNCERTAIN_STATUS: ProviderRunStatus = 'launch_uncertain';
+const ACTIVE_LAUNCH_OWNERS = new Set<string>();
+
 const SENSITIVE_SETTING_COMPOUND_ALIASES = new Set([
   'apikey',
   'apikeys',
@@ -236,6 +241,7 @@ const RUN_TRANSITIONS: Readonly<
     'failed',
     'cancelled',
     'expired',
+    'launch_uncertain',
   ]),
   provider_complete: new Set(['awaiting_publish', 'published', 'failed']),
   awaiting_publish: new Set(['published', 'failed', 'cancelled']),
@@ -244,6 +250,7 @@ const RUN_TRANSITIONS: Readonly<
   failed: new Set(),
   cancelled: new Set(),
   expired: new Set(),
+  launch_uncertain: new Set(['cancelled']),
 };
 
 const FINISHED_RUN_STATUSES = new Set<ProviderRunStatus>([
@@ -254,7 +261,11 @@ const FINISHED_RUN_STATUSES = new Set<ProviderRunStatus>([
 ]);
 
 export class StateStore {
-  private constructor(private readonly database: Database.Database) {}
+  private readonly launchOwnerId = randomUUID();
+
+  private constructor(private readonly database: Database.Database) {
+    ACTIVE_LAUNCH_OWNERS.add(this.launchOwnerId);
+  }
 
   static open(databasePath: string): StateStore {
     const parent = dirname(databasePath);
@@ -270,11 +281,17 @@ export class StateStore {
 
     const store = new StateStore(database);
     store.migrate();
+    store.recoverInterruptedLaunches();
     return store;
   }
 
   close(): void {
-    this.database.close();
+    try {
+      this.quarantineOwnedLaunches(this.launchOwnerId);
+    } finally {
+      ACTIVE_LAUNCH_OWNERS.delete(this.launchOwnerId);
+      this.database.close();
+    }
   }
 
   upsertProject(input: ProjectInput): ProjectRecord {
@@ -511,8 +528,15 @@ export class StateStore {
     }
     const row = this.database
       .prepare(
-        `SELECT COUNT(*) AS count FROM account_leases
-         WHERE account_id = ? AND expires_at > ?`,
+        `SELECT COUNT(*) AS count
+         FROM account_leases AS lease
+         JOIN provider_runs AS run ON run.id = lease.run_id
+         WHERE lease.account_id = ?
+           AND (
+             lease.expires_at > ?
+             OR run.status = 'launch_uncertain'
+             OR run.launch_state IN ('prepared', 'accepted')
+           )`,
       )
       .get(accountId, now.toISOString()) as SqlRow;
     return Number(row.count);
@@ -534,10 +558,19 @@ export class StateStore {
           `Provider account ${accountId} is ${account.status}.`,
         );
       }
+      this.requireAccountLeaseRunOwner(accountId, runId);
       const acquiredAt = now.toISOString();
       const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
       this.database
-        .prepare('DELETE FROM account_leases WHERE account_id = ? AND expires_at <= ?')
+        .prepare(
+          `DELETE FROM account_leases
+           WHERE account_id = ? AND expires_at <= ?
+             AND run_id NOT IN (
+               SELECT id FROM provider_runs
+               WHERE status = 'launch_uncertain'
+                  OR launch_state IN ('prepared', 'accepted')
+             )`,
+        )
         .run(accountId, acquiredAt);
       const existing = this.database
         .prepare(
@@ -579,6 +612,40 @@ export class StateStore {
     this.database
       .prepare('DELETE FROM account_leases WHERE account_id = ? AND run_id = ?')
       .run(accountId, runId);
+  }
+
+  heartbeatAccountLease(
+    accountId: string,
+    runId: string,
+    now = new Date(),
+  ): AccountLeaseRecord {
+    if (!isValidDate(now)) {
+      throw new RelayError('invalid_argument', 'Lease time must be a valid date.');
+    }
+    return this.database.transaction(() => {
+      this.requireAccountLeaseRunOwner(accountId, runId, { active: true });
+      const acquiredAt = now.toISOString();
+      const existing = this.database
+        .prepare(
+          `SELECT * FROM account_leases
+           WHERE account_id = ? AND run_id = ? AND expires_at > ?`,
+        )
+        .get(accountId, runId, acquiredAt) as SqlRow | undefined;
+      if (existing === undefined) {
+        throw new RelayError(
+          'not_found',
+          `Run ${runId} does not hold an active lease for account ${accountId}.`,
+        );
+      }
+      const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+      this.database
+        .prepare(
+          `UPDATE account_leases SET acquired_at = ?, expires_at = ?
+           WHERE account_id = ? AND run_id = ?`,
+        )
+        .run(acquiredAt, expiresAt, accountId, runId);
+      return { accountId, runId, acquiredAt, expiresAt };
+    }).immediate();
   }
 
   createWorkItem(input: WorkItemInput): WorkItemRecord {
@@ -823,11 +890,28 @@ export class StateStore {
     return this.database.transaction(() => {
       const session = this.requiredRow(
         this.database
-          .prepare('SELECT work_item_id FROM provider_sessions WHERE id = ?')
+          .prepare(
+            `SELECT work_item_id, provider, account_id
+             FROM provider_sessions WHERE id = ?`,
+          )
           .get(input.sessionId),
         `Session ${input.sessionId} was not found.`,
       );
       const workItemId = String(session.work_item_id);
+      const provider = String(session.provider) as ProviderName;
+      const accountId = nullableString(session.account_id);
+      if (input.provider !== provider) {
+        throw new RelayError(
+          'provider_mismatch',
+          `Run provider ${input.provider} does not match session provider ${provider}.`,
+        );
+      }
+      if (input.accountId !== undefined && input.accountId !== accountId) {
+        throw new RelayError(
+          'provider_mismatch',
+          `Run account ${input.accountId} does not match its session account.`,
+        );
+      }
       if (this.countRuns(workItemId) >= 20) {
         throw new RelayError(
           'run_budget_exceeded',
@@ -866,7 +950,7 @@ export class StateStore {
           id,
           input.sessionId,
           workItemId,
-          input.provider,
+          provider,
           input.type,
           input.prompt ?? null,
           input.mutationMode,
@@ -877,7 +961,7 @@ export class StateStore {
           input.expectedBranch ?? null,
           input.baselineSha ?? null,
           input.pinnedSha ?? null,
-          input.accountId ?? null,
+          accountId ?? null,
           input.model ?? null,
           input.baseSha ?? null,
           input.resultSha ?? null,
@@ -919,6 +1003,157 @@ export class StateStore {
       .prepare('UPDATE provider_runs SET result_sha = ? WHERE id = ?')
       .run(resultSha, id);
     return this.getRun(id);
+  }
+
+  prepareRunLaunch(id: string, attemptId: string = randomUUID()): RunRecord {
+    if (attemptId.trim() === '') {
+      throw new RelayError('invalid_argument', 'Launch attempt ID is required.');
+    }
+    return this.setRunLaunchState(id, 'prepared', attemptId);
+  }
+
+  markRunLaunchAccepted(id: string, attemptId: string): RunRecord {
+    return this.setRunLaunchState(id, 'accepted', attemptId);
+  }
+
+  completeRunLaunch(id: string, attemptId: string): RunRecord {
+    return this.database.transaction(() => {
+      const run = this.getRun(id);
+      const owner = this.database
+        .prepare('SELECT launch_owner_id FROM provider_runs WHERE id = ?')
+        .get(id) as SqlRow;
+      if (
+        run.launchAttemptId !== attemptId ||
+        run.launchState !== 'accepted' ||
+        nullableString(owner.launch_owner_id) !== this.launchOwnerId
+      ) {
+        throw new RelayError(
+          'invalid_run_transition',
+          `Run ${id} does not have the accepted launch attempt ${attemptId}.`,
+        );
+      }
+      this.database
+        .prepare(
+          `UPDATE provider_runs
+           SET launch_state = NULL, launch_owner_id = NULL, launch_owner_pid = NULL
+           WHERE id = ?`,
+        )
+        .run(id);
+      return this.getRun(id);
+    }).immediate();
+  }
+
+  markRunLaunchUncertain(id: string, attemptId?: string): RunRecord {
+    return this.database.transaction(() => {
+      const run = this.getRun(id);
+      if (String(run.status) !== LAUNCH_UNCERTAIN_STATUS) {
+        if (!RUN_TRANSITIONS[run.status].has(LAUNCH_UNCERTAIN_STATUS)) {
+          throw new RelayError(
+            'invalid_run_transition',
+            `Run ${id} cannot be quarantined from ${run.status}.`,
+          );
+        }
+        this.database
+          .prepare(
+            `UPDATE provider_runs SET status = 'launch_uncertain',
+             launch_state = 'uncertain', launch_attempt_id = ?,
+             launch_owner_id = NULL, launch_owner_pid = NULL, finished_at = NULL
+             WHERE id = ?`,
+          )
+          .run(attemptId ?? run.launchAttemptId ?? randomUUID(), id);
+      }
+      return this.getRun(id);
+    }).immediate();
+  }
+
+  resolveUncertainLaunch(id: string): RunRecord {
+    return this.database.transaction(() => {
+      const run = this.getRun(id);
+      if (run.status !== 'launch_uncertain') {
+        throw new RelayError(
+          'invalid_run_transition',
+          `Run ${id} is not awaiting uncertain-launch resolution.`,
+        );
+      }
+      const now = new Date().toISOString();
+      const siblings = this.database
+        .prepare(
+          `SELECT id, status, launch_attempt_id
+           FROM provider_runs
+           WHERE session_id = ? AND id <> ? AND status IN ('queued', 'running')`,
+        )
+        .all(run.sessionId, id) as SqlRow[];
+      const quarantineSibling = this.database.prepare(
+        `UPDATE provider_runs SET status = 'launch_uncertain',
+         launch_state = 'uncertain', launch_attempt_id = ?,
+         launch_owner_id = NULL, launch_owner_pid = NULL, finished_at = NULL
+         WHERE id = ?`,
+      );
+      const cancelSibling = this.database.prepare(
+        `UPDATE provider_runs SET status = 'cancelled', finished_at = ?
+         WHERE id = ?`,
+      );
+      const releaseSiblingLease = this.database.prepare(
+        'DELETE FROM account_leases WHERE run_id = ?',
+      );
+      for (const sibling of siblings) {
+        const siblingId = String(sibling.id);
+        if (sibling.status === 'running') {
+          quarantineSibling.run(
+            nullableString(sibling.launch_attempt_id) ?? randomUUID(),
+            siblingId,
+          );
+        } else {
+          cancelSibling.run(now, siblingId);
+          releaseSiblingLease.run(siblingId);
+        }
+      }
+      this.database
+        .prepare(
+          `UPDATE provider_runs SET status = 'cancelled', finished_at = ?
+           WHERE id = ?`,
+        )
+        .run(now, id);
+      this.database
+        .prepare(
+          `UPDATE provider_sessions SET status = 'failed', last_activity_at = ?
+           WHERE id = ? AND status IN ('pending', 'active')`,
+        )
+        .run(now, run.sessionId);
+      this.database
+        .prepare('DELETE FROM account_leases WHERE run_id = ?')
+        .run(id);
+      return this.getRun(id);
+    }).immediate();
+  }
+
+  recoverInterruptedLaunches(): number {
+    return this.database.transaction(() => {
+      const owners = this.database
+        .prepare(
+          `SELECT launch_owner_id, launch_owner_pid
+           FROM provider_runs
+           WHERE status IN ('queued', 'running')
+             AND launch_state IN ('prepared', 'accepted')
+           GROUP BY launch_owner_id, launch_owner_pid`,
+        )
+        .all() as SqlRow[];
+      let recovered = 0;
+      for (const owner of owners) {
+        const ownerId = nullableString(owner.launch_owner_id);
+        const ownerPid = nullableInteger(owner.launch_owner_pid);
+        if (ownerId !== undefined && ACTIVE_LAUNCH_OWNERS.has(ownerId)) continue;
+        if (
+          ownerPid !== undefined &&
+          ownerPid !== process.pid &&
+          isProcessAlive(ownerPid)
+        ) {
+          continue;
+        }
+        recovered += this.quarantineOwnedLaunches(ownerId).changes;
+      }
+      return recovered;
+    }).immediate();
   }
 
   countRuns(workItemId: string): number {
@@ -1593,6 +1828,63 @@ export class StateStore {
         this.recordMigration(7);
       }).immediate();
     }
+    if (!applied.has(8)) {
+      this.database.pragma('foreign_keys = OFF');
+      try {
+        this.database.transaction(() => {
+          this.database.exec(`
+            ALTER TABLE provider_runs ADD COLUMN launch_attempt_id TEXT;
+            ALTER TABLE provider_runs ADD COLUMN launch_state TEXT
+              CHECK(launch_state IN ('prepared','accepted','uncertain'));
+            ALTER TABLE provider_runs ADD COLUMN launch_owner_id TEXT;
+            ALTER TABLE provider_runs ADD COLUMN launch_owner_pid INTEGER;
+          `);
+          const hasAccountLeases = this.database
+            .prepare(
+              `SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = 'account_leases'`,
+            )
+            .get() !== undefined;
+          if (hasAccountLeases) {
+            const invalidLeaseCount = this.database
+              .prepare(
+                `SELECT COUNT(*) AS count
+                 FROM account_leases AS lease
+                 LEFT JOIN provider_runs AS run ON run.id = lease.run_id
+                 WHERE run.id IS NULL OR run.account_id IS NOT lease.account_id`,
+              )
+              .get() as SqlRow;
+            if (Number(invalidLeaseCount.count) !== 0) {
+              throw new Error('Migration 8 found account leases without matching account-owned runs.');
+            }
+          }
+          this.database.exec(`
+            CREATE TABLE account_leases_scoped (
+              account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
+              run_id TEXT NOT NULL REFERENCES provider_runs(id) ON DELETE CASCADE,
+              acquired_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              PRIMARY KEY(account_id, run_id)
+            );
+          `);
+          if (hasAccountLeases) {
+            this.database.exec(`
+              INSERT INTO account_leases_scoped (account_id, run_id, acquired_at, expires_at)
+              SELECT account_id, run_id, acquired_at, expires_at FROM account_leases;
+              DROP TABLE account_leases;
+            `);
+          }
+          this.database.exec('ALTER TABLE account_leases_scoped RENAME TO account_leases;');
+          this.recordMigration(8);
+        }).immediate();
+      } finally {
+        this.database.pragma('foreign_keys = ON');
+      }
+      const violations = this.database.pragma('foreign_key_check') as unknown[];
+      if (violations.length > 0) {
+        throw new Error('Migration 8 left foreign-key violations.');
+      }
+    }
   }
 
   private recordMigration(version: number): void {
@@ -1630,6 +1922,115 @@ export class StateStore {
       throw new RelayError('not_found', `Provider account ${id} was not found.`);
     }
     return account;
+  }
+
+  private requireAccountLeaseRunOwner(
+    accountId: string,
+    runId: string,
+    options: { active?: boolean } = {},
+  ): void {
+    const row = this.database
+      .prepare(
+        `SELECT run.account_id AS run_account_id, session.account_id AS session_account_id,
+                run.status
+         FROM provider_runs AS run
+         JOIN provider_sessions AS session ON session.id = run.session_id
+         WHERE run.id = ?`,
+      )
+      .get(runId) as SqlRow | undefined;
+    if (row === undefined) {
+      throw new RelayError('not_found', `Run ${runId} was not found.`);
+    }
+    if (
+      nullableString(row.run_account_id) !== accountId ||
+      nullableString(row.session_account_id) !== accountId
+    ) {
+      throw new RelayError(
+        'provider_mismatch',
+        `Run ${runId} is not owned by provider account ${accountId}.`,
+      );
+    }
+    if (options.active === true && row.status !== 'running') {
+      throw new RelayError(
+        'invalid_run_transition',
+        `Run ${runId} is not active for lease heartbeat.`,
+      );
+    }
+  }
+
+  private setRunLaunchState(
+    id: string,
+    launchState: 'prepared' | 'accepted',
+    attemptId: string,
+  ): RunRecord {
+    if (attemptId.trim() === '') {
+      throw new RelayError('invalid_argument', 'Launch attempt ID is required.');
+    }
+    return this.database.transaction(() => {
+      const run = this.getRun(id);
+      if (run.status !== 'queued' && run.status !== 'running') {
+        throw new RelayError(
+          'invalid_run_transition',
+          `Run ${id} cannot record a launch attempt from ${run.status}.`,
+        );
+      }
+      if (run.launchAttemptId !== undefined && run.launchAttemptId !== attemptId) {
+        throw new RelayError(
+          'invalid_argument',
+          `Run ${id} already has a different launch attempt.`,
+        );
+      }
+      if (launchState === 'accepted') {
+        const owner = this.database
+          .prepare('SELECT launch_owner_id FROM provider_runs WHERE id = ?')
+          .get(id) as SqlRow;
+        if (
+          run.launchState !== 'prepared' ||
+          nullableString(owner.launch_owner_id) !== this.launchOwnerId
+        ) {
+          throw new RelayError(
+            'invalid_run_transition',
+            `Run ${id} does not have a prepared launch owned by this process.`,
+          );
+        }
+        this.database
+          .prepare('UPDATE provider_runs SET launch_state = ? WHERE id = ?')
+          .run(launchState, id);
+      } else {
+        if (run.launchState !== undefined && run.launchState !== 'prepared') {
+          throw new RelayError(
+            'invalid_run_transition',
+            `Run ${id} already has launch state ${run.launchState}.`,
+          );
+        }
+        this.database
+          .prepare(
+            `UPDATE provider_runs SET launch_attempt_id = ?, launch_state = ?,
+             launch_owner_id = ?, launch_owner_pid = ? WHERE id = ?`,
+          )
+          .run(
+            attemptId,
+            launchState,
+            this.launchOwnerId,
+            process.pid,
+            id,
+          );
+      }
+      return this.getRun(id);
+    }).immediate();
+  }
+
+  private quarantineOwnedLaunches(ownerId: string | undefined) {
+    return this.database
+      .prepare(
+        `UPDATE provider_runs
+         SET status = 'launch_uncertain', launch_state = 'uncertain',
+             launch_owner_id = NULL, launch_owner_pid = NULL, finished_at = NULL
+         WHERE status IN ('queued', 'running')
+           AND launch_state IN ('prepared', 'accepted')
+           AND launch_owner_id IS ?`,
+      )
+      .run(ownerId ?? null);
   }
 
   private validateProviderAccount(input: ProviderAccountInput): void {
@@ -1748,6 +2149,12 @@ export class StateStore {
     if (row.model !== null) record.model = String(row.model);
     if (row.base_sha !== null) record.baseSha = String(row.base_sha);
     if (row.result_sha !== null) record.resultSha = String(row.result_sha);
+    if (row.launch_attempt_id !== null) {
+      record.launchAttemptId = String(row.launch_attempt_id);
+    }
+    if (row.launch_state !== null) {
+      record.launchState = String(row.launch_state) as NonNullable<RunRecord['launchState']>;
+    }
     if (row.finished_at !== null) record.finishedAt = String(row.finished_at);
     return record;
   }
@@ -1802,6 +2209,25 @@ export class StateStore {
 
 function nullableString(value: unknown): string | undefined {
   return value === null || value === undefined ? undefined : String(value);
+}
+
+function nullableInteger(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : undefined;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (
+      error instanceof Error &&
+      'code' in error &&
+      (error as NodeJS.ErrnoException).code === 'EPERM'
+    );
+  }
 }
 
 function isFullSha(value: string): boolean {

@@ -22,21 +22,39 @@ if (args[0] === 'auth' && args[1] === 'status') {
 } else if (args[0] === '--version') {
   process.stdout.write('2.1.217 (Claude Code)');
 } else if (args[0] === '--help') {
-  process.stdout.write('--cloud Start or attach to an existing cloud session');
+  process.stdout.write(
+    scenario === 'installed-no-cloud'
+      ? '--help Show help'
+      : '--cloud Start or attach to an existing cloud session\n-p, --print Print mode\n--output-format json\n--model MODEL\nCLAUDE_CONFIG_DIR profile isolation',
+  );
 } else if (args.includes('--cloud') && !args.includes('-p')) {
   if (scenario === 'malformed') {
     process.stdout.write('cloud session launched');
+  } else if (scenario === 'invalid-url-host') {
+    process.stdout.write('Session created: https://claude.ai.example/code/session_abc123');
+  } else if (scenario === 'invalid-url-path') {
+    process.stdout.write('Session created: https://claude.ai/tasks/session_abc123');
+  } else if (scenario === 'invalid-url-id') {
+    process.stdout.write('Session created: https://claude.ai/code/not-a-session');
   } else if (scenario === 'attach') {
     process.exitCode = 0;
   } else {
     process.stdout.write('Session created: https://claude.ai/code/session_abc123');
   }
 } else if (args[0] === '-p') {
-  process.stdout.write(JSON.stringify({
-    ok: true,
-    session_id: 'session_abc123',
-    url: 'https://claude.ai/code/session_abc123',
-  }));
+  process.stdout.write(JSON.stringify(
+    scenario === 'invalid-json-url'
+      ? {
+          ok: true,
+          session_id: 'session_abc123',
+          url: 'https://claude.ai/code/session_other',
+        }
+      : {
+          ok: true,
+          session_id: 'session_abc123',
+          url: 'https://claude.ai/code/session_abc123',
+        },
+  ));
 } else {
   process.stderr.write(`unsupported fake claude command: ${args.join(' ')}`);
   process.exitCode = 2;

@@ -14,7 +14,7 @@
 - Relay owns coordination state; providers own execution and conversation state; GitHub owns durable artifact truth.
 - A provider completion never implies a published or verified GitHub artifact.
 - WorkItem identifiers and full 40-character commit SHAs are the cross-provider coordination keys.
-- At most one mutating run may hold a WorkItem lease; read-only runs are pinned to one immutable SHA.
+- Provider-account capacity gates execution; concurrent writes use distinct `relay/run/...` result branches, read-only runs are SHA-pinned, and each WorkItem landing is serialized.
 - Provider tokens and GitHub credentials are never stored.
 - MCP exposes delegate, send, handoff, and status only; merge remains interactive CLI-only.
 - Runtime dependencies are limited to `@modelcontextprotocol/server`, Zod, Commander, and `better-sqlite3`.
@@ -142,7 +142,7 @@ Commit: `feat: add process and provider foundations`
 
 ---
 
-### Task 2: SQLite coordination state and mutation leases
+### Task 2: SQLite coordination state and capacity leases
 
 **Files:**
 - Create: `src/state-store.ts`
@@ -166,12 +166,12 @@ test('persists a project, WorkItem, session, run, and artifact snapshot', () => 
   assert.equal(store.getStatus(workItem.id).artifact?.sha, 'a'.repeat(40));
 });
 
-test('allows one mutation lease and rejects a second owner', () => {
+test('enforces provider-account capacity transactionally', () => {
   const store = seededStore();
-  store.acquireMutationLease('work_1', 'run_1', new Date('2026-08-16T12:00:00Z'));
+  store.acquireAccountLease('account_1', 'run_1', new Date('2026-08-16T12:00:00Z'));
   assert.throws(
-    () => store.acquireMutationLease('work_1', 'run_2', new Date('2026-08-16T12:00:01Z')),
-    (error: unknown) => error instanceof RelayError && error.code === 'work_item_locked'
+    () => store.acquireAccountLease('account_1', 'run_2', new Date('2026-08-16T12:00:01Z')),
+    (error: unknown) => error instanceof RelayError && error.code === 'account_at_capacity'
   );
 });
 
@@ -191,7 +191,7 @@ Expected: FAIL because `StateStore` is missing.
 
 - [ ] **Step 3: Implement schema migration and transactional methods**
 
-Create tables `schema_migrations`, `projects`, `provider_configs`, `work_items`, `provider_sessions`, `provider_runs`, `artifact_snapshots`, and `work_item_leases` with foreign keys enabled. Store timestamps as ISO-8601 text and JSON objects as validated JSON text.
+Create tables `schema_migrations`, `projects`, `provider_configs`, `work_items`, `provider_sessions`, `provider_runs`, `provider_accounts`, `account_leases`, `artifact_snapshots`, `candidates`, and `landing_leases` with foreign keys enabled. Store timestamps as ISO-8601 text and JSON objects as validated JSON text.
 
 ```ts
 export class StateStore {
@@ -209,8 +209,10 @@ export class StateStore {
   createRun(input: RunInput): RunRecord;
   transitionRun(id: string, status: RunStatus): RunRecord;
   countRuns(workItemId: string): number;
-  acquireMutationLease(workItemId: string, runId: string, now?: Date): void;
-  releaseMutationLease(workItemId: string, runId: string): void;
+  acquireAccountLease(accountId: string, runId: string, now?: Date): AccountLeaseRecord;
+  releaseAccountLease(accountId: string, runId: string): void;
+  acquireLandingLease(workItemId: string, runId: string, now?: Date): LandingLeaseRecord;
+  releaseLandingLease(workItemId: string, runId: string): void;
   saveArtifact(input: ArtifactInput): ArtifactRecord;
   getLatestArtifact(workItemId: string): ArtifactRecord | undefined;
   getStatus(workItemId: string): WorkItemStatus;
@@ -554,7 +556,7 @@ export class RelayCore {
 }
 ```
 
-Generate IDs with `randomUUID`. Generate target branches as `relay/<slug>-<first-eight-work-item-id-chars>`. Store prompts only when privacy configuration permits. Acquire and release mutation leases in `finally`. Reconcile after every provider execution. Recover expired sessions by starting a new session with a packet from the latest verified artifact. Generate delegation lineage internally from `parentRunId`; callers cannot supply depth or origin directly.
+Generate IDs with `randomUUID`. Generate isolated write targets as `relay/run/<work-item>/<run>`. Store prompts only when privacy configuration permits. Acquire and release provider-account capacity in `finally`, and serialize integration updates with a WorkItem landing lease. Reconcile after every provider execution. Recover expired sessions by starting a new session with a packet from the latest verified artifact. Generate delegation lineage internally from `parentRunId`; callers cannot supply depth or origin directly.
 
 - [ ] **Step 4: Verify focused and accumulated tests, then commit**
 

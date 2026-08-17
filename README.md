@@ -24,11 +24,12 @@ This is an experimental, pre-1.0 project. Provider cloud CLIs and APIs can chang
 - One logical WorkItem can span Claude, Codex, and Jules.
 - Claude and Jules sessions support programmatic follow-up.
 - Codex supports cloud task creation and structured inspection; scripted cloud follow-up is intentionally unavailable until OpenAI documents a stable surface.
+- Write mode is capability-gated: Codex can target Relay's exact result branch; Claude and Jules currently fail closed with `capability_unavailable` because their adapters cannot prove that output contract.
 - Handoffs contain a repository, branch, full commit SHA, PR, and instruction—not another model's transcript.
 - GitHub reconciliation distinguishes `provider_complete`, `awaiting_publish`, `published`, and `verified`.
 - A completed write is credited only when its expected remote branch appears or advances beyond the SHA observed before dispatch.
 - Read-only work is pinned to the branch SHA observed at dispatch and fails visibly if that head moves.
-- A one-writer lease prevents two mutating providers from racing on one WorkItem; up to three read-only reviews can run concurrently.
+- Provider-account capacity limits active execution. Concurrent writes use distinct Relay-owned `relay/run/...` result branches, while landing serializes each WorkItem's integration update.
 - Merge is CLI-only, interactive, and bound to the exact approved head SHA.
 - The local MCP server exposes strict account inspection, delegation, handoff, status, and integration-only landing tools. It cannot merge.
 
@@ -82,6 +83,10 @@ relay init \
 
 Relay never copies provider or GitHub credentials into SQLite. `gh`, `claude`, and `codex` own their credentials. The Jules adapter reads `JULES_API_KEY` from the process environment at execution time.
 
+### GitHub writer trust boundary
+
+Relay tells providers which isolated `relay/run/...` branch to use and verifies the artifacts they publish, but a provider's native GitHub credential can still write any ref that credential is allowed to write. Provider prompts are not a GitHub authorization boundary, and Relay cannot locally enforce server-side repository permissions. Treat provider identities as trusted writers unless you configure GitHub rulesets and least-privileged provider identities to limit them to `relay/run/*`; protect base and integration branches in GitHub itself. `relay doctor` repeats this warning for interactive use.
+
 ### Claude
 
 Install and authenticate Claude Code, then make sure the installed version exposes cloud sessions. Relay starts with `claude --cloud`, continues with the same opaque session ID, and uses the native cloud interface for attachment when supported.
@@ -92,6 +97,7 @@ relay doctor
 ```
 
 Cloud CLI behavior is capability-probed because Anthropic rolls features out independently.
+Claude cloud starts, follow-ups, and attachment are read-only in Relay until the CLI exposes exact result-branch publication.
 
 ### Codex
 
@@ -128,17 +134,18 @@ relay init --jules-source sources/github/OWNER/REPO
 ```
 
 Relay uses the official Jules `v1alpha` REST API for sessions, follow-ups, status, activities, and plan approval. The alpha schema can change.
+Jules is read-only in Relay: `AUTO_CREATE_PR` chooses a provider-owned branch, so it cannot satisfy Relay's exact `relay/run/...` result-ref contract.
 
 ## Use it
 
 Durable development work is explicit:
 
 ```sh
-relay delegate claude "Implement passwordless login" --title "Passwordless login"
-relay send claude "Add integration tests" --mode write
+relay delegate codex "Implement passwordless login" --title "Passwordless login"
+relay send claude "Review the integration tests" --mode read
 relay status
 relay handoff codex "Review the current implementation for security issues"
-relay handoff jules "Add tests for the review findings" --mode write
+relay handoff jules "Review the security findings" --mode read
 relay reconcile
 relay land RUN_ID
 ```
@@ -148,7 +155,7 @@ Useful direct commands:
 ```sh
 relay claude "Review the current PR"
 relay codex "Look for security regressions"
-relay jules "Add missing edge-case tests" --mode write
+relay jules "Identify missing edge-case tests" --mode read
 relay sessions --json
 relay providers --json
 relay chat claude
@@ -167,6 +174,8 @@ jules> /quit
 Slash commands are `/use`, `/new`, `/handoff`, `/status`, `/land`, `/reconcile`, `/chat`, `/merge`, `/help`, and `/quit`.
 
 Write runs always publish isolated, append-only `relay/run/...` branches. A completed write becomes a candidate, then `relay land RUN_ID` performs a staged two-call lifecycle: the first call creates and checks an immutable staging commit; the second fast-forwards only that WorkItem's integration branch after exact-SHA checks pass. Relay maintains one integration PR per WorkItem. Landing never merges `main` or the base branch; the final base merge remains the separate, human-confirmed `relay merge` flow.
+
+Relay persists a launch-attempt ID before submitting provider work. If it cannot prove whether a remote launch was accepted, the run becomes `launch_uncertain`, `relay status` calls for explicit operator resolution, and Relay quarantines that account's capacity instead of retrying automatically. After inspecting and resolving the provider-side launch, use `relay resolve-launch RUN_ID`; Relay asks for confirmation before cancelling the quarantined local attempt and releasing its capacity. If other running work shares that provider session, Relay quarantines those runs and their capacity independently rather than making them invisible when the session is invalidated.
 
 ## Safe merge
 
@@ -233,13 +242,14 @@ See [SECURITY.md](SECURITY.md) for reporting and trust boundaries.
 
 Both terminal and MCP clients call the same `RelayCore`. Adapters translate provider protocols and expose honest capabilities. `StateStore` persists coordination in SQLite through ordered migrations. `GitHubClient` verifies explicit refs, full SHAs, matching open PR heads, required checks, and safe merge preconditions. Historical snapshots remain available locally, while status, handoff, recovery, and merge always refresh current GitHub state and never act on a stale snapshot.
 
-The core safety limits are:
+The concurrency boundary is:
 
 - delegation depth: 2 when callers propagate `parentRunId`;
-- active mutating runs per WorkItem: 1;
-- active read-only runs per WorkItem: 3;
+- configured provider-account capacity for active execution;
+- one unique `relay/run/...` result branch per concurrent write run;
+- one serialized landing lease per WorkItem integration branch;
 - total runs per WorkItem: 20;
-- abandoned mutation lease reclamation: 60 minutes.
+- expired account and landing lease reclamation: 60 minutes.
 
 See the [architecture design](docs/superpowers/specs/2026-08-16-relay-madness-design.md) for the complete model.
 

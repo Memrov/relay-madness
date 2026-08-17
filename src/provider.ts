@@ -4,6 +4,7 @@ export type MutationMode = 'read' | 'write';
 export type ProviderRunStatus =
   | 'queued'
   | 'running'
+  | 'launch_uncertain'
   | 'provider_complete'
   | 'awaiting_publish'
   | 'published'
@@ -20,6 +21,8 @@ export interface ProviderCapabilities {
   structuredStatus: boolean;
   events: boolean;
   selectBranch: boolean;
+  /** The provider can publish writes to the exact Relay-owned result branch. */
+  controlledResultBranch: boolean;
   publishPullRequest: boolean;
   cancel: boolean;
   subscriptionAuth: boolean;
@@ -37,7 +40,10 @@ export interface StartRunInput {
   prompt: string;
   cwd: string;
   mode: MutationMode;
-  branch?: string;
+  /** Existing branch or ref the provider must use as its input. */
+  startingBranch?: string;
+  /** Exact Relay-owned branch where a write provider must publish its output. */
+  resultBranch?: string;
   environmentId?: string;
   repo?: string;
   source?: string;

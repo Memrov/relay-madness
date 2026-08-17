@@ -44,20 +44,29 @@ export class ClaudeProvider implements CloudProvider {
       this.probe(['--help']),
     ]);
     const available = version !== undefined;
+    const helpText = help ?? '';
+    const cloud = available && /(?:^|\s)--cloud(?:\s|$)/m.test(helpText);
+    const followup =
+      cloud &&
+      /(?:^|\s)(?:-p|--print)(?:[\s,]|$)/m.test(helpText) &&
+      /(?:^|\s)--output-format(?:\s|$)/m.test(helpText);
+    const model = cloud && /(?:^|\s)--model(?:\s|$)/m.test(helpText);
+    const profileIsolation = cloud && /\bCLAUDE_CONFIG_DIR\b/.test(helpText);
     return {
-      start: available,
+      start: cloud,
       structuredStart: false,
-      queueFollowup: available,
+      queueFollowup: followup,
       interactiveAttach:
-        available && /attach to an existing cloud session/i.test(help ?? ''),
+        cloud && /attach to an existing cloud session/i.test(helpText),
       structuredStatus: false,
       events: false,
       selectBranch: false,
+      controlledResultBranch: false,
       publishPullRequest: false,
       cancel: false,
-      subscriptionAuth: true,
-      selectModel: available,
-      profileIsolation: available,
+      subscriptionAuth: available,
+      selectModel: model,
+      profileIsolation,
     };
   }
 
@@ -169,37 +178,79 @@ export class ClaudeProvider implements CloudProvider {
 
 function parseClaudeExecution(output: string): ProviderExecution {
   const trimmed = output.trim();
+  let parsed: z.infer<typeof executionSchema> | undefined;
   try {
-    const parsed = executionSchema.parse(JSON.parse(trimmed));
-    const providerSessionId = parsed.session_id ?? parsed.sessionId;
-    if (providerSessionId !== undefined) {
-      const execution: ProviderExecution = {
-        providerSessionId,
-        status: 'running',
-      };
-      if (parsed.url !== undefined) execution.url = parsed.url;
-      return execution;
-    }
+    parsed = executionSchema.parse(JSON.parse(trimmed));
   } catch {
     // Claude start output is not guaranteed to be JSON.
+  }
+  const providerSessionId = parsed?.session_id ?? parsed?.sessionId;
+  if (providerSessionId !== undefined) {
+    validateClaudeSessionId(providerSessionId);
+    if (parsed?.url === undefined) {
+      return { providerSessionId, status: 'running' };
+    }
+    parseClaudeSessionIdFromUrl(parsed.url, providerSessionId);
+    return { providerSessionId, url: parsed.url, status: 'running' };
   }
 
   const urlText = trimmed.match(/https:\/\/[^\s]+/)?.[0];
   if (urlText !== undefined) {
     const cleanUrl = urlText.replace(/[),.;]+$/, '');
-    try {
-      const url = new URL(cleanUrl);
-      const providerSessionId = url.pathname.split('/').filter(Boolean).at(-1);
-      if (providerSessionId !== undefined && providerSessionId !== '') {
-        return { providerSessionId, url: cleanUrl, status: 'running' };
-      }
-    } catch {
-      // Fall through to the typed error below.
-    }
+    const providerSessionId = parseClaudeSessionIdFromUrl(cleanUrl);
+    return { providerSessionId, url: cleanUrl, status: 'running' };
   }
 
   throw new RelayError(
     'provider_output_invalid',
     'Claude cloud output did not include a session identifier.',
   );
+}
+
+function parseClaudeSessionIdFromUrl(value: string, expectedSessionId?: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch (cause) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Claude cloud returned an invalid session URL.',
+      undefined,
+      { cause },
+    );
+  }
+  const match = /^\/code\/(session_[A-Za-z0-9]+)$/.exec(url.pathname);
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== 'claude.ai' ||
+    url.port !== '' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== '' ||
+    match === null
+  ) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Claude cloud returned an invalid session URL.',
+    );
+  }
+  const sessionId = match[1]!;
+  validateClaudeSessionId(sessionId);
+  if (expectedSessionId !== undefined && sessionId !== expectedSessionId) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Claude cloud session URL did not match its session identifier.',
+    );
+  }
+  return sessionId;
+}
+
+function validateClaudeSessionId(value: string): void {
+  if (!/^session_[A-Za-z0-9]+$/.test(value)) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Claude cloud returned an invalid session identifier.',
+    );
+  }
 }

@@ -9,6 +9,7 @@ export type RelayErrorCode =
   | 'github_state_mismatch'
   | 'invalid_argument'
   | 'invalid_run_transition'
+  | 'launch_uncertain'
   | 'merge_not_approved'
   | 'merge_not_ready'
   | 'not_found'

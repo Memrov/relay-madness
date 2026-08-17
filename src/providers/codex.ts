@@ -56,6 +56,7 @@ export class CodexProvider implements CloudProvider {
       structuredStatus: available,
       events: false,
       selectBranch: true,
+      controlledResultBranch: available,
       publishPullRequest: false,
       cancel: false,
       subscriptionAuth: true,
@@ -96,7 +97,8 @@ export class CodexProvider implements CloudProvider {
     const environmentId = requireEnvironment(input.environmentId);
     const args = ['cloud', 'exec', '--env', environmentId];
     if (input.model !== undefined) args.push('-c', `model="${validatedModel(input.model)}"`);
-    if (input.branch !== undefined) args.push('--branch', input.branch);
+    const branch = input.resultBranch ?? input.startingBranch;
+    if (branch !== undefined) args.push('--branch', branch);
     args.push(input.prompt);
 
     const result = await this.runner.run(
@@ -210,11 +212,10 @@ function parseSubmission(output: string): ProviderExecution {
   }
   try {
     const cleanUrl = urlText.replace(/[),.;]+$/, '');
-    const url = new URL(cleanUrl);
-    const providerSessionId = url.pathname.split('/').filter(Boolean).at(-1);
-    if (providerSessionId === undefined || providerSessionId === '') throw new Error();
+    const providerSessionId = parseCodexTaskUrl(cleanUrl);
     return { providerSessionId, status: 'running', url: cleanUrl };
   } catch (cause) {
+    if (cause instanceof RelayError) throw cause;
     throw new RelayError(
       'provider_output_invalid',
       'Codex cloud returned an invalid task URL.',
@@ -226,7 +227,10 @@ function parseSubmission(output: string): ProviderExecution {
 
 function parseTaskList(output: string): readonly z.infer<typeof taskSchema>[] {
   try {
-    return taskListSchema.parse(JSON.parse(output)).tasks;
+    return taskListSchema.parse(JSON.parse(output)).tasks.map((task) => {
+      parseCodexTaskUrl(task.url, task.id);
+      return task;
+    });
   } catch (cause) {
     throw new RelayError(
       'provider_output_invalid',
@@ -235,6 +239,44 @@ function parseTaskList(output: string): readonly z.infer<typeof taskSchema>[] {
       { cause },
     );
   }
+}
+
+function parseCodexTaskUrl(value: string, expectedTaskId?: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch (cause) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Codex cloud returned an invalid task URL.',
+      undefined,
+      { cause },
+    );
+  }
+  const match = /^\/codex\/tasks\/(task_[A-Za-z0-9]+)$/.exec(url.pathname);
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== 'chatgpt.com' ||
+    url.port !== '' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== '' ||
+    match === null
+  ) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Codex cloud returned an invalid task URL.',
+    );
+  }
+  const taskId = match[1]!;
+  if (expectedTaskId !== undefined && taskId !== expectedTaskId) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Codex cloud task URL did not match its task identifier.',
+    );
+  }
+  return taskId;
 }
 
 function mapCodexStatus(status: string): ProviderRunStatus {

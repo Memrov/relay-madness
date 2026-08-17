@@ -10,6 +10,8 @@ Include affected versions, operating system, reproduction steps, impact, and any
 
 Relay Madness executes authenticated provider CLIs and calls GitHub from the user's machine. A Relay user is responsible for reviewing the permissions granted to those tools and for protecting the local account.
 
+Provider prompts are not GitHub authorization. Relay instructs write-capable providers to use `relay/run/*` and verifies published artifacts, but a provider's native GitHub identity can write any ref that GitHub permits. Treat it as a trusted writer unless GitHub rulesets and least-privileged provider identities restrict it to `relay/run/*`; protect base and integration branches with GitHub's server-side controls.
+
 Relay intentionally:
 
 - invokes external commands with an argument array and `shell: false`;

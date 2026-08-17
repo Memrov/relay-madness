@@ -36,9 +36,11 @@ class FakeProvider implements CloudProvider {
   readonly starts: StartRunInput[] = [];
   readonly sends: SendRunInput[] = [];
   readonly inspections: InspectRunInput[] = [];
+  readonly attachments: AttachInput[] = [];
   startStatus: ProviderRunStatus = 'running';
   sendStatus: ProviderRunStatus = 'running';
   onStart?: (input: StartRunInput) => void;
+  capabilityOverrides: Partial<ProviderCapabilities> = {};
 
   constructor(readonly name: ProviderName) {}
 
@@ -56,6 +58,8 @@ class FakeProvider implements CloudProvider {
       subscriptionAuth: this.name !== 'jules',
       selectModel: this.name !== 'jules',
       profileIsolation: this.name !== 'jules',
+      controlledResultBranch: true,
+      ...this.capabilityOverrides,
     };
   }
 
@@ -86,7 +90,8 @@ class FakeProvider implements CloudProvider {
     return { status: this.startStatus };
   }
 
-  async attach(_input: AttachInput): Promise<number> {
+  async attach(input: AttachInput): Promise<number> {
+    this.attachments.push(input);
     return 0;
   }
 }
@@ -96,11 +101,13 @@ async function relayHarness(
     githubScenario?: string;
     providerStatus?: ProviderRunStatus;
     storePrompts?: boolean;
+    now?: () => Date;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'relay-core-test-'));
   roots.push(root);
-  const store = StateStore.open(join(root, 'state', 'relay.db'));
+  const statePath = join(root, 'state', 'relay.db');
+  const store = StateStore.open(statePath);
   stores.push(store);
   const env: NodeJS.ProcessEnv = {
     PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
@@ -113,7 +120,7 @@ async function relayHarness(
   for (const provider of [claude, codex, jules]) {
     provider.startStatus = options.providerStatus ?? 'running';
     provider.onStart = (input) => {
-      env.FAKE_GH_BRANCH = input.branch;
+      env.FAKE_GH_BRANCH = input.resultBranch ?? input.startingBranch;
     };
   }
   const core = new RelayCore({
@@ -125,10 +132,12 @@ async function relayHarness(
       ['jules', jules],
     ]),
     storePrompts: options.storePrompts ?? true,
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   return {
     core,
     store,
+    statePath,
     cwd: root,
     claude,
     codex,
@@ -263,6 +272,75 @@ test('uses only the configured default account when an account is omitted', asyn
   assert.equal(harness.claude.starts[0]?.profilePath, '/profiles/claude-default');
 });
 
+test('rejects unsupported write, profile, and model selection before provider launch', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  await harness.core.initialize({ cwd: harness.cwd });
+  harness.claude.capabilityOverrides.controlledResultBranch = false;
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      task: 'Unsafe write',
+      title: 'Capability gate',
+      cwd: harness.cwd,
+      mode: 'write',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'capability_unavailable',
+  );
+  assert.equal(harness.claude.starts.length, 0);
+
+  addAccount(harness.store, { id: 'jules-a', provider: 'jules' });
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'jules',
+      accountId: 'jules-a',
+      task: 'Review it',
+      title: 'Profile gate',
+      cwd: harness.cwd,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'capability_unavailable',
+  );
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'jules',
+      model: 'gemini-2.5-pro',
+      task: 'Review it',
+      title: 'Model gate',
+      cwd: harness.cwd,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'capability_unavailable',
+  );
+  assert.equal(harness.jules.starts.length, 0);
+});
+
+test('rejects a follow-up when the provider no longer supports that operation', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    task: 'Review it',
+    title: 'Follow-up gate',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  harness.claude.capabilityOverrides.queueFollowup = false;
+
+  await assert.rejects(
+    harness.core.send({
+      provider: 'claude',
+      message: 'Continue',
+      workItemId: first.workItem.id,
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'capability_unavailable',
+  );
+  assert.equal(harness.claude.sends.length, 0);
+});
+
 test('scopes provider sessions by account and prevents a follow-up from switching accounts', async () => {
   const harness = await relayHarness({ githubScenario: 'published' });
   await harness.core.initialize({ cwd: harness.cwd });
@@ -320,6 +398,133 @@ test('does not let a follow-up select a different account than its active sessio
   });
   assert.equal(continued.session.accountId, 'claude-a');
   assert.equal(harness.claude.sends.length, 1);
+});
+
+test('keeps an omitted follow-up on its stored account after the default changes', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  harness.claude.startStatus = 'provider_complete';
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, {
+    id: 'claude-a',
+    provider: 'claude',
+    isDefault: true,
+  });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    task: 'First',
+    title: 'Sticky default',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  addAccount(harness.store, {
+    id: 'claude-b',
+    provider: 'claude',
+    isDefault: true,
+  });
+
+  const continued = await harness.core.send({
+    provider: 'claude',
+    message: 'Continue',
+    workItemId: first.workItem.id,
+  });
+
+  assert.equal(continued.session.accountId, 'claude-a');
+  assert.equal(harness.claude.sends[0]?.profilePath, '/profiles/claude-a');
+});
+
+test('prefers one active account session over failed and expired account history', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  harness.claude.startStatus = 'provider_complete';
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  addAccount(harness.store, { id: 'claude-b', provider: 'claude' });
+  addAccount(harness.store, { id: 'claude-c', provider: 'claude' });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'First',
+    title: 'Usable session',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  harness.store.upsertSession({
+    workItemId: first.workItem.id,
+    provider: 'claude',
+    accountId: 'claude-b',
+    providerSessionId: 'failed_history',
+    status: 'failed',
+  });
+  harness.store.upsertSession({
+    workItemId: first.workItem.id,
+    provider: 'claude',
+    accountId: 'claude-c',
+    providerSessionId: 'expired_history',
+    status: 'expired',
+  });
+
+  const continued = await harness.core.send({
+    provider: 'claude',
+    message: 'Continue on the usable account',
+    workItemId: first.workItem.id,
+  });
+  await harness.core.chat('claude', { workItemId: first.workItem.id });
+
+  assert.equal(continued.session.accountId, 'claude-a');
+  assert.equal(harness.claude.sends[0]?.profilePath, '/profiles/claude-a');
+  assert.equal(
+    harness.claude.attachments[0]?.providerSessionId,
+    first.session.providerSessionId,
+  );
+});
+
+test('requires an account for follow-up and chat when multiple scopes exist', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  harness.claude.startStatus = 'provider_complete';
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  addAccount(harness.store, { id: 'claude-b', provider: 'claude' });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'First',
+    title: 'Ambiguous sessions',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-b',
+    task: 'Second',
+    workItemId: first.workItem.id,
+    mode: 'read',
+  });
+
+  for (const operation of [
+    () => harness.core.send({
+      provider: 'claude' as const,
+      message: 'Continue',
+      workItemId: first.workItem.id,
+    }),
+    () => harness.core.chat('claude', { workItemId: first.workItem.id }),
+  ]) {
+    await assert.rejects(
+      operation,
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'invalid_argument',
+    );
+  }
+  assert.equal(harness.claude.sends.length, 0);
+  assert.equal(harness.claude.attachments.length, 0);
+
+  await harness.core.chat('claude', {
+    workItemId: first.workItem.id,
+    accountId: 'claude-a',
+  });
+  assert.equal(
+    harness.claude.attachments[0]?.providerSessionId,
+    first.session.providerSessionId,
+  );
+  assert.equal(harness.claude.attachments[0]?.profilePath, '/profiles/claude-a');
 });
 
 test('allows parallel writers only on distinct run branches', async () => {
@@ -392,6 +597,203 @@ test('releases account capacity only after the provider reaches a terminal state
   });
 });
 
+test('heartbeats an inspected active run so its account remains reserved past an hour', async () => {
+  let now = new Date('2026-08-16T10:00:00Z');
+  const harness = await relayHarness({
+    githubScenario: 'published',
+    now: () => now,
+  });
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'Long review',
+    title: 'Heartbeat',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+
+  now = new Date('2026-08-16T10:59:00Z');
+  await harness.core.status({ workItemId: first.workItem.id });
+  now = new Date('2026-08-16T11:30:00Z');
+
+  assert.equal(harness.store.countActiveAccountLeases('claude-a', now), 1);
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      accountId: 'claude-a',
+      task: 'Second review',
+      workItemId: first.workItem.id,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'account_at_capacity',
+  );
+  assert.equal(harness.claude.starts.length, 1);
+});
+
+test('heartbeats every active run sharing one inspected provider session', async () => {
+  let now = new Date('2026-08-16T10:00:00Z');
+  const harness = await relayHarness({
+    githubScenario: 'published',
+    now: () => now,
+  });
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, {
+    id: 'claude-a',
+    provider: 'claude',
+    maxConcurrency: 2,
+  });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'Long review',
+    title: 'Shared heartbeat',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  await harness.core.send({
+    provider: 'claude',
+    accountId: 'claude-a',
+    message: 'Parallel follow-up',
+    workItemId: first.workItem.id,
+    mode: 'read',
+  });
+
+  now = new Date('2026-08-16T10:59:00Z');
+  await harness.core.status({ workItemId: first.workItem.id });
+  now = new Date('2026-08-16T11:30:00Z');
+
+  assert.equal(harness.store.countActiveAccountLeases('claude-a', now), 2);
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      accountId: 'claude-a',
+      task: 'Third review',
+      workItemId: first.workItem.id,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'account_at_capacity',
+  );
+  assert.equal(harness.claude.starts.length, 1);
+  assert.equal(harness.claude.sends.length, 1);
+});
+
+test('finishes and releases every active run sharing a terminal provider session', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, {
+    id: 'claude-a',
+    provider: 'claude',
+    maxConcurrency: 2,
+  });
+  const first = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'Long review',
+    title: 'Shared completion',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  await harness.core.send({
+    provider: 'claude',
+    accountId: 'claude-a',
+    message: 'Parallel follow-up',
+    workItemId: first.workItem.id,
+    mode: 'read',
+  });
+  harness.claude.startStatus = 'provider_complete';
+
+  const status = await harness.core.status({ workItemId: first.workItem.id });
+
+  assert.equal(
+    status.runs.filter((run) => run.status === 'running').length,
+    0,
+  );
+  assert.equal(harness.store.countActiveAccountLeases('claude-a'), 0);
+});
+
+test('quarantines capacity and refuses retry after remote acceptance cannot be persisted', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  const project = await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  const activateSession = harness.store.activateSession.bind(harness.store);
+  let injectFault = true;
+  harness.store.activateSession = ((id, input) => {
+    if (injectFault && !input.providerSessionId.startsWith('pending:')) {
+      injectFault = false;
+      throw new Error('fault after remote acceptance');
+    }
+    return activateSession(id, input);
+  }) as StateStore['activateSession'];
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      accountId: 'claude-a',
+      task: 'Potentially accepted',
+      title: 'Uncertain launch',
+      cwd: harness.cwd,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'launch_uncertain',
+  );
+
+  const workItem = harness.store.getCurrentWorkItem(project.id)!;
+  const uncertain = harness.store
+    .getStatus(workItem.id)
+    .runs.find((run) => run.status === 'launch_uncertain');
+  assert.ok(uncertain);
+  assert.equal(uncertain.launchState, 'uncertain');
+  assert.equal(harness.claude.starts.length, 1);
+  assert.equal(harness.store.countActiveAccountLeases('claude-a'), 1);
+
+  const reopened = StateStore.open(harness.statePath);
+  stores.push(reopened);
+  assert.equal(reopened.getRun(uncertain.id).status, 'launch_uncertain');
+  assert.match(
+    reopened.getSession(workItem.id, 'claude', 'claude-a')?.providerSessionId ?? '',
+    /^pending:/,
+  );
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      accountId: 'claude-a',
+      task: 'Do not retry',
+      workItemId: workItem.id,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'launch_uncertain',
+  );
+  assert.equal(harness.claude.starts.length, 1);
+
+  await assert.rejects(
+    harness.core.resolveLaunch({ runId: uncertain.id, confirmed: false }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'invalid_argument',
+  );
+  const resolved = await harness.core.resolveLaunch({
+    runId: uncertain.id,
+    confirmed: true,
+  });
+  assert.equal(resolved.status, 'cancelled');
+  assert.equal(harness.store.countActiveAccountLeases('claude-a'), 0);
+
+  await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'Retry only after resolution',
+    workItemId: workItem.id,
+    mode: 'read',
+  });
+  assert.equal(harness.claude.starts.length, 2);
+});
+
 test('reuses an active provider session for send', async () => {
   const harness = await relayHarness();
   const delegated = await harness.core.delegate({
@@ -431,13 +833,51 @@ test('marks provider completion as awaiting publish until GitHub resolves the br
   assert.equal(result.artifact, undefined);
 });
 
+test('reconciles every unresolved result run before selecting a displayed artifact', async () => {
+  const harness = await relayHarness({
+    githubScenario: 'missing-base-a',
+    providerStatus: 'provider_complete',
+  });
+  const first = await harness.core.delegate({
+    provider: 'codex',
+    task: 'First writer',
+    title: 'Out-of-order results',
+    cwd: harness.cwd,
+    mode: 'write',
+  });
+  const second = await harness.core.delegate({
+    provider: 'codex',
+    task: 'Second writer',
+    workItemId: first.workItem.id,
+    mode: 'write',
+  });
+  assert.equal(first.run.status, 'awaiting_publish');
+  assert.equal(second.run.status, 'awaiting_publish');
+  assert.equal(harness.store.getCandidate(first.run.id), undefined);
+  assert.equal(harness.store.getCandidate(second.run.id), undefined);
+
+  harness.setGithubScenario('no-pr');
+  await harness.core.reconcile({ workItemId: first.workItem.id });
+
+  assert.equal(harness.store.getRun(first.run.id).status, 'published');
+  assert.equal(harness.store.getRun(second.run.id).status, 'published');
+  assert.equal(
+    harness.store.getCandidate(first.run.id)?.sourceBranch,
+    first.run.expectedBranch,
+  );
+  assert.equal(
+    harness.store.getCandidate(second.run.id)?.sourceBranch,
+    second.run.expectedBranch,
+  );
+});
+
 test('records a full verified SHA after a provider publishes', async () => {
   const harness = await relayHarness({
     githubScenario: 'base-a',
     providerStatus: 'provider_complete',
   });
   harness.claude.onStart = (input) => {
-    harness.setGithubBranch(input.branch);
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
     harness.setGithubScenario('published');
   };
 
@@ -484,7 +924,7 @@ test('preserves provider truth when GitHub reconciliation fails', async () => {
     providerStatus: 'provider_complete',
   });
   harness.claude.onStart = (input) => {
-    harness.setGithubBranch(input.branch);
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
     harness.setGithubScenario('error');
   };
 
@@ -512,7 +952,7 @@ test('preserves provider truth when GitHub reconciliation fails', async () => {
 test('builds a handoff from the reconciled SHA without copying the original prompt', async () => {
   const harness = await relayHarness({ providerStatus: 'provider_complete' });
   harness.claude.onStart = (input) => {
-    harness.setGithubBranch(input.branch);
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
     harness.setGithubScenario('published');
   };
   const original = await harness.core.delegate({
@@ -537,7 +977,7 @@ test('builds a handoff from the reconciled SHA without copying the original prom
 test('does not hand off or report a stale artifact after its branch disappears', async () => {
   const harness = await relayHarness({ providerStatus: 'provider_complete' });
   harness.claude.onStart = (input) => {
-    harness.setGithubBranch(input.branch);
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
     harness.setGithubScenario('published');
   };
   const original = await harness.core.delegate({
@@ -567,7 +1007,7 @@ test('does not hand off or report a stale artifact after its branch disappears',
 test('reconciles a mutating handoff against its isolated result branch', async () => {
   const harness = await relayHarness({ providerStatus: 'provider_complete' });
   harness.claude.onStart = (input) => {
-    harness.setGithubBranch(input.branch);
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
     harness.setGithubScenario('published');
   };
   const original = await harness.core.delegate({
@@ -603,7 +1043,7 @@ test('reconciles a mutating handoff against its isolated result branch', async (
 test('recovers an expired session by starting a replacement from GitHub state', async () => {
   const harness = await relayHarness({ providerStatus: 'provider_complete' });
   harness.claude.onStart = (input) => {
-    harness.setGithubBranch(input.branch);
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
     harness.setGithubScenario('published');
   };
   const delegated = await harness.core.delegate({
@@ -757,7 +1197,7 @@ test('rejects a read result when the pinned branch head moves during inspection'
     providerStatus: 'provider_complete',
   });
   harness.codex.onStart = (input) => {
-    harness.setGithubBranch(input.branch);
+    harness.setGithubBranch(input.resultBranch ?? input.startingBranch);
     harness.setGithubScenario('moved');
   };
 
@@ -848,5 +1288,38 @@ test('omits prompts from SQLite when prompt storage is disabled', async () => {
   assert.equal(
     harness.store.getStatus(result.workItem.id).runs[0]?.prompt,
     undefined,
+  );
+});
+
+test('rejects a pull request head that moves after human approval', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  const project = await harness.core.initialize({ cwd: harness.cwd });
+  const workItem = harness.store.createWorkItem({
+    projectId: project.id,
+    title: 'Approval race',
+    baseBranch: 'main',
+    currentBranch: 'relay/work/approval-race',
+  });
+  harness.store.saveArtifact({
+    workItemId: workItem.id,
+    branch: workItem.integrationBranch,
+    sha: 'b'.repeat(40),
+    status: 'verified',
+    pullRequest: 143,
+    checks: 'passing',
+  });
+  harness.setGithubBranch(workItem.integrationBranch);
+  harness.setGithubScenario('moved');
+
+  await assert.rejects(
+    harness.core.merge({
+      workItemId: workItem.id,
+      strategy: 'squash',
+      approved: true,
+      pullRequest: 143,
+      expectedSha: 'b'.repeat(40),
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'head_moved',
   );
 });

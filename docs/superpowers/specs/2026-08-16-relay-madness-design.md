@@ -91,9 +91,9 @@ A Project binds a GitHub repository to its default branch, local locator checkou
 
 ### WorkItem
 
-A WorkItem is one logical development objective. It owns the base branch, deterministic target branch, current full commit SHA, pull-request number, status, and provider sessions.
+A WorkItem is one logical development objective. It owns the base branch, reserved integration branch, current full commit SHA, pull-request number, status, and provider sessions.
 
-Only one mutating provider session may hold a WorkItem lease. Follow-up turns in that session transfer the lease to the newest run. Up to three read-only reviews may run concurrently when each is pinned to the SHA observed at dispatch. These limits are enforced inside immediate SQLite transactions so separate Relay processes cannot race past them.
+Concurrent write runs are allowed only when each owns a distinct Relay-generated `relay/run/...` result branch. Provider-account capacity leases limit active execution, while a single landing lease serializes updates to each WorkItem integration branch. Read-only work remains pinned to its observed SHA. These state changes are transactionally coordinated so separate Relay processes cannot race past the configured capacity or landing boundary.
 
 ### ProviderSession
 
@@ -114,6 +114,8 @@ Weekly usage snapshots are caller-supplied advisory scheduling telemetry keyed b
 ### Candidate landing
 
 Every eligible completed write creates one immutable candidate from its isolated append-only `relay/run/...` branch. Landing is intentionally staged: the first `land(runId)` call creates an exact-SHA staging branch and checks it; the second fast-forwards only the WorkItem integration branch when that same staging SHA passes. Each WorkItem has one integration PR. Landing never merges the base branch or `main`; final base-branch merge remains the separate interactive human-approved flow.
+
+Relay verifies the branches and commits it observes, but its branch instructions and prompts do not authorize GitHub writes. A provider's native GitHub identity is a trusted writer unless repository administrators configure GitHub rulesets and least-privileged provider identities that restrict it to `relay/run/*`. Base and integration ref protection is a GitHub server-side responsibility; Relay does not claim local authorization enforcement it cannot provide.
 
 ### ArtifactSnapshot
 
@@ -162,17 +164,17 @@ Higher-level code checks capabilities before selecting a path. An unsupported op
 
 ### Claude adapter
 
-The Claude adapter invokes the authenticated `claude` CLI. It starts a cloud session from the project locator checkout, sends queue-and-exit follow-ups by session ID, and attaches interactively when the installed CLI supports attachment. It parses structured JSON when available and accepts documented Claude session URLs as a fallback identifier source.
+The Claude adapter invokes the authenticated `claude` CLI. It capability-probes cloud start, queue-and-exit follow-up, model selection, profile isolation, and interactive attachment rather than treating binary presence as support. It parses structured JSON when available and accepts only documented Claude session URLs as a fallback identifier source. Claude operations remain read-only until the CLI exposes exact Relay-controlled result-branch publication.
 
 Because Claude can complete without an automatically discoverable branch or pull request, publication and reconciliation remain separate phases.
 
 ### Jules adapter
 
-The Jules adapter uses the official REST API for session creation, follow-up messages, plan approval, inspection, activities, and automatic pull-request mode. It reads `JULES_API_KEY` at execution time and never persists the key. Jules API instability is isolated inside the adapter and tested against recorded schema-shaped fixtures.
+The Jules adapter uses the official REST API for read-only session creation, follow-up messages, plan approval, inspection, and activities. It reads `JULES_API_KEY` at execution time and never persists the key. Relay rejects Jules write mode because `AUTO_CREATE_PR` publishes to a Jules-selected branch rather than the exact Relay-controlled result ref. Jules API instability is isolated inside the adapter and tested against recorded schema-shaped fixtures.
 
 ### Codex adapter
 
-The Codex adapter invokes the authenticated `codex` CLI. It supports cloud task submission, listing, and status inspection using a stored project environment ID. Programmatic follow-up is reported unavailable until OpenAI publishes a stable command or API. `relay chat codex` launches the native cloud interface as the interactive escape hatch.
+The Codex adapter invokes the authenticated `codex` CLI. It supports cloud task submission to an exact Relay-controlled result branch, listing, and status inspection using a stored project environment ID. Programmatic follow-up is reported unavailable until OpenAI publishes a stable command or API. `relay chat codex` launches the native cloud interface as the interactive escape hatch.
 
 ## Handoffs
 
@@ -189,7 +191,7 @@ Instruction: Review for correctness, security, and regressions.
 Expected output: Report findings against the pinned commit. Do not merge.
 ```
 
-Mutating handoffs allocate a new provider-specific target branch unless the previous writer has released the WorkItem lease. Read-only handoffs remain pinned to the source SHA and must report when the pull-request head moves during the review.
+Mutating handoffs allocate a new Relay-generated `relay/run/...` result branch and consume capacity on the selected provider account. Read-only handoffs remain pinned to the source SHA and must report when the pull-request head moves during the review.
 
 ## GitHub behavior
 
@@ -224,8 +226,9 @@ SQLite is the only Relay-owned durable store. The database contains:
 - `work_items`;
 - `provider_sessions`;
 - `provider_runs`;
+- `provider_accounts` and `account_leases`;
 - `artifact_snapshots`;
-- `work_item_leases`.
+- `candidates` and `landing_leases`.
 
 Foreign keys are enabled. Mutating state transitions run in transactions. The database and containing directory are created with user-only permissions.
 
@@ -236,10 +239,11 @@ Prompts are stored unless Relay was launched with `RELAY_STORE_PROMPTS=false`. P
 Relay owns delegation lineage and enforces these defaults:
 
 - maximum delegation depth: 2;
-- maximum active mutating runs per WorkItem: 1;
-- maximum active read-only runs per WorkItem: 3;
+- configured provider-account capacity for active execution;
+- one unique `relay/run/...` result branch per concurrent write run;
+- one serialized landing lease per WorkItem integration branch;
 - maximum total runs per WorkItem: 20;
-- abandoned mutation lease reclamation: 60 minutes;
+- expired account and landing lease reclamation: 60 minutes;
 - explicit repository and provider membership in the Project.
 
 Provider cloud environments do not receive Relay bridge credentials. A delegated provider therefore cannot silently call back into Relay unless a future, explicitly configured deployment grants that capability.
@@ -280,7 +284,7 @@ The suite covers:
 - Jules request and response schemas;
 - subprocess timeouts and redaction;
 - state migrations and transactional transitions;
-- WorkItem mutation leases;
+- provider-account capacity, isolated result branches, and serialized landing;
 - immutable handoff packets;
 - missing and moved GitHub branches;
 - pull-request and check normalization;

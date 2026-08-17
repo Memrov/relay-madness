@@ -246,6 +246,44 @@ function seed(store: StateStore) {
   return { project, workItem, session };
 }
 
+function activeRunForAccount(
+  store: StateStore,
+  input: {
+    accountId: string;
+    provider: 'claude' | 'codex' | 'jules';
+    id?: string;
+    providerSessionId?: string;
+    sessionStatus?: 'pending' | 'active';
+  },
+) {
+  const project = store.upsertProject({
+    repo: `acme/${input.accountId}-${input.id ?? 'run'}`,
+    defaultBranch: 'main',
+    locatorPath: '/tmp/account-run',
+  });
+  const workItem = store.createWorkItem({
+    projectId: project.id,
+    title: 'Account run',
+    baseBranch: 'main',
+  });
+  const session = store.upsertSession({
+    workItemId: workItem.id,
+    provider: input.provider,
+    accountId: input.accountId,
+    providerSessionId: input.providerSessionId ?? `session-${input.id ?? input.accountId}`,
+    status: input.sessionStatus ?? 'active',
+  });
+  const run = store.createRun({
+    ...(input.id === undefined ? {} : { id: input.id }),
+    sessionId: session.id,
+    provider: input.provider,
+    accountId: input.accountId,
+    type: 'delegation',
+    mutationMode: 'write',
+  });
+  return { workItem, session, run: store.transitionRun(run.id, 'running') };
+}
+
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -679,17 +717,22 @@ test('applies ordered schema migrations', () => {
   const landingLeaseColumns = database.pragma(
     'table_info(landing_leases)',
   ) as Array<{ name: string }>;
+  const accountLeaseForeignKeys = database.pragma(
+    'foreign_key_list(account_leases)',
+  ) as Array<{ table: string; from: string }>;
   database.close();
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3, 4, 5, 6, 7],
+    [1, 2, 3, 4, 5, 6, 7, 8],
   );
   assert.ok(runColumns.some(({ name }) => name === 'baseline_sha'));
   assert.ok(runColumns.some(({ name }) => name === 'account_id'));
   assert.ok(runColumns.some(({ name }) => name === 'model'));
   assert.ok(runColumns.some(({ name }) => name === 'base_sha'));
   assert.ok(runColumns.some(({ name }) => name === 'result_sha'));
+  assert.ok(runColumns.some(({ name }) => name === 'launch_attempt_id'));
+  assert.ok(runColumns.some(({ name }) => name === 'launch_state'));
   assert.ok(
     artifactColumns.some(({ name }) => name === 'verification_status'),
   );
@@ -700,6 +743,11 @@ test('applies ordered schema migrations', () => {
   );
   assert.ok(candidateColumns.some(({ name }) => name === 'conflict_paths_json'));
   assert.ok(landingLeaseColumns.some(({ name }) => name === 'expires_at'));
+  assert.ok(
+    accountLeaseForeignKeys.some(
+      ({ table, from }) => table === 'provider_runs' && from === 'run_id',
+    ),
+  );
 });
 
 test('migrates a version-four relay run branch without retaining its SHA or PR', () => {
@@ -930,20 +978,22 @@ test('accepts weekly usage boundaries and rejects invalid percentages or reset t
 
 test('enforces account capacity transactionally and reclaims stale leases', () => {
   const store = storeWithAccount('codex-a', 'codex', { maxConcurrency: 1 });
-  store.acquireAccountLease('codex-a', 'run-a', new Date('2026-08-16T10:00:00Z'));
+  const first = activeRunForAccount(store, { accountId: 'codex-a', provider: 'codex', id: 'run-a' });
+  const second = activeRunForAccount(store, { accountId: 'codex-a', provider: 'codex', id: 'run-b' });
+  store.acquireAccountLease('codex-a', first.run.id, new Date('2026-08-16T10:00:00Z'));
   assert.throws(
-    () => store.acquireAccountLease('codex-a', 'run-b', new Date('2026-08-16T10:00:01Z')),
+    () => store.acquireAccountLease('codex-a', second.run.id, new Date('2026-08-16T10:00:01Z')),
     (error: unknown) =>
       error instanceof RelayError && error.code === 'account_at_capacity',
   );
 
   const replacement = store.acquireAccountLease(
     'codex-a',
-    'run-b',
+    second.run.id,
     new Date('2026-08-16T11:00:01Z'),
   );
   assert.equal(replacement.runId, 'run-b');
-  store.releaseAccountLease('codex-a', 'run-b');
+  store.releaseAccountLease('codex-a', second.run.id);
   store.close();
 });
 
@@ -959,7 +1009,8 @@ test('counts only unexpired account leases without reclaiming expired rows', () 
     maxConcurrency: 1,
     isDefault: true,
   });
-  store.acquireAccountLease('codex-a', 'run-a', new Date('2026-08-16T10:00:00Z'));
+  const run = activeRunForAccount(store, { accountId: 'codex-a', provider: 'codex', id: 'run-a' });
+  store.acquireAccountLease('codex-a', run.run.id, new Date('2026-08-16T10:00:00Z'));
 
   assert.equal(
     store.countActiveAccountLeases('codex-a', new Date('2026-08-16T11:00:01Z')),
@@ -973,6 +1024,257 @@ test('counts only unexpired account leases without reclaiming expired rows', () 
     .get('codex-a') as { count: number };
   database.close();
   assert.equal(row.count, 1);
+});
+
+test('heartbeats only an active run-owned account lease without exceeding capacity', () => {
+  const store = storeWithAccount('codex-a', 'codex', { maxConcurrency: 1 });
+  const first = activeRunForAccount(store, { accountId: 'codex-a', provider: 'codex', id: 'heartbeat-a' });
+  const second = activeRunForAccount(store, { accountId: 'codex-a', provider: 'codex', id: 'heartbeat-b' });
+  store.acquireAccountLease('codex-a', first.run.id, new Date('2026-08-16T10:00:00Z'));
+
+  const renewed = store.heartbeatAccountLease(
+    'codex-a',
+    first.run.id,
+    new Date('2026-08-16T10:59:00Z'),
+  );
+
+  assert.equal(renewed.expiresAt, '2026-08-16T11:59:00.000Z');
+  assert.throws(
+    () => store.acquireAccountLease('codex-a', second.run.id, new Date('2026-08-16T11:30:00Z')),
+    (error: unknown) => error instanceof RelayError && error.code === 'account_at_capacity',
+  );
+  assert.throws(
+    () => store.heartbeatAccountLease('codex-a', second.run.id, new Date('2026-08-16T11:30:00Z')),
+    (error: unknown) => error instanceof RelayError && error.code === 'not_found',
+  );
+  store.close();
+});
+
+test('does not revive an expired account lease through heartbeat', () => {
+  const store = storeWithAccount('codex-a', 'codex', { maxConcurrency: 1 });
+  const first = activeRunForAccount(store, { accountId: 'codex-a', provider: 'codex', id: 'late-a' });
+  const second = activeRunForAccount(store, { accountId: 'codex-a', provider: 'codex', id: 'late-b' });
+  store.acquireAccountLease('codex-a', first.run.id, new Date('2026-08-16T10:00:00Z'));
+  store.acquireAccountLease('codex-a', second.run.id, new Date('2026-08-16T11:00:01Z'));
+
+  assert.throws(
+    () => store.heartbeatAccountLease('codex-a', first.run.id, new Date('2026-08-16T11:00:01Z')),
+    (error: unknown) => error instanceof RelayError && error.code === 'not_found',
+  );
+  assert.equal(store.countActiveAccountLeases('codex-a', new Date('2026-08-16T11:00:01Z')), 1);
+  store.close();
+});
+
+test('derives run provider and account identity from its session', () => {
+  const store = storeWithAccount('claude-a', 'claude');
+  store.upsertProviderAccount({
+    id: 'claude-b', provider: 'claude', label: 'B', profilePath: '/profiles/claude-b',
+    status: 'ready', maxConcurrency: 1, isDefault: false,
+  });
+  const { session } = activeRunForAccount(store, { accountId: 'claude-a', provider: 'claude', id: 'identity-base' });
+
+  assert.throws(
+    () => store.createRun({ sessionId: session.id, provider: 'codex', type: 'message', mutationMode: 'read' }),
+    (error: unknown) => error instanceof RelayError && error.code === 'provider_mismatch',
+  );
+  assert.throws(
+    () => store.createRun({ sessionId: session.id, provider: 'claude', accountId: 'claude-b', type: 'message', mutationMode: 'read' }),
+    (error: unknown) => error instanceof RelayError && error.code === 'provider_mismatch',
+  );
+  const canonical = store.createRun({
+    sessionId: session.id, provider: 'claude', type: 'message', mutationMode: 'read',
+  });
+  assert.equal(canonical.accountId, 'claude-a');
+  store.close();
+});
+
+test('quarantines an interrupted launch after reopening the state database', () => {
+  const path = databasePath();
+  const store = StateStore.open(path);
+  store.upsertProviderAccount({
+    id: 'codex-a', provider: 'codex', label: 'A', profilePath: '/profiles/codex-a',
+    status: 'ready', maxConcurrency: 1, isDefault: false,
+  });
+  const { run } = activeRunForAccount(store, {
+    accountId: 'codex-a',
+    provider: 'codex',
+    id: 'uncertain-a',
+    providerSessionId: 'pending:uncertain-a',
+  });
+  store.acquireAccountLease('codex-a', run.id);
+  const attempt = store.prepareRunLaunch(run.id, 'attempt-uncertain-a');
+  assert.equal(attempt.launchState, 'prepared');
+  store.close();
+
+  const reopened = StateStore.open(path);
+  const recovered = reopened.getRun(run.id);
+  assert.equal(recovered.status, 'launch_uncertain');
+  assert.equal(recovered.launchState, 'uncertain');
+  assert.equal(recovered.launchAttemptId, 'attempt-uncertain-a');
+  assert.equal(reopened.countActiveAccountLeases('codex-a'), 1);
+  assert.equal(
+    reopened.countActiveAccountLeases(
+      'codex-a',
+      new Date('2126-08-16T11:00:01Z'),
+    ),
+    1,
+  );
+  const replacement = activeRunForAccount(reopened, {
+    accountId: 'codex-a',
+    provider: 'codex',
+    id: 'uncertain-replacement',
+  });
+  assert.throws(
+    () =>
+      reopened.acquireAccountLease(
+        'codex-a',
+        replacement.run.id,
+        new Date('2126-08-16T11:00:01Z'),
+      ),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'account_at_capacity',
+  );
+  reopened.close();
+});
+
+test('does not quarantine a launch owned by another live StateStore', () => {
+  const path = databasePath();
+  const owner = StateStore.open(path);
+  owner.upsertProviderAccount({
+    id: 'codex-a',
+    provider: 'codex',
+    label: 'A',
+    profilePath: '/profiles/codex-a',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+  const { run } = activeRunForAccount(owner, {
+    accountId: 'codex-a',
+    provider: 'codex',
+    id: 'live-launch',
+  });
+  owner.prepareRunLaunch(run.id, 'attempt-live');
+
+  const observer = StateStore.open(path);
+
+  assert.equal(observer.getRun(run.id).status, 'running');
+  assert.equal(observer.getRun(run.id).launchState, 'prepared');
+  observer.close();
+  owner.markRunLaunchAccepted(run.id, 'attempt-live');
+  owner.completeRunLaunch(run.id, 'attempt-live');
+  owner.close();
+});
+
+test('does not quarantine a launch after local acceptance is durably completed', () => {
+  const path = databasePath();
+  const store = StateStore.open(path);
+  store.upsertProviderAccount({
+    id: 'codex-safe',
+    provider: 'codex',
+    label: 'Safe',
+    profilePath: '/profiles/codex-safe',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+  const { run } = activeRunForAccount(store, {
+    accountId: 'codex-safe',
+    provider: 'codex',
+    id: 'accepted-safe',
+  });
+  const attemptId = 'attempt-accepted-safe';
+  store.prepareRunLaunch(run.id, attemptId);
+  store.markRunLaunchAccepted(run.id, attemptId);
+  store.completeRunLaunch(run.id, attemptId);
+  store.close();
+
+  const reopened = StateStore.open(path);
+  assert.equal(reopened.getRun(run.id).status, 'running');
+  assert.equal(reopened.getRun(run.id).launchState, undefined);
+  reopened.close();
+});
+
+test('releases quarantined capacity only through explicit uncertain-launch resolution', () => {
+  const store = storeWithAccount('codex-resolve', 'codex');
+  const { session, run } = activeRunForAccount(store, {
+    accountId: 'codex-resolve',
+    provider: 'codex',
+    id: 'uncertain-resolve',
+    providerSessionId: 'pending:uncertain-resolve',
+    sessionStatus: 'pending',
+  });
+  store.acquireAccountLease('codex-resolve', run.id);
+  store.prepareRunLaunch(run.id, 'attempt-resolve');
+  store.markRunLaunchUncertain(run.id, 'attempt-resolve');
+
+  const resolved = store.resolveUncertainLaunch(run.id);
+
+  assert.equal(resolved.status, 'cancelled');
+  assert.equal(store.countActiveAccountLeases('codex-resolve'), 0);
+  assert.equal(
+    store.getStatus(run.workItemId).sessions.find(({ id }) => id === session.id)
+      ?.status,
+    'failed',
+  );
+  store.close();
+});
+
+test('invalidates an active session when resolving post-acceptance uncertainty', () => {
+  const store = storeWithAccount('codex-active-resolve', 'codex');
+  const { session, run } = activeRunForAccount(store, {
+    accountId: 'codex-active-resolve',
+    provider: 'codex',
+    id: 'uncertain-active-resolve',
+  });
+  store.acquireAccountLease('codex-active-resolve', run.id);
+  store.prepareRunLaunch(run.id, 'attempt-active-resolve');
+  store.markRunLaunchAccepted(run.id, 'attempt-active-resolve');
+  store.markRunLaunchUncertain(run.id, 'attempt-active-resolve');
+
+  store.resolveUncertainLaunch(run.id);
+
+  assert.equal(
+    store.getStatus(run.workItemId).sessions.find(({ id }) => id === session.id)
+      ?.status,
+    'failed',
+  );
+  store.close();
+});
+
+test('quarantines running siblings when resolving a shared-session launch', () => {
+  const store = storeWithAccount('codex-shared-resolve', 'codex', {
+    maxConcurrency: 2,
+  });
+  const { session, run } = activeRunForAccount(store, {
+    accountId: 'codex-shared-resolve',
+    provider: 'codex',
+    id: 'uncertain-shared-a',
+  });
+  const sibling = store.transitionRun(
+    store.createRun({
+      id: 'uncertain-shared-b',
+      sessionId: session.id,
+      provider: 'codex',
+      accountId: 'codex-shared-resolve',
+      type: 'message',
+      mutationMode: 'read',
+    }).id,
+    'running',
+  );
+  store.acquireAccountLease('codex-shared-resolve', run.id);
+  store.acquireAccountLease('codex-shared-resolve', sibling.id);
+  store.prepareRunLaunch(run.id, 'attempt-shared-resolve');
+  store.markRunLaunchUncertain(run.id, 'attempt-shared-resolve');
+
+  store.resolveUncertainLaunch(run.id);
+
+  assert.equal(store.getRun(sibling.id).status, 'launch_uncertain');
+  assert.equal(store.getRun(sibling.id).launchState, 'uncertain');
+  assert.equal(store.countActiveAccountLeases('codex-shared-resolve'), 1);
+  store.resolveUncertainLaunch(sibling.id);
+  assert.equal(store.countActiveAccountLeases('codex-shared-resolve'), 0);
+  store.close();
 });
 
 test('does not acquire leases from disabled or authentication-required accounts', () => {

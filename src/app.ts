@@ -37,6 +37,7 @@ type RelayCoreApi = Pick<
   | 'sessions'
   | 'providers'
   | 'reconcile'
+  | 'resolveLaunch'
   | 'chat'
   | 'merge'
 >;
@@ -140,6 +141,7 @@ function createRelayApi(
     sessions: core.sessions.bind(core),
     providers: core.providers.bind(core),
     reconcile: core.reconcile.bind(core),
+    resolveLaunch: core.resolveLaunch.bind(core),
     chat: core.chat.bind(core),
     merge: core.merge.bind(core),
     addAccount: async (input) => store.upsertProviderAccount(input),
@@ -182,7 +184,7 @@ export function createCli(
 
   program
     .command('doctor')
-    .description('Check GitHub and provider authentication')
+    .description('Check authentication and the provider GitHub-writer trust boundary')
     .option('--json', 'print machine-readable JSON')
     .action(async ({ json }: { json?: boolean }) => {
       const report = await core.doctor();
@@ -191,6 +193,9 @@ export function createCli(
       for (const provider of PROVIDERS) {
         writeHealth(io, titleCase(provider), report.providers[provider].auth);
       }
+      io.write(
+        'Warning: Provider identities are trusted GitHub writers; Relay prompts do not enforce branch authorization. Configure GitHub rulesets and least-privileged provider identities to restrict writes to relay/run/*.\n',
+      );
     });
 
   program
@@ -264,6 +269,8 @@ export function createCli(
     .argument('<provider>', 'claude, codex, or jules')
     .argument('<message>', 'message to send')
     .option('--work-item <id>', 'WorkItem ID')
+    .option('--account <id>', 'provider account ID')
+    .option('--model <model>', 'provider model identifier')
     .addOption(modeOption('read'))
     .option('--json', 'print machine-readable JSON')
     .action(async (providerText: string, message: string, commandOptions) => {
@@ -272,6 +279,12 @@ export function createCli(
         message,
         mode: commandOptions.mode as MutationMode,
         ...selector(io, commandOptions.workItem as string | undefined),
+        ...(commandOptions.account === undefined
+          ? {}
+          : { accountId: commandOptions.account as string }),
+        ...(commandOptions.model === undefined
+          ? {}
+          : { model: commandOptions.model as string }),
       });
       writeResult(io, result, commandOptions.json === true);
     });
@@ -363,7 +376,14 @@ export function createCli(
     .requiredOption('--remaining-percent <percent>', 'remaining weekly usage percent')
     .option('--resets-at <timestamp>', 'usage reset time as an ISO timestamp')
     .action(async (accountId: string, commandOptions) => {
-      const remainingPercent = Number(commandOptions.remainingPercent);
+      const rawRemainingPercent = commandOptions.remainingPercent as string;
+      if (rawRemainingPercent.trim() === '') {
+        throw new RelayError(
+          'invalid_argument',
+          '--remaining-percent must be a finite number from 0 through 100.',
+        );
+      }
+      const remainingPercent = Number(rawRemainingPercent);
       if (!Number.isFinite(remainingPercent) || remainingPercent < 0 || remainingPercent > 100) {
         throw new RelayError(
           'invalid_argument',
@@ -449,14 +469,39 @@ export function createCli(
     });
 
   program
+    .command('resolve-launch')
+    .description('Release a quarantined launch after manual provider inspection')
+    .argument('<run-id>', 'launch_uncertain run ID')
+    .action(async (runId: string) => {
+      const answer = await io.readLine(
+        'Confirm the remote launch was manually resolved and Relay may release its quarantine? [y/N] ',
+      );
+      if (!isYes(answer)) {
+        io.write('Resolution cancelled.\n');
+        return;
+      }
+      const run = await core.resolveLaunch({ runId, confirmed: true });
+      io.write(`Run ${run.id} resolved as ${run.status}.\n`);
+    });
+
+  program
     .command('chat')
     .description('Attach to a provider-native cloud session')
     .argument('<provider>', 'claude, codex, or jules')
     .option('--work-item <id>', 'WorkItem ID')
-    .action(async (providerText: string, commandOptions: { workItem?: string }) => {
+    .option('--account <id>', 'provider account ID')
+    .action(async (
+      providerText: string,
+      commandOptions: { workItem?: string; account?: string },
+    ) => {
       await core.chat(
         providerName(providerText),
-        selector(io, commandOptions.workItem),
+        {
+          ...selector(io, commandOptions.workItem),
+          ...(commandOptions.account === undefined
+            ? {}
+            : { accountId: commandOptions.account }),
+        },
       );
     });
 
@@ -503,6 +548,8 @@ export function createCli(
           ...selected,
           strategy: commandOptions.strategy,
           approved: true,
+          pullRequest: artifact.pullRequest,
+          expectedSha: artifact.sha,
         });
         io.write(`Merged PR #${artifact.pullRequest}.\n`);
       },
@@ -618,6 +665,13 @@ function writeStatus(
   io.write(`Checks    ${status.artifact?.checks ?? 'unknown'}\n`);
   for (const session of status.sessions) {
     io.write(`${titleCase(session.provider).padEnd(10)} ${session.status}\n`);
+  }
+  for (const run of status.runs.filter(
+    (candidate) => candidate.status === 'launch_uncertain',
+  )) {
+    io.write(
+      `Run       ${run.id}  launch_uncertain — explicit operator resolution required\n`,
+    );
   }
   for (const candidate of status.candidates ?? []) {
     io.write(`Candidate ${candidate.runId}  ${candidate.status}\n`);

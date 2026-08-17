@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -40,9 +40,12 @@ export interface LandingCoordinatorDependencies {
 
 export class LandingCoordinator {
   private readonly runner: ProcessRunner;
+  private readonly hooksPath: string;
 
   constructor(private readonly dependencies: LandingCoordinatorDependencies) {
     this.runner = dependencies.runner ?? new ProcessRunner();
+    this.hooksPath = mkdtempSync(join(tmpdir(), 'relay-empty-hooks-'));
+    chmodSync(this.hooksPath, 0o700);
   }
 
   async land(runId: string): Promise<LandingResult> {
@@ -146,62 +149,50 @@ export class LandingCoordinator {
       return this.status(candidate.runId, 'stale');
     }
 
-    const temporaryRoot = mkdtempSync(join(tmpdir(), 'relay-stage-'));
-    const worktreePath = join(temporaryRoot, 'worktree');
-    let worktreeAdded = false;
-    try {
+    const stagingSha = (
       await this.git(
         project.locatorPath,
-        'worktree',
-        'add',
-        '--detach',
-        worktreePath,
-        integrationHead,
-      );
-      worktreeAdded = true;
-      await this.git(worktreePath, 'merge', '--squash', candidate.sourceSha);
-      await this.git(
-        worktreePath,
         '-c',
         'user.name=Relay',
         '-c',
         'user.email=relay@localhost',
-        'commit',
+        'commit-tree',
+        preflight.treeSha,
+        '-p',
+        integrationHead,
         '-m',
         candidateCommitSubject(candidate.runId),
         '-m',
         candidateCommitTrailers(candidate),
+      )
+    ).stdout.trim();
+    if (!isFullSha(stagingSha)) {
+      throw new RelayError(
+        'provider_output_invalid',
+        'Git returned an invalid staged commit SHA.',
       );
-      const stagingSha = (
-        await this.git(worktreePath, 'rev-parse', 'HEAD')
-      ).stdout.trim();
-      await this.git(
-        worktreePath,
-        'push',
-        'origin',
-        `HEAD:refs/heads/${stagingBranch}`,
-      );
-      const observedStage = await this.remoteSha(
-        project.locatorPath,
-        stagingBranch,
-      );
-      if (observedStage !== stagingSha) {
-        return this.status(candidate.runId, 'stale');
-      }
-      return resultFor(
-        this.dependencies.store.recordCandidateStage(candidate.runId, {
-          stagingBranch,
-          stagingSha,
-          integrationBaseSha: integrationHead,
-          integrationRefExisted,
-        }),
-      );
-    } finally {
-      if (worktreeAdded) {
-        await this.cleanTemporaryWorktree(project.locatorPath, worktreePath);
-      }
-      rmSync(temporaryRoot, { recursive: true, force: true });
     }
+    await this.git(
+      project.locatorPath,
+      'push',
+      'origin',
+      `${stagingSha}:refs/heads/${stagingBranch}`,
+    );
+    const observedStage = await this.remoteSha(
+      project.locatorPath,
+      stagingBranch,
+    );
+    if (observedStage !== stagingSha) {
+      return this.status(candidate.runId, 'stale');
+    }
+    return resultFor(
+      this.dependencies.store.recordCandidateStage(candidate.runId, {
+        stagingBranch,
+        stagingSha,
+        integrationBaseSha: integrationHead,
+        integrationRefExisted,
+      }),
+    );
   }
 
   private async finish(candidate: CandidateRecord): Promise<LandingResult> {
@@ -429,23 +420,15 @@ export class LandingCoordinator {
     );
   }
 
-  private async cleanTemporaryWorktree(
-    repositoryPath: string,
-    worktreePath: string,
-  ): Promise<void> {
-    if (existsSync(worktreePath)) {
-      await this.git(worktreePath, 'reset', '--merge', 'HEAD');
-      await this.git(worktreePath, 'clean', '-fd');
-      await this.git(repositoryPath, 'worktree', 'remove', worktreePath);
-    }
-    await this.git(repositoryPath, 'worktree', 'prune');
-  }
-
   private async git(
     cwd: string,
     ...args: readonly string[]
   ): Promise<ProcessResult> {
-    return await this.runner.run('git', args, { cwd, timeoutMs: 120_000 });
+    return await this.runner.run(
+      'git',
+      ['-c', `core.hooksPath=${this.hooksPath}`, ...args],
+      { cwd, timeoutMs: 120_000 },
+    );
   }
 }
 

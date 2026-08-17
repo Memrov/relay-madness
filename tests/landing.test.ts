@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -102,6 +109,40 @@ test('prepares one candidate on a staging branch without moving integration', as
     fixture.integrationBefore,
   );
   assert.equal(fixture.remoteSha(result.stagingBranch!), result.stagingSha);
+});
+
+test('never executes candidate-controlled hooks while staging or landing', async () => {
+  const fixture = await createLandingRepository({
+    checks: 'unknown',
+    candidateHooks: true,
+  });
+  const sentinel = join(fixture.root, 'candidate-hook-ran');
+
+  const staged = await fixture.lander.land(fixture.runId);
+  assert.equal(staged.status, 'staged');
+  assert.equal(existsSync(sentinel), false);
+
+  fixture.github.checks = 'passing';
+  const landed = await fixture.lander.land(fixture.runId);
+
+  assert.equal(landed.status, 'landed');
+  assert.equal(existsSync(sentinel), false);
+  assert.ok(
+    fixture.runner.commands.every(
+      ({ args }) =>
+        args[0] === '-c' &&
+        args[1]?.startsWith('core.hooksPath=/') === true,
+    ),
+  );
+  assert.ok(
+    fixture.runner.commands.some(({ args }) => args.includes('commit-tree')),
+  );
+  assert.equal(
+    fixture.runner.commands.some(
+      ({ args }) => args.includes('merge') || args.includes('commit'),
+    ),
+    false,
+  );
 });
 
 test('fast-forwards integration only after the exact staging SHA passes checks', async () => {
@@ -373,6 +414,7 @@ async function createConflictingLandingRepository(): Promise<LandingFixture> {
 async function createLandingRepository(
   options: {
     checks?: CheckSummary;
+    candidateHooks?: boolean;
     conflict?: boolean;
     integrationExists?: boolean;
     resultSha?: string;
@@ -414,6 +456,26 @@ async function createLandingRepository(
 
   const sourceBranch = 'relay/run/work-1/run-1';
   git(checkout, 'switch', '-c', sourceBranch, 'main');
+  if (options.candidateHooks === true) {
+    const hooksPath = join(checkout, '.githooks');
+    mkdirSync(hooksPath, { recursive: true });
+    for (const hook of [
+      'post-checkout',
+      'post-merge',
+      'pre-commit',
+      'prepare-commit-msg',
+      'commit-msg',
+      'post-commit',
+      'pre-push',
+    ]) {
+      const hookPath = join(hooksPath, hook);
+      writeFileSync(
+        hookPath,
+        `#!/bin/sh\nprintf '%s\\n' "${hook}" >> "${join(root, 'candidate-hook-ran')}"\n`,
+      );
+      chmodSync(hookPath, 0o755);
+    }
+  }
   if (options.conflict === true) {
     writeFileSync(join(checkout, 'src', 'shared.ts'), 'export const shared = 3;\n');
   } else {
@@ -423,6 +485,9 @@ async function createLandingRepository(
   git(checkout, 'commit', '-m', 'Candidate change');
   git(checkout, 'push', '-u', 'origin', sourceBranch);
   const sourceSha = git(checkout, 'rev-parse', 'HEAD');
+  if (options.candidateHooks === true) {
+    git(checkout, 'config', 'core.hooksPath', '.githooks');
+  }
 
   const store = StateStore.open(join(root, 'state', 'relay.db'));
   stores.push(store);

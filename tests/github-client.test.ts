@@ -261,6 +261,8 @@ test('summarizes checks for the exact commit SHA', async () => {
   const failing = githubForScenario('commit-checks-failing').github;
   const mixed = githubForScenario('commit-checks-mixed').github;
   const unknown = githubForScenario('commit-checks-unknown').github;
+  const legacyFailing = githubForScenario('commit-checks-legacy-failing').github;
+  const legacyPending = githubForScenario('commit-checks-legacy-pending').github;
   const sha = 'e'.repeat(40);
 
   assert.equal(await passing.getCommitChecks('acme/web', sha), 'passing');
@@ -268,6 +270,8 @@ test('summarizes checks for the exact commit SHA', async () => {
   assert.equal(await failing.getCommitChecks('acme/web', sha), 'failing');
   assert.equal(await mixed.getCommitChecks('acme/web', sha), 'failing');
   assert.equal(await unknown.getCommitChecks('acme/web', sha), 'unknown');
+  assert.equal(await legacyFailing.getCommitChecks('acme/web', sha), 'failing');
+  assert.equal(await legacyPending.getCommitChecks('acme/web', sha), 'pending');
 });
 
 test('inspects every commit-check page before classifying the SHA', async () => {
@@ -280,6 +284,13 @@ test('inspects every commit-check page before classifying the SHA', async () => 
   );
   assert.ok(command?.includes('--paginate'));
   assert.ok(command?.includes('--slurp'));
+  const legacyCommand = readCommands().find(
+    (args) =>
+      args[0] === 'api' &&
+      args[1] === `repos/acme/web/commits/${sha}/status`,
+  );
+  assert.ok(legacyCommand?.includes('--paginate'));
+  assert.ok(legacyCommand?.includes('--slurp'));
 });
 
 test('reuses one correctly targeted integration pull request', async () => {

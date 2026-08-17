@@ -55,7 +55,7 @@ const queuedSession = {
   updateTime: '2026-08-16T12:00:00Z',
 };
 
-test('creates an AUTO_CREATE_PR session without persisting its API key', async () => {
+test('creates a read session from an existing starting branch without persisting its API key', async () => {
   const { provider, requests } = julesWithResponses([
     { status: 200, body: queuedSession },
   ]);
@@ -65,9 +65,9 @@ test('creates an AUTO_CREATE_PR session without persisting its API key', async (
     title: 'Tests',
     repo: 'acme/web',
     cwd: '/tmp',
-    branch: 'main',
+    startingBranch: 'main',
     source: 'sources/github-acme-web',
-    mode: 'write',
+    mode: 'read',
   });
 
   assert.deepEqual(result, {
@@ -84,8 +84,27 @@ test('creates an AUTO_CREATE_PR session without persisting its API key', async (
       githubRepoContext: { startingBranch: 'main' },
     },
     requirePlanApproval: false,
-    automationMode: 'AUTO_CREATE_PR',
   });
+});
+
+test('rejects write mode because Jules cannot publish an exact Relay result ref', async () => {
+  const { provider, requests } = julesWithResponses([]);
+
+  await assert.rejects(
+    provider.start({
+      prompt: 'Add tests',
+      title: 'Tests',
+      repo: 'acme/web',
+      cwd: '/tmp',
+      startingBranch: 'main',
+      resultBranch: 'relay/run/work-1/run-1',
+      source: 'sources/github-acme-web',
+      mode: 'write',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'capability_unavailable',
+  );
+  assert.equal(requests.length, 0);
 });
 
 test('sends a follow-up with the documented prompt body', async () => {
@@ -210,7 +229,7 @@ test('reports missing API-key authentication without making a request', async ()
   });
   assert.equal(requests.length, 0);
   await assert.rejects(
-    provider.start({ prompt: 'x', cwd: '/tmp', mode: 'write' }),
+    provider.start({ prompt: 'x', cwd: '/tmp', mode: 'read' }),
     (error: unknown) =>
       error instanceof RelayError && error.code === 'configuration_missing',
   );
@@ -232,5 +251,6 @@ test('reports the documented Jules capabilities', async () => {
     subscriptionAuth: false,
     selectModel: false,
     profileIsolation: false,
+    controlledResultBranch: false,
   });
 });

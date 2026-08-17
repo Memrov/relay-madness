@@ -10,7 +10,13 @@ import { createRelayMcpServer } from '../src/mcp.js';
 const sha = 'b'.repeat(40);
 
 function fakeCore() {
-  const calls = { handoff: 0, status: 0, merge: 0, land: 0 };
+  const calls = {
+    handoff: [] as unknown[],
+    send: [] as unknown[],
+    status: 0,
+    merge: 0,
+    land: [] as string[],
+  };
   const workItem = {
     id: 'work_1',
     projectId: 'project_1',
@@ -67,9 +73,12 @@ function fakeCore() {
     doctor: async () => ({}),
     initialize: async () => result.project,
     delegate: async () => result,
-    send: async () => result,
-    handoff: async () => {
-      calls.handoff += 1;
+    send: async (input: unknown) => {
+      calls.send.push(input);
+      return result;
+    },
+    handoff: async (input: unknown) => {
+      calls.handoff.push(input);
       return { ...result, prompt: 'hidden prompt' };
     },
     accounts: async () => [
@@ -94,7 +103,7 @@ function fakeCore() {
       },
     ],
     land: async (runId: string) => {
-      calls.land += 1;
+      calls.land.push(runId);
       return {
         runId,
         status: 'landed',
@@ -224,7 +233,7 @@ test('lands a candidate through the integration branch without merging main', as
       stagingSha: sha,
       landedSha: 'a'.repeat(40),
     });
-    assert.equal(calls.land, 1);
+    assert.deepEqual(calls.land, ['run_1']);
     assert.equal(calls.merge, 0);
   } finally {
     await close();
@@ -258,7 +267,15 @@ test('routes a handoff through Relay Core without exposing provider IDs', async 
       checks: 'passing',
     });
     assert.equal(JSON.stringify(response).includes('must-not-leak'), false);
-    assert.equal(calls.handoff, 1);
+    assert.deepEqual(calls.handoff, [
+      {
+        provider: 'jules',
+        instruction: 'Add tests',
+        mode: 'read',
+        workItemId: 'current',
+        cwd: '/workspace/acme-web',
+      },
+    ]);
   } finally {
     await close();
   }
@@ -341,20 +358,80 @@ test('rejects unknown input fields before reaching Relay Core', async () => {
   }
 });
 
-test('accepts account and model selection but rejects unknown delegate and handoff fields', async () => {
+test('forwards handoff account and model selection through Relay Core', async () => {
   const { core, calls } = fakeCore();
   const { client, close } = await connectedMcp(core);
   try {
-    const accepted = await client.callTool({
+    const response = await client.callTool({
+      name: 'relay_handoff',
+      arguments: {
+        provider: 'jules',
+        workItem: 'current',
+        instruction: 'Review it',
+        account: 'jules-a',
+        model: 'jules-latest',
+      },
+    });
+    assert.equal(response.isError, undefined);
+    assert.deepEqual(calls.handoff, [
+      {
+        provider: 'jules',
+        instruction: 'Review it',
+        mode: 'read',
+        workItemId: 'current',
+        cwd: '/workspace/acme-web',
+        accountId: 'jules-a',
+        model: 'jules-latest',
+      },
+    ]);
+  } finally {
+    await close();
+  }
+});
+
+test('forwards send account and model selection through Relay Core', async () => {
+  const { core, calls } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    await client.callTool({
+      name: 'relay_send',
+      arguments: {
+        provider: 'jules',
+        workItem: 'work_1',
+        message: 'Continue',
+        account: 'jules-a',
+        model: 'gemini-2.5-pro',
+      },
+    });
+
+    assert.deepEqual(calls.send, [
+      {
+        provider: 'jules',
+        message: 'Continue',
+        mode: 'read',
+        workItemId: 'work_1',
+        cwd: '/workspace/acme-web',
+        accountId: 'jules-a',
+        model: 'gemini-2.5-pro',
+      },
+    ]);
+  } finally {
+    await close();
+  }
+});
+
+test('rejects unknown delegate, handoff, and landing fields before reaching Relay Core', async () => {
+  const { core, calls } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    const rejectedDelegate = await client.callTool({
       name: 'relay_delegate',
       arguments: {
         provider: 'codex',
         task: 'Implement it',
-        account: 'codex-a',
-        model: 'gpt-5.6-sol',
+        unknown: true,
       },
     });
-    assert.equal(accepted.isError, undefined);
     const rejected = await client.callTool({
       name: 'relay_handoff',
       arguments: {
@@ -364,21 +441,36 @@ test('accepts account and model selection but rejects unknown delegate and hando
         unknown: true,
       },
     });
+    const rejectedLand = await client.callTool({
+      name: 'relay_land',
+      arguments: { runId: 'run_1', merge: true },
+    });
+    assert.equal(rejectedDelegate.isError, true);
     assert.equal(rejected.isError, true);
-    assert.equal(calls.handoff, 0);
+    assert.equal(rejectedLand.isError, true);
+    assert.deepEqual(calls.handoff, []);
+    assert.deepEqual(calls.land, []);
   } finally {
     await close();
   }
 });
 
-test('returns typed, redacted Relay errors to MCP clients', async () => {
+test('returns only allowlisted MCP error fields without subprocess diagnostics', async () => {
   const { core } = fakeCore();
   const throwingCore = {
     ...core,
     send: async () => {
-      throw new RelayError('work_item_locked', 'WorkItem is busy.', {
-        apiToken: 'must-not-leak',
-      });
+      throw new RelayError(
+        'process_failed',
+        'Command failed in /private/profiles/claude-a with PLAINTEXT_SECRET and prompt: build auth.',
+        {
+          profilePath: '/private/profiles/claude-a',
+          prompt: 'build auth',
+          stdout: 'PLAINTEXT_SECRET',
+          stderr: 'PLAINTEXT_SECRET',
+          nested: ['PLAINTEXT_SECRET'],
+        },
+      );
     },
   } as RelayApi;
   const { client, close } = await connectedMcp(throwingCore);
@@ -397,12 +489,63 @@ test('returns typed, redacted Relay errors to MCP clients', async () => {
     assert.equal(text?.type, 'text');
     if (text?.type !== 'text') assert.fail('Expected text error content.');
     assert.deepEqual(JSON.parse(text.text), {
-      error: {
-        code: 'work_item_locked',
-        message: 'WorkItem is busy.',
-        details: { apiToken: '[REDACTED]' },
-      },
+      error: { code: 'process_failed' },
     });
+    assert.equal(text.text.includes('/private/profiles/claude-a'), false);
+    assert.equal(text.text.includes('PLAINTEXT_SECRET'), false);
+    assert.equal(text.text.includes('build auth'), false);
+  } finally {
+    await close();
+  }
+});
+
+test('returns candidate lifecycle details in MCP status', async () => {
+  const { core } = fakeCore();
+  const coreWithCandidate = {
+    ...core,
+    status: async () => ({
+      ...(await core.status({ workItemId: 'current' })),
+      candidates: [
+        {
+          id: 'run_1',
+          runId: 'run_1',
+          workItemId: 'work_1',
+          status: 'staged' as const,
+          sourceBranch: 'relay/run/auth-run_1',
+          sourceSha: 'c'.repeat(40),
+          baseSha: 'd'.repeat(40),
+          integrationBranch: 'relay/work/auth',
+          stagingBranch: 'relay/stage/run_1',
+          stagingSha: 'e'.repeat(40),
+          conflictFiles: [],
+          createdAt: '2026-08-16T00:00:00.000Z',
+          updatedAt: '2026-08-16T00:00:00.000Z',
+        },
+      ],
+    }),
+  } as RelayApi;
+  const { client, close } = await connectedMcp(coreWithCandidate);
+  try {
+    const response = await client.callTool({
+      name: 'relay_status',
+      arguments: { workItem: 'current' },
+    });
+    assert.deepEqual(
+      (response.structuredContent as { candidates?: unknown }).candidates,
+      [
+        {
+          runId: 'run_1',
+          status: 'staged',
+          sourceBranch: 'relay/run/auth-run_1',
+          sourceSha: 'c'.repeat(40),
+          baseSha: 'd'.repeat(40),
+          integrationBranch: 'relay/work/auth',
+          stagingBranch: 'relay/stage/run_1',
+          stagingSha: 'e'.repeat(40),
+          conflictFiles: [],
+        },
+      ],
+    );
   } finally {
     await close();
   }

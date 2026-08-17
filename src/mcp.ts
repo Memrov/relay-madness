@@ -158,6 +158,8 @@ export function createRelayMcpServer(
           workItem: workItemSchema,
           mode: modeSchema.default('read'),
           parentRunId: z.string().min(1).optional(),
+          account: z.string().min(1).optional(),
+          model: z.string().min(1).optional(),
         })
         .strict(),
       outputSchema,
@@ -168,7 +170,7 @@ export function createRelayMcpServer(
         openWorldHint: true,
       },
     },
-    async ({ provider, message, workItem, mode, parentRunId }) => {
+    async ({ provider, message, workItem, mode, parentRunId, account, model }) => {
       return await executeTool(async () => {
         const result = await core.send({
           provider,
@@ -176,6 +178,8 @@ export function createRelayMcpServer(
           mode,
           ...selection(workItem, cwd),
           ...(parentRunId === undefined ? {} : { parentRunId }),
+          ...(account === undefined ? {} : { accountId: account }),
+          ...(model === undefined ? {} : { model }),
         });
         return publicRun(result);
       });
@@ -466,16 +470,9 @@ async function executeTool(
 function toolError(error: unknown) {
   const publicError =
     error instanceof RelayError
-      ? compact({
-          code: error.code,
-          message: error.message,
-          details: error.details,
-        })
-      : {
-          code: 'unexpected_error',
-          message: 'Relay operation failed.',
-        };
-  const safe = redact({ error: publicError });
+      ? { code: error.code }
+      : { code: 'unexpected_error' };
+  const safe = { error: publicError };
   return {
     isError: true,
     content: [{ type: 'text' as const, text: JSON.stringify(safe) }],

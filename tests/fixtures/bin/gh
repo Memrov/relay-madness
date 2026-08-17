@@ -9,7 +9,7 @@ if (log) appendFileSync(log, `${JSON.stringify(args)}\n`);
 const sha =
   scenario === 'moved'
     ? 'c'.repeat(40)
-    : scenario === 'base-a'
+    : scenario === 'base-a' || scenario === 'missing-base-a'
       ? 'a'.repeat(40)
       : 'b'.repeat(40);
 
@@ -28,6 +28,36 @@ if (args[0] === 'auth' && args[1] === 'status') {
     defaultBranchRef: { name: 'main' },
     url: 'https://github.com/acme/web',
   });
+} else if (
+  args[0] === 'api' &&
+  args[1]?.match(/\/commits\/[0-9a-f]{40}\/status$/i)
+) {
+  const requestedSha = args[1].split('/').at(-2);
+  const mode = scenario.replace('commit-checks-', '');
+  const state =
+    mode === 'legacy-failing'
+      ? 'failure'
+      : mode === 'legacy-pending'
+        ? 'pending'
+        : mode === 'unknown'
+          ? 'pending'
+          : 'success';
+  const statuses =
+    mode === 'unknown'
+      ? []
+      : [
+          {
+            context: 'legacy/required',
+            state,
+            target_url: 'https://example.test/legacy-status',
+          },
+        ];
+  output([{
+    state,
+    sha: requestedSha,
+    total_count: statuses.length,
+    statuses,
+  }]);
 } else if (
   args[0] === 'api' &&
   args.some(
@@ -109,7 +139,8 @@ if (args[0] === 'auth' && args[1] === 'status') {
     process.exitCode = 1;
   } else if (
     scenario === 'deleted' ||
-    (scenario === 'missing' && !args[1]?.includes('heads/main')) ||
+    ((scenario === 'missing' || scenario === 'missing-base-a') &&
+      !args[1]?.includes('heads/main')) ||
     (scenario === 'target-missing' && args[1]?.includes('-jules-'))
   ) {
     process.stderr.write('gh: Not Found (HTTP 404)');

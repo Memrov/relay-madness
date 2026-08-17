@@ -59,7 +59,7 @@ test('starts a Claude cloud session and parses its documented URL', async () => 
   const execution = await provider.start({
     prompt: 'Implement auth',
     cwd,
-    branch: 'relay/auth',
+    startingBranch: 'relay/auth',
     mode: 'write',
   });
 
@@ -120,6 +120,19 @@ test('reports authentication and attach capability independently', async () => {
   assert.equal(capabilities.structuredStatus, false);
 });
 
+test('does not advertise cloud operations when only the Claude binary is installed', async () => {
+  const { provider } = claudeForScenario('installed-no-cloud');
+
+  const capabilities = await provider.capabilities();
+
+  assert.equal(capabilities.start, false);
+  assert.equal(capabilities.queueFollowup, false);
+  assert.equal(capabilities.interactiveAttach, false);
+  assert.equal(capabilities.selectModel, false);
+  assert.equal(capabilities.profileIsolation, false);
+  assert.equal(capabilities.controlledResultBranch, false);
+});
+
 test('reports a logged-out CLI without throwing', async () => {
   const { provider } = claudeForScenario('logged-out');
 
@@ -137,6 +150,31 @@ test('rejects cloud output without a session identifier', async () => {
     (error: unknown) =>
       error instanceof RelayError &&
       error.code === 'provider_output_invalid',
+  );
+});
+
+test('rejects Claude cloud URLs outside the documented session route', async () => {
+  for (const scenario of ['invalid-url-host', 'invalid-url-path', 'invalid-url-id']) {
+    const { provider, cwd } = claudeForScenario(scenario);
+    await assert.rejects(
+      provider.start({ prompt: 'x', cwd, mode: 'write' }),
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'provider_output_invalid',
+    );
+  }
+});
+
+test('rejects a structured Claude session URL that does not match its session ID', async () => {
+  const { provider, cwd } = claudeForScenario('invalid-json-url');
+
+  await assert.rejects(
+    provider.send!({
+      providerSessionId: 'session_abc123',
+      message: 'Continue',
+      cwd,
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_output_invalid',
   );
 });
 

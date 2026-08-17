@@ -22,6 +22,12 @@ if (args[0] === 'login' && args[1] === 'status') {
 } else if (args[0] === 'cloud' && args[1] === 'exec') {
   if (scenario === 'malformed') {
     process.stdout.write('task submitted');
+  } else if (scenario === 'invalid-url-host') {
+    process.stdout.write('Task submitted\nhttps://chatgpt.com.example/codex/tasks/task_456');
+  } else if (scenario === 'invalid-url-path') {
+    process.stdout.write('Task submitted\nhttps://chatgpt.com/tasks/task_456');
+  } else if (scenario === 'invalid-url-id') {
+    process.stdout.write('Task submitted\nhttps://chatgpt.com/codex/tasks/not-a-task');
   } else {
     process.stdout.write('Task submitted\nhttps://chatgpt.com/codex/tasks/task_456');
   }
@@ -30,7 +36,9 @@ if (args[0] === 'login' && args[1] === 'status') {
     tasks: [
       {
         id: 'task_456',
-        url: 'https://chatgpt.com/codex/tasks/task_456',
+        url: scenario === 'invalid-list-url'
+          ? 'https://chatgpt.com/codex/tasks/task_other'
+          : 'https://chatgpt.com/codex/tasks/task_456',
         title: 'Review auth',
         status: scenario === 'failed' ? 'failed' : 'completed',
         updated_at: '2026-08-16T12:00:00Z',

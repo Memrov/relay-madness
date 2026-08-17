@@ -30,6 +30,7 @@ export interface RelayCoreDependencies {
   github: GitHubClient;
   providers: ReadonlyMap<ProviderName, CloudProvider>;
   storePrompts?: boolean;
+  now?: () => Date;
 }
 
 export interface InitializeInput {
@@ -78,9 +79,20 @@ export interface WorkItemSelector {
   cwd?: string;
 }
 
+export interface ChatInput extends WorkItemSelector {
+  accountId?: string;
+}
+
 export interface MergeRequest extends WorkItemSelector {
   strategy: MergeStrategy;
   approved: boolean;
+  pullRequest: number;
+  expectedSha: string;
+}
+
+export interface ResolveLaunchRequest {
+  runId: string;
+  confirmed: boolean;
 }
 
 export interface RelayRunResult {
@@ -129,13 +141,20 @@ interface StartExecutionInput {
   pinnedSha?: string;
 }
 
-const ACTIVE_RUN_STATUSES = new Set(['queued', 'running']);
+const ACTIVE_RUN_STATUSES = new Set<ProviderRunStatus>(['queued', 'running']);
+const CAPACITY_HOLDING_RUN_STATUSES = new Set<ProviderRunStatus>([
+  'queued',
+  'running',
+  'launch_uncertain',
+]);
 
 export class RelayCore {
   private readonly storePrompts: boolean;
+  private readonly now: () => Date;
 
   constructor(private readonly dependencies: RelayCoreDependencies) {
     this.storePrompts = dependencies.storePrompts ?? true;
+    this.now = dependencies.now ?? (() => new Date());
   }
 
   async doctor(): Promise<DoctorReport> {
@@ -211,30 +230,27 @@ export class RelayCore {
 
   async send(input: SendInput): Promise<RelayRunResult> {
     const context = await this.resolveWorkItem(input);
-    const selectedAccount = this.resolveAccount(input.provider, input.accountId);
-    let session = this.dependencies.store.getSession(
+    const route = this.sessionRoute(
+      context.workItem.id,
+      input.provider,
+      input.accountId,
+    );
+    const selectedAccount = route.account;
+    const session = route.session;
+    this.assertNoUncertainLaunch(
       context.workItem.id,
       input.provider,
       selectedAccount?.id,
     );
-    const providerSessions = this.dependencies.store
-      .listSessions(context.workItem.id)
-      .filter((candidate) => candidate.provider === input.provider);
     if (
       session === undefined &&
-      input.accountId === undefined &&
-      selectedAccount === undefined &&
-      providerSessions.length === 1
+      input.accountId !== undefined &&
+      route.existingScopes > 0
     ) {
-      session = providerSessions[0];
-    }
-    if (session === undefined && input.accountId !== undefined) {
-      if (providerSessions.length > 0) {
-        throw new RelayError(
-          'provider_mismatch',
-          `${input.provider} follow-ups must remain with their original account.`,
-        );
-      }
+      throw new RelayError(
+        'provider_mismatch',
+        `${input.provider} follow-ups must remain with their original account.`,
+      );
     }
     if (session?.status === 'pending') {
       throw new RelayError(
@@ -348,6 +364,12 @@ export class RelayCore {
     const model = input.model ?? modelFromConfig(
       this.executionConfig(context.project.id, input.provider, account),
     );
+    await this.requireCapabilities(provider, {
+      operation: 'followup',
+      ...(account === undefined ? {} : { account }),
+      ...(model === undefined ? {} : { model }),
+      mode,
+    });
     let run = this.dependencies.store.createRun({
       id: runId,
       sessionId: session.id,
@@ -365,13 +387,17 @@ export class RelayCore {
       ...lineage,
     });
     let leaseHeld = false;
-    let providerAccepted = false;
+    const launchAttemptId = randomUUID();
+    let launchPrepared = false;
+    let launchCompleted = false;
     try {
       if (account !== undefined) {
-        this.dependencies.store.acquireAccountLease(account.id, run.id);
+        this.dependencies.store.acquireAccountLease(account.id, run.id, this.now());
         leaseHeld = true;
       }
       run = this.dependencies.store.transitionRun(run.id, 'running');
+      run = this.dependencies.store.prepareRunLaunch(run.id, launchAttemptId);
+      launchPrepared = true;
       const config = this.executionConfig(context.project.id, input.provider, account);
       const execution = await provider.send({
         providerSessionId: session.providerSessionId,
@@ -381,7 +407,10 @@ export class RelayCore {
         ...(account === undefined ? {} : { profilePath: account.profilePath }),
         ...(model === undefined ? {} : { model }),
       });
-      providerAccepted = true;
+      run = this.dependencies.store.markRunLaunchAccepted(
+        run.id,
+        launchAttemptId,
+      );
       this.dependencies.store.upsertSession({
         workItemId: context.workItem.id,
         provider: input.provider,
@@ -393,6 +422,8 @@ export class RelayCore {
           : { branch: context.workItem.currentBranch }),
         ...(execution.url === undefined ? {} : { providerUrl: execution.url }),
       });
+      run = this.dependencies.store.completeRunLaunch(run.id, launchAttemptId);
+      launchCompleted = true;
       run = this.applyProviderStatus(run, execution);
       const reconciled = await this.reconcileRun(
         context,
@@ -400,7 +431,11 @@ export class RelayCore {
         expectedBranch,
       );
       run = reconciled.run;
-      if (!ACTIVE_RUN_STATUSES.has(run.status) && leaseHeld && account !== undefined) {
+      if (
+        !CAPACITY_HOLDING_RUN_STATUSES.has(run.status) &&
+        leaseHeld &&
+        account !== undefined
+      ) {
         this.dependencies.store.releaseAccountLease(account.id, run.id);
         leaseHeld = false;
       }
@@ -413,13 +448,27 @@ export class RelayCore {
         reconciled.artifact,
       );
     } catch (error) {
-      if (!providerAccepted) {
+      if (launchPrepared && !launchCompleted) {
+        run = this.dependencies.store.markRunLaunchUncertain(
+          run.id,
+          launchAttemptId,
+        );
+        throw this.launchUncertainError(run, error);
+      }
+      if (!launchPrepared) {
         run = this.failRunIfActive(run);
       } else {
         run = this.dependencies.store.getRun(run.id);
       }
-      if (leaseHeld && !ACTIVE_RUN_STATUSES.has(run.status) && account !== undefined) {
+      if (
+        leaseHeld &&
+        !CAPACITY_HOLDING_RUN_STATUSES.has(run.status) &&
+        account !== undefined
+      ) {
         this.dependencies.store.releaseAccountLease(account.id, run.id);
+      }
+      if (run.status === 'launch_uncertain') {
+        throw this.launchUncertainError(run, error);
       }
       throw error;
     }
@@ -477,58 +526,122 @@ export class RelayCore {
   ): Promise<ArtifactRecord | undefined> {
     const context = await this.resolveWorkItem(input);
     const status = this.dependencies.store.getStatus(context.workItem.id);
-    const latestArtifactIsIntegration =
-      status.artifact?.branch === context.workItem.currentBranch &&
-      context.workItem.pullRequest !== undefined;
-    const run = latestArtifactIsIntegration
-      ? undefined
-      : [...status.runs]
-          .reverse()
-          .find((candidate) =>
-            [
-              'provider_complete',
-              'awaiting_publish',
-              'published',
-              'verified',
-            ].includes(candidate.status),
-          );
-    const branch =
-      run?.expectedBranch ??
-      context.workItem.currentBranch ??
-      context.workItem.baseBranch;
-    if (run === undefined) {
+    let newestResultArtifact: ArtifactRecord | undefined;
+    let unresolvedResultError: unknown;
+    for (const run of status.runs.filter(
+      (candidate) =>
+        candidate.mutationMode === 'write' &&
+        ['provider_complete', 'awaiting_publish', 'published'].includes(
+          candidate.status,
+        ),
+    )) {
+      try {
+        const reconciled = await this.reconcileRun(
+          context,
+          run,
+          run.expectedBranch ?? context.workItem.baseBranch,
+        );
+        if (reconciled.artifact !== undefined) {
+          newestResultArtifact = reconciled.artifact;
+        }
+      } catch (error) {
+        unresolvedResultError ??= error;
+      }
+    }
+
+    const currentWorkItem = this.dependencies.store.getWorkItem(
+      context.workItem.id,
+    );
+    if (
+      currentWorkItem.currentBranch !== undefined &&
+      currentWorkItem.pullRequest !== undefined
+    ) {
       const observed = await this.dependencies.github.reconcile({
         repo: context.project.repo,
-        branch,
-        expectedBaseBranch: context.workItem.baseBranch,
-        ...(context.workItem.pullRequest === undefined
-          ? {}
-          : { pullRequest: context.workItem.pullRequest }),
+        branch: currentWorkItem.currentBranch,
+        expectedBaseBranch: currentWorkItem.baseBranch,
+        pullRequest: currentWorkItem.pullRequest,
       });
-      return this.persistArtifact(context.workItem.id, observed);
+      return this.persistArtifact(currentWorkItem.id, observed);
     }
-    return (await this.reconcileRun(context, run, branch)).artifact;
+    if (newestResultArtifact !== undefined) return newestResultArtifact;
+    const newestVerifiedResult = [...status.runs]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.mutationMode === 'write' &&
+          candidate.status === 'verified' &&
+          isResultBranch(candidate.expectedBranch),
+      );
+    if (newestVerifiedResult !== undefined) {
+      return (
+        await this.reconcileRun(
+          context,
+          newestVerifiedResult,
+          newestVerifiedResult.expectedBranch!,
+        )
+      ).artifact;
+    }
+
+    const unresolvedRead = [...status.runs]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.mutationMode === 'read' &&
+          ['provider_complete', 'awaiting_publish', 'published'].includes(
+            candidate.status,
+          ),
+      );
+    if (unresolvedRead !== undefined) {
+      return (
+        await this.reconcileRun(
+          context,
+          unresolvedRead,
+          unresolvedRead.expectedBranch ?? currentWorkItem.baseBranch,
+        )
+      ).artifact;
+    }
+
+    const observed = await this.dependencies.github.reconcile({
+      repo: context.project.repo,
+      branch: currentWorkItem.currentBranch ?? currentWorkItem.baseBranch,
+      expectedBaseBranch: currentWorkItem.baseBranch,
+    });
+    const artifact = this.persistArtifact(currentWorkItem.id, observed);
+    if (artifact !== undefined) return artifact;
+    if (unresolvedResultError !== undefined) throw unresolvedResultError;
+    return undefined;
   }
 
   async status(input: WorkItemSelector): Promise<RelayStatus> {
     const context = await this.resolveWorkItem(input);
     const before = this.dependencies.store.getStatus(context.workItem.id);
     const activeSessions = before.sessions.filter((session) => session.status === 'active');
+    let inspectionError: unknown;
 
     for (const session of activeSessions) {
       const provider = this.provider(session.provider);
       if (provider.inspect === undefined) continue;
-      const run = [...before.runs]
-        .reverse()
-        .find(
-          (candidate) =>
-            candidate.sessionId === session.id && ACTIVE_RUN_STATUSES.has(candidate.status),
-        );
+      const runs = before.runs.filter(
+        (candidate) =>
+          candidate.sessionId === session.id && candidate.status === 'running',
+      );
+      const run = runs.at(-1);
       if (run === undefined) continue;
       const account = session.accountId === undefined
         ? undefined
         : this.resolveAccount(session.provider, session.accountId);
       const config = this.executionConfig(context.project.id, session.provider, account);
+      if (account !== undefined) {
+        const now = this.now();
+        for (const activeRun of runs) {
+          this.dependencies.store.heartbeatAccountLease(
+            account.id,
+            activeRun.id,
+            now,
+          );
+        }
+      }
       const inspection = await provider.inspect({
         providerSessionId: session.providerSessionId,
         ...optionalString(config, 'environmentId'),
@@ -553,8 +666,11 @@ export class RelayCore {
             : { providerUrl: session.providerUrl }
           : { providerUrl: inspection.url }),
       });
-      const updated = this.applyProviderStatus(run, execution);
-      if (!ACTIVE_RUN_STATUSES.has(updated.status)) {
+      const updatedRuns = runs.map((activeRun) =>
+        this.applyProviderStatus(activeRun, execution),
+      );
+      for (const updated of updatedRuns) {
+        if (ACTIVE_RUN_STATUSES.has(updated.status)) continue;
         try {
           await this.reconcileRun(
             context,
@@ -563,6 +679,8 @@ export class RelayCore {
               context.workItem.currentBranch ??
               context.workItem.baseBranch,
           );
+        } catch (error) {
+          inspectionError ??= error;
         } finally {
           if (account !== undefined) {
             this.dependencies.store.releaseAccountLease(account.id, updated.id);
@@ -570,6 +688,8 @@ export class RelayCore {
         }
       }
     }
+
+    if (inspectionError !== undefined) throw inspectionError;
 
     const artifact = await this.reconcile({
       workItemId: context.workItem.id,
@@ -605,13 +725,27 @@ export class RelayCore {
     >;
   }
 
+  async resolveLaunch(input: ResolveLaunchRequest): Promise<RunRecord> {
+    if (!input.confirmed) {
+      throw new RelayError(
+        'invalid_argument',
+        'Uncertain-launch resolution requires explicit operator confirmation.',
+      );
+    }
+    return this.dependencies.store.resolveUncertainLaunch(input.runId);
+  }
+
   async chat(
     providerName: ProviderName,
-    input: WorkItemSelector,
+    input: ChatInput,
   ): Promise<number> {
     const context = await this.resolveWorkItem(input);
-    const account = this.resolveAccount(providerName, undefined);
-    const session = this.dependencies.store.getSession(
+    const { account, session } = this.sessionRoute(
+      context.workItem.id,
+      providerName,
+      input.accountId,
+    );
+    this.assertNoUncertainLaunch(
       context.workItem.id,
       providerName,
       account?.id,
@@ -629,6 +763,10 @@ export class RelayCore {
         `${providerName} does not support interactive attachment.`,
       );
     }
+    await this.requireCapabilities(provider, {
+      operation: 'attach',
+      ...(account === undefined ? {} : { account }),
+    });
     return await provider.attach({
       providerSessionId: session.providerSessionId,
       cwd: context.project.locatorPath,
@@ -637,6 +775,18 @@ export class RelayCore {
   }
 
   async merge(input: MergeRequest): Promise<void> {
+    if (!Number.isSafeInteger(input.pullRequest) || input.pullRequest <= 0) {
+      throw new RelayError(
+        'invalid_argument',
+        'Merge approval must be bound to a positive pull-request number.',
+      );
+    }
+    if (!/^[0-9a-f]{40}$/i.test(input.expectedSha)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Merge approval must be bound to a full commit SHA.',
+      );
+    }
     const context = await this.resolveWorkItem(input);
     const artifact = await this.reconcile({
       workItemId: context.workItem.id,
@@ -647,10 +797,27 @@ export class RelayCore {
         `WorkItem ${context.workItem.id} has no pull request to merge.`,
       );
     }
+    if (artifact.pullRequest !== input.pullRequest) {
+      throw new RelayError(
+        'github_state_mismatch',
+        `The current pull request changed from #${input.pullRequest} to #${artifact.pullRequest} after approval.`,
+        {
+          expectedPullRequest: input.pullRequest,
+          observedPullRequest: artifact.pullRequest,
+        },
+      );
+    }
+    if (artifact.sha !== input.expectedSha) {
+      throw new RelayError(
+        'head_moved',
+        `Pull request #${input.pullRequest} moved after approval.`,
+        { expectedSha: input.expectedSha, observedSha: artifact.sha },
+      );
+    }
     await this.dependencies.github.merge({
       repo: context.project.repo,
-      pullRequest: artifact.pullRequest,
-      expectedSha: artifact.sha,
+      pullRequest: input.pullRequest,
+      expectedSha: input.expectedSha,
       expectedBaseBranch: context.workItem.baseBranch,
       strategy: input.strategy,
       approved: input.approved,
@@ -727,6 +894,17 @@ export class RelayCore {
     const account = this.resolveAccount(input.provider, input.accountId);
     const config = this.executionConfig(input.project.id, input.provider, account);
     const model = input.model ?? modelFromConfig(config);
+    await this.requireCapabilities(provider, {
+      operation: 'start',
+      ...(account === undefined ? {} : { account }),
+      ...(model === undefined ? {} : { model }),
+      mode: input.mode,
+    });
+    this.assertNoUncertainLaunch(
+      input.workItem.id,
+      input.provider,
+      account?.id,
+    );
     const lineage = this.lineage(input.parentRunId, input.provider);
     const baseSha =
       (await this.dependencies.github.getBranchSha(
@@ -803,17 +981,23 @@ export class RelayCore {
     }
     let leaseHeld = false;
     let providerExecution: ProviderExecution | undefined;
+    const launchAttemptId = randomUUID();
+    let launchPrepared = false;
+    let launchCompleted = false;
     try {
       if (account !== undefined) {
-        this.dependencies.store.acquireAccountLease(account.id, run.id);
+        this.dependencies.store.acquireAccountLease(account.id, run.id, this.now());
         leaseHeld = true;
       }
       run = this.dependencies.store.transitionRun(run.id, 'running');
+      run = this.dependencies.store.prepareRunLaunch(run.id, launchAttemptId);
+      launchPrepared = true;
       const execution = await provider.start({
         prompt: executionPrompt,
         cwd: input.project.locatorPath,
         mode: input.mode,
-        branch: expectedBranch,
+        startingBranch: input.startBranch,
+        ...(input.mode === 'write' ? { resultBranch: expectedBranch } : {}),
         repo: input.project.repo,
         title: input.workItem.title,
         ...optionalString(config, 'environmentId'),
@@ -822,6 +1006,10 @@ export class RelayCore {
         ...(model === undefined ? {} : { model }),
       });
       providerExecution = execution;
+      run = this.dependencies.store.markRunLaunchAccepted(
+        run.id,
+        launchAttemptId,
+      );
       const session = this.dependencies.store.activateSession(
         pendingSession.id,
         {
@@ -831,6 +1019,8 @@ export class RelayCore {
           ...(execution.url === undefined ? {} : { providerUrl: execution.url }),
         },
       );
+      run = this.dependencies.store.completeRunLaunch(run.id, launchAttemptId);
+      launchCompleted = true;
       run = this.applyProviderStatus(run, execution);
       const reconciled = await this.reconcileRun(
         { project: input.project, workItem: input.workItem },
@@ -838,7 +1028,11 @@ export class RelayCore {
         expectedBranch,
       );
       run = reconciled.run;
-      if (!ACTIVE_RUN_STATUSES.has(run.status) && leaseHeld && account !== undefined) {
+      if (
+        !CAPACITY_HOLDING_RUN_STATUSES.has(run.status) &&
+        leaseHeld &&
+        account !== undefined
+      ) {
         this.dependencies.store.releaseAccountLease(account.id, run.id);
         leaseHeld = false;
       }
@@ -851,14 +1045,21 @@ export class RelayCore {
         reconciled.artifact,
       );
     } catch (error) {
-      if (providerExecution === undefined) {
+      if (launchPrepared && !launchCompleted) {
+        run = this.dependencies.store.markRunLaunchUncertain(
+          run.id,
+          launchAttemptId,
+        );
+        throw this.launchUncertainError(run, error);
+      }
+      if (!launchPrepared) {
         run = this.failRunIfActive(run);
         this.dependencies.store.activateSession(pendingSession.id, {
           providerSessionId: pendingSession.providerSessionId,
           status: 'failed',
           branch: expectedBranch,
         });
-      } else {
+      } else if (providerExecution !== undefined) {
         run = this.dependencies.store.getRun(run.id);
         this.dependencies.store.activateSession(pendingSession.id, {
           providerSessionId: providerExecution.providerSessionId,
@@ -869,8 +1070,15 @@ export class RelayCore {
             : { providerUrl: providerExecution.url }),
         });
       }
-      if (leaseHeld && !ACTIVE_RUN_STATUSES.has(run.status) && account !== undefined) {
+      if (
+        leaseHeld &&
+        !CAPACITY_HOLDING_RUN_STATUSES.has(run.status) &&
+        account !== undefined
+      ) {
         this.dependencies.store.releaseAccountLease(account.id, run.id);
+      }
+      if (run.status === 'launch_uncertain') {
+        throw this.launchUncertainError(run, error);
       }
       throw error;
     }
@@ -1063,6 +1271,126 @@ export class RelayCore {
       ...providerConfig,
       ...(this.dependencies.store.getProviderAccountConfig(projectId, account.id) ?? {}),
     };
+  }
+
+  private sessionRoute(
+    workItemId: string,
+    provider: ProviderName,
+    accountId: string | undefined,
+  ): {
+    account: ProviderAccountRecord | undefined;
+    session: SessionRecord | undefined;
+    existingScopes: number;
+  } {
+    const providerSessions = this.dependencies.store
+      .listSessions(workItemId)
+      .filter(
+        (candidate) =>
+          candidate.provider === provider && candidate.status !== 'complete',
+      );
+    const usableSessions = providerSessions.filter((candidate) =>
+      candidate.status === 'active' || candidate.status === 'pending'
+    );
+    const routeSessions = usableSessions.length > 0
+      ? usableSessions
+      : providerSessions;
+    const routeScopes = [
+      ...new Set(routeSessions.map((candidate) => candidate.accountId ?? null)),
+    ];
+    if (accountId === undefined && routeScopes.length > 1) {
+      throw new RelayError(
+        'invalid_argument',
+        `Multiple ${provider} account sessions exist for this WorkItem; select one with --account.`,
+      );
+    }
+    const account = accountId !== undefined
+      ? this.resolveAccount(provider, accountId)
+      : routeScopes.length === 1
+        ? routeScopes[0] === null
+          ? undefined
+          : this.resolveAccount(provider, routeScopes[0])
+        : this.resolveAccount(provider, undefined);
+    const stored = this.dependencies.store.getSession(
+      workItemId,
+      provider,
+      account?.id,
+    );
+    return {
+      account,
+      session: stored?.status === 'complete' ? undefined : stored,
+      existingScopes: new Set(
+        providerSessions.map((candidate) => candidate.accountId ?? null),
+      ).size,
+    };
+  }
+
+  private async requireCapabilities(
+    provider: CloudProvider,
+    requirements: {
+      operation: 'start' | 'followup' | 'attach';
+      account?: ProviderAccountRecord;
+      model?: string;
+      mode?: MutationMode;
+    },
+  ): Promise<void> {
+    const capabilities = await provider.capabilities();
+    const unavailable = (message: string): never => {
+      throw new RelayError('capability_unavailable', message);
+    };
+    if (requirements.operation === 'start' && !capabilities.start) {
+      unavailable(`${provider.name} does not support cloud starts.`);
+    }
+    if (requirements.operation === 'followup' && !capabilities.queueFollowup) {
+      unavailable(`${provider.name} does not support programmatic follow-up.`);
+    }
+    if (requirements.operation === 'attach' && !capabilities.interactiveAttach) {
+      unavailable(`${provider.name} does not support interactive attachment.`);
+    }
+    if (requirements.account !== undefined && !capabilities.profileIsolation) {
+      unavailable(`${provider.name} cannot isolate a selected account profile.`);
+    }
+    if (requirements.model !== undefined && !capabilities.selectModel) {
+      unavailable(`${provider.name} does not support explicit model selection.`);
+    }
+    if (requirements.mode === 'write' && !capabilities.controlledResultBranch) {
+      unavailable(
+        `${provider.name} cannot publish to a Relay-controlled result branch.`,
+      );
+    }
+  }
+
+  private assertNoUncertainLaunch(
+    workItemId: string,
+    provider: ProviderName,
+    accountId: string | undefined,
+  ): void {
+    const uncertain = this.dependencies.store
+      .getStatus(workItemId)
+      .runs.find(
+        (run) =>
+          run.provider === provider &&
+          run.status === 'launch_uncertain' &&
+          run.accountId === accountId,
+      );
+    if (uncertain !== undefined) {
+      throw new RelayError(
+        'launch_uncertain',
+        `Run ${uncertain.id} may have been accepted remotely; inspect the provider and resolve it explicitly before retrying.`,
+        { runId: uncertain.id, launchAttemptId: uncertain.launchAttemptId },
+      );
+    }
+  }
+
+  private launchUncertainError(run: RunRecord, cause: unknown): RelayError {
+    return new RelayError(
+      'launch_uncertain',
+      `Run ${run.id} may have been accepted remotely; inspect the provider and resolve it explicitly before retrying.`,
+      {
+        runId: run.id,
+        launchAttemptId: run.launchAttemptId,
+      },
+      { cause },
+    );
   }
 }
 

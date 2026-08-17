@@ -57,7 +57,7 @@ test('submits a cloud task to the configured environment and branch', async () =
   const result = await provider.start({
     prompt: 'Review auth',
     cwd,
-    branch: 'relay/auth',
+    startingBranch: 'relay/auth',
     environmentId: 'env_123',
     mode: 'read',
   });
@@ -85,7 +85,7 @@ test('runs Codex with the selected account home and requested cloud model', asyn
     prompt: 'Build it',
     cwd,
     mode: 'write',
-    branch: 'main',
+    resultBranch: 'relay/run/work-1/run-1',
     environmentId: 'env-1',
     profilePath: '/profiles/codex-a',
     model: 'gpt-5.6-sol',
@@ -99,7 +99,7 @@ test('runs Codex with the selected account home and requested cloud model', asyn
     '-c',
     'model="gpt-5.6-sol"',
     '--branch',
-    'main',
+    'relay/run/work-1/run-1',
     'Build it',
   ]);
   assert.equal(readEnvironments()[0]?.CODEX_HOME, '/profiles/codex-a');
@@ -168,6 +168,35 @@ test('rejects submission output without a task identifier', async () => {
       cwd,
       environmentId: 'env_123',
       mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_output_invalid',
+  );
+});
+
+test('rejects Codex submission URLs outside the documented task route', async () => {
+  for (const scenario of ['invalid-url-host', 'invalid-url-path', 'invalid-url-id']) {
+    const { provider, cwd } = codexForScenario(scenario);
+    await assert.rejects(
+      provider.start({
+        prompt: 'Review',
+        cwd,
+        environmentId: 'env_123',
+        mode: 'read',
+      }),
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'provider_output_invalid',
+    );
+  }
+});
+
+test('rejects a listed Codex task whose URL disagrees with its task ID', async () => {
+  const { provider } = codexForScenario('invalid-list-url');
+
+  await assert.rejects(
+    provider.inspect!({
+      providerSessionId: 'task_456',
+      environmentId: 'env_123',
     }),
     (error: unknown) =>
       error instanceof RelayError && error.code === 'provider_output_invalid',

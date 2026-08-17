@@ -16,6 +16,7 @@ const statusFixture = {
     projectId: 'project_1',
     title: 'Authentication',
     baseBranch: 'main',
+    integrationBranch: 'relay/auth',
     currentBranch: 'relay/auth',
     currentSha: sha,
     pullRequest: 143,
@@ -48,6 +49,8 @@ interface CoreCalls {
   addAccount: unknown[];
   recordUsage: unknown[];
   land: unknown[];
+  chat: unknown[];
+  resolveLaunch: unknown[];
 }
 
 function fakeCore(overrides: Partial<RelayApi> = {}): {
@@ -62,6 +65,8 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
     addAccount: [],
     recordUsage: [],
     land: [],
+    chat: [],
+    resolveLaunch: [],
   };
   const core = {
     doctor: async () => ({
@@ -154,7 +159,14 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
     sessions: async () => [],
     providers: async () => ({}),
     reconcile: async () => statusFixture.artifact,
-    chat: async () => 0,
+    resolveLaunch: async (input: unknown) => {
+      calls.resolveLaunch.push(input);
+      return { id: 'run_uncertain', status: 'cancelled' } as never;
+    },
+    chat: async (...input: unknown[]) => {
+      calls.chat.push(input);
+      return 0;
+    },
     merge: async (input: unknown) => {
       calls.merge.push(input);
     },
@@ -199,6 +211,42 @@ test('prints machine-readable status', async () => {
   assert.deepEqual(JSON.parse(io.stdout), statusFixture);
 });
 
+test('surfaces quarantined launch state in human-readable status', async () => {
+  const { core } = fakeCore({
+    status: async () => ({
+      ...statusFixture,
+      project: {
+        id: 'project_1',
+        repo: 'acme/web',
+        defaultBranch: 'main',
+        locatorPath: '/workspace/acme-web',
+        createdAt: '2026-08-16T00:00:00.000Z',
+        updatedAt: '2026-08-16T00:00:00.000Z',
+      },
+      runs: [
+        {
+          id: 'run_uncertain',
+          sessionId: 'session_pending',
+          workItemId: 'work_1',
+          provider: 'claude',
+          type: 'delegation',
+          mutationMode: 'read',
+          status: 'launch_uncertain',
+          correlationId: 'run_uncertain',
+          delegationDepth: 0,
+          startedAt: '2026-08-16T00:00:00.000Z',
+        },
+      ],
+    }),
+  });
+  const io = memoryIo();
+
+  await createCli(core, io).parseAsync(['node', 'relay', 'status']);
+
+  assert.match(io.stdout, /run_uncertain\s+launch_uncertain/);
+  assert.match(io.stdout, /explicit operator resolution required/);
+});
+
 test('doctor reports each dependency independently', async () => {
   const { core } = fakeCore();
   const io = memoryIo();
@@ -209,6 +257,14 @@ test('doctor reports each dependency independently', async () => {
   assert.match(io.stdout, /Claude\s+✗/);
   assert.match(io.stdout, /Codex\s+✓/);
   assert.match(io.stdout, /Jules\s+✗/);
+  assert.match(
+    io.stdout,
+    /Provider identities are trusted GitHub writers; Relay prompts do not enforce branch authorization\./,
+  );
+  assert.match(
+    createCli(core, io).helpInformation(),
+    /provider GitHub-writer trust boundary/,
+  );
 });
 
 test('merge defaults to refusal when confirmation is not yes', async () => {
@@ -229,6 +285,30 @@ test('merge defaults to refusal when confirmation is not yes', async () => {
   assert.match(io.stdout, /Merge cancelled/);
 });
 
+test('resolves launch quarantine only after explicit operator confirmation', async () => {
+  const { core, calls } = fakeCore();
+  const refusedIo = memoryIo({ answers: ['no'] });
+  await createCli(core, refusedIo).parseAsync([
+    'node',
+    'relay',
+    'resolve-launch',
+    'run_uncertain',
+  ]);
+  assert.deepEqual(calls.resolveLaunch, []);
+
+  const approvedIo = memoryIo({ answers: ['yes'] });
+  await createCli(core, approvedIo).parseAsync([
+    'node',
+    'relay',
+    'resolve-launch',
+    'run_uncertain',
+  ]);
+  assert.deepEqual(calls.resolveLaunch, [
+    { runId: 'run_uncertain', confirmed: true },
+  ]);
+  assert.match(approvedIo.stdout, /resolved as cancelled/);
+});
+
 test('merge binds an affirmative confirmation to core approval', async () => {
   const { core, calls } = fakeCore();
   const io = memoryIo({ answers: ['yes'] });
@@ -246,6 +326,8 @@ test('merge binds an affirmative confirmation to core approval', async () => {
       cwd: '/workspace/acme-web',
       strategy: 'rebase',
       approved: true,
+      pullRequest: 143,
+      expectedSha: sha,
     },
   ]);
 });
@@ -272,6 +354,64 @@ test('initializes only non-secret provider references', async () => {
         jules: { source: 'sources/github-acme-web' },
       },
     },
+  ]);
+});
+
+test('forwards account and model selection for send', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+
+  await createCli(core, io).parseAsync([
+    'node',
+    'relay',
+    'send',
+    'claude',
+    'Continue',
+    '--work-item',
+    'work_1',
+    '--account',
+    'claude-a',
+    '--model',
+    'opus',
+  ]);
+
+  assert.deepEqual(calls.send, [
+    {
+      provider: 'claude',
+      message: 'Continue',
+      mode: 'read',
+      workItemId: 'work_1',
+      cwd: '/workspace/acme-web',
+      accountId: 'claude-a',
+      model: 'opus',
+    },
+  ]);
+});
+
+test('forwards account selection for chat', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+
+  await createCli(core, io).parseAsync([
+    'node',
+    'relay',
+    'chat',
+    'claude',
+    '--work-item',
+    'work_1',
+    '--account',
+    'claude-a',
+  ]);
+
+  assert.deepEqual(calls.chat, [
+    [
+      'claude',
+      {
+        workItemId: 'work_1',
+        cwd: '/workspace/acme-web',
+        accountId: 'claude-a',
+      },
+    ],
   ]);
 });
 
@@ -332,6 +472,27 @@ test('manages account and caller-supplied weekly usage without listing profile p
   ]);
   assert.equal(io.stdout.includes('/profiles/codex-a'), false);
   assert.match(io.stdout, /"accountId": "codex-a"/);
+});
+
+test('rejects blank remaining usage percentages before recording a snapshot', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+
+  await assert.rejects(
+    createCli(core, io).parseAsync([
+      'node',
+      'relay',
+      'usage',
+      'set',
+      'codex-a',
+      '--model',
+      'gpt-5.6-sol',
+      '--remaining-percent',
+      ' \t ',
+    ]),
+    /--remaining-percent must be a finite number from 0 through 100/,
+  );
+  assert.deepEqual(calls.recordUsage, []);
 });
 
 test('forwards explicit account and model selection when delegating', async () => {
@@ -416,4 +577,22 @@ test('REPL handoff keeps the selected provider explicit', async () => {
   const io = memoryIo({ lines: ['/handoff jules Add edge cases', '/quit'] });
 
   await runRepl(core, io);
+});
+
+test('REPL merge binds approval to the pull request and SHA it displayed', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo({ lines: ['/merge squash', 'yes', '/quit'] });
+
+  await runRepl(core, io);
+
+  assert.deepEqual(calls.merge, [
+    {
+      workItemId: 'current',
+      cwd: '/workspace/acme-web',
+      strategy: 'squash',
+      approved: true,
+      pullRequest: 143,
+      expectedSha: sha,
+    },
+  ]);
 });

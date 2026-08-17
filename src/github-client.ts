@@ -59,6 +59,19 @@ const commitChecksSchema = z.object({
   ),
 });
 
+const commitStatusSchema = z.object({
+  state: z.string(),
+  sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  total_count: z.number().int().nonnegative(),
+  statuses: z.array(
+    z.object({
+      context: z.string().min(1),
+      state: z.string(),
+      target_url: z.url().nullable().optional(),
+    }),
+  ),
+});
+
 const createdPullRequestSchema = z.object({
   number: z.number().int().positive(),
   html_url: z.url(),
@@ -352,22 +365,34 @@ export class GitHubClient {
         'Commit checks require a full 40-character SHA.',
       );
     }
-    const pages = await this.runJson(
-      [
-        'api',
-        '--paginate',
-        '--slurp',
-        `repos/${repo}/commits/${sha}/check-runs`,
-      ],
-      z.array(commitChecksSchema),
-    );
+    const [pages, legacyPages] = await Promise.all([
+      this.runJson(
+        [
+          'api',
+          '--paginate',
+          '--slurp',
+          `repos/${repo}/commits/${sha}/check-runs`,
+        ],
+        z.array(commitChecksSchema),
+      ),
+      this.runJson(
+        [
+          'api',
+          `repos/${repo}/commits/${sha}/status`,
+          '--paginate',
+          '--slurp',
+        ],
+        z.array(commitStatusSchema),
+      ),
+    ]);
     const checkRuns = pages.flatMap((page) => page.check_runs);
     const reportedCount = pages.reduce(
       (count, page) => Math.max(count, page.total_count),
       0,
     );
+    let checkRunSummary: CheckSummary = 'passing';
     if (reportedCount === 0 || checkRuns.length < reportedCount) {
-      return 'unknown';
+      checkRunSummary = 'unknown';
     }
     const successful = new Set(['success', 'neutral', 'skipped']);
     if (
@@ -378,12 +403,12 @@ export class GitHubClient {
             !successful.has(check.conclusion.toLowerCase())),
       )
     ) {
-      return 'failing';
+      checkRunSummary = 'failing';
+    } else if (checkRuns.some((check) => check.status !== 'completed')) {
+      checkRunSummary = 'pending';
     }
-    if (checkRuns.some((check) => check.status !== 'completed')) {
-      return 'pending';
-    }
-    return 'passing';
+    const legacySummary = summarizeLegacyStatuses(legacyPages, sha);
+    return combineCheckSummaries(checkRunSummary, legacySummary);
   }
 
   async ensurePullRequest(
@@ -549,6 +574,52 @@ export class GitHubClient {
     }
     return options;
   }
+}
+
+function summarizeLegacyStatuses(
+  pages: readonly z.infer<typeof commitStatusSchema>[],
+  expectedSha: string,
+): CheckSummary {
+  if (
+    pages.length === 0 ||
+    pages.some((page) => page.sha.toLowerCase() !== expectedSha.toLowerCase())
+  ) {
+    return 'unknown';
+  }
+  const statuses = pages.flatMap((page) => page.statuses);
+  const reportedCount = pages.reduce(
+    (count, page) => Math.max(count, page.total_count),
+    0,
+  );
+  if (reportedCount === 0 || statuses.length < reportedCount) return 'unknown';
+  const combinedStates = pages.map((page) => page.state.toLowerCase());
+  const states = statuses.map((entry) => entry.state.toLowerCase());
+  if (
+    combinedStates.some((state) => state === 'failure' || state === 'error') ||
+    states.some((state) => state === 'failure' || state === 'error')
+  ) {
+    return 'failing';
+  }
+  if (
+    combinedStates.some((state) => state === 'pending') ||
+    states.some((state) => state === 'pending')
+  ) {
+    return 'pending';
+  }
+  return combinedStates.every((state) => state === 'success') &&
+    states.every((state) => state === 'success')
+    ? 'passing'
+    : 'unknown';
+}
+
+function combineCheckSummaries(
+  checkRuns: CheckSummary,
+  legacyStatuses: CheckSummary,
+): CheckSummary {
+  if (checkRuns === 'failing' || legacyStatuses === 'failing') return 'failing';
+  if (checkRuns === 'pending' || legacyStatuses === 'pending') return 'pending';
+  if (checkRuns === 'unknown' || legacyStatuses === 'unknown') return 'unknown';
+  return 'passing';
 }
 
 function isNotFound(error: unknown): boolean {

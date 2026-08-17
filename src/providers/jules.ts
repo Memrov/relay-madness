@@ -92,6 +92,7 @@ export class JulesProvider implements CloudProvider {
       structuredStatus: true,
       events: true,
       selectBranch: true,
+      controlledResultBranch: false,
       publishPullRequest: true,
       cancel: false,
       subscriptionAuth: false,
@@ -110,13 +111,19 @@ export class JulesProvider implements CloudProvider {
   }
 
   async start(input: StartRunInput): Promise<ProviderExecution> {
+    if (input.mode === 'write') {
+      throw new RelayError(
+        'capability_unavailable',
+        'Jules cannot publish to a Relay-controlled result branch.',
+      );
+    }
     const body: Record<string, unknown> = {
       prompt: input.prompt,
       requirePlanApproval: false,
     };
     if (input.title !== undefined) body.title = input.title;
     if (input.source !== undefined) {
-      if (input.branch === undefined) {
+      if (input.startingBranch === undefined) {
         throw new RelayError(
           'invalid_argument',
           'A Jules source session requires a starting branch.',
@@ -124,10 +131,9 @@ export class JulesProvider implements CloudProvider {
       }
       body.sourceContext = {
         source: input.source,
-        githubRepoContext: { startingBranch: input.branch },
+        githubRepoContext: { startingBranch: input.startingBranch },
       };
     }
-    if (input.mode === 'write') body.automationMode = 'AUTO_CREATE_PR';
 
     const session = await this.request('sessions', sessionSchema, {
       method: 'POST',

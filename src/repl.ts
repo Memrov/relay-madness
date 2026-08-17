@@ -126,7 +126,13 @@ async function mergeInteractively(
     io.write('Merge cancelled.\n');
     return;
   }
-  await core.merge({ ...selected, strategy, approved: true });
+  await core.merge({
+    ...selected,
+    strategy,
+    approved: true,
+    pullRequest: artifact.pullRequest,
+    expectedSha: artifact.sha,
+  });
   io.write(`Merged PR #${artifact.pullRequest}.\n`);
 }
 
