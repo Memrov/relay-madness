@@ -25,6 +25,7 @@ export interface ProjectRecord extends ProjectInput {
 }
 
 export interface WorkItemInput {
+  id?: string;
   projectId: string;
   title: string;
   baseBranch: string;
@@ -233,7 +234,7 @@ export class StateStore {
 
   createWorkItem(input: WorkItemInput): WorkItemRecord {
     return this.database.transaction(() => {
-      const id = randomUUID();
+      const id = input.id ?? randomUUID();
       const now = new Date().toISOString();
       this.database
         .prepare(
@@ -269,6 +270,22 @@ export class StateStore {
     );
   }
 
+  getProject(id: string): ProjectRecord {
+    return this.projectFromRow(
+      this.requiredRow(
+        this.database.prepare('SELECT * FROM projects WHERE id = ?').get(id),
+        `Project ${id} was not found.`,
+      ),
+    );
+  }
+
+  getProjectByRepo(repo: string): ProjectRecord | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM projects WHERE repo = ?')
+      .get(repo) as SqlRow | undefined;
+    return row === undefined ? undefined : this.projectFromRow(row);
+  }
+
   getCurrentWorkItem(projectId: string): WorkItemRecord | undefined {
     const row = this.database
       .prepare(
@@ -283,36 +300,47 @@ export class StateStore {
 
   upsertSession(input: SessionInput): SessionRecord {
     const now = new Date().toISOString();
-    this.database
-      .prepare(
-        `INSERT INTO provider_sessions (
-          id, work_item_id, provider, provider_session_id, provider_url,
-          status, branch, last_activity_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(work_item_id, provider) DO UPDATE SET
-          provider_session_id = excluded.provider_session_id,
-          provider_url = excluded.provider_url,
-          status = excluded.status,
-          branch = excluded.branch,
-          last_activity_at = excluded.last_activity_at`,
-      )
-      .run(
-        randomUUID(),
-        input.workItemId,
-        input.provider,
-        input.providerSessionId,
-        input.providerUrl ?? null,
-        input.status,
-        input.branch ?? null,
-        now,
-      );
+    this.database.transaction(() => {
+      if (input.status === 'active') {
+        this.database
+          .prepare(
+            `UPDATE provider_sessions SET status = 'expired'
+             WHERE work_item_id = ? AND provider = ?
+               AND provider_session_id <> ? AND status = 'active'`,
+          )
+          .run(input.workItemId, input.provider, input.providerSessionId);
+      }
+      this.database
+        .prepare(
+          `INSERT INTO provider_sessions (
+            id, work_item_id, provider, provider_session_id, provider_url,
+            status, branch, last_activity_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(work_item_id, provider, provider_session_id) DO UPDATE SET
+            provider_url = excluded.provider_url,
+            status = excluded.status,
+            branch = excluded.branch,
+            last_activity_at = excluded.last_activity_at`,
+        )
+        .run(
+          randomUUID(),
+          input.workItemId,
+          input.provider,
+          input.providerSessionId,
+          input.providerUrl ?? null,
+          input.status,
+          input.branch ?? null,
+          now,
+        );
+    })();
     return this.sessionFromRow(
       this.requiredRow(
         this.database
           .prepare(
-            'SELECT * FROM provider_sessions WHERE work_item_id = ? AND provider = ?',
+            `SELECT * FROM provider_sessions
+             WHERE work_item_id = ? AND provider = ? AND provider_session_id = ?`,
           )
-          .get(input.workItemId, input.provider),
+          .get(input.workItemId, input.provider, input.providerSessionId),
         `Session for ${input.provider} was not persisted.`,
       ),
     );
@@ -324,10 +352,45 @@ export class StateStore {
   ): SessionRecord | undefined {
     const row = this.database
       .prepare(
-        'SELECT * FROM provider_sessions WHERE work_item_id = ? AND provider = ?',
+        `SELECT * FROM provider_sessions WHERE work_item_id = ? AND provider = ?
+         ORDER BY last_activity_at DESC, rowid DESC LIMIT 1`,
       )
       .get(workItemId, provider) as SqlRow | undefined;
     return row === undefined ? undefined : this.sessionFromRow(row);
+  }
+
+  activateSession(
+    id: string,
+    input: {
+      providerSessionId: string;
+      providerUrl?: string;
+      status: SessionRecord['status'];
+      branch?: string;
+    },
+  ): SessionRecord {
+    const now = new Date().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE provider_sessions SET provider_session_id = ?, provider_url = ?,
+           status = ?, branch = ?, last_activity_at = ? WHERE id = ?`,
+      )
+      .run(
+        input.providerSessionId,
+        input.providerUrl ?? null,
+        input.status,
+        input.branch ?? null,
+        now,
+        id,
+      );
+    if (result.changes !== 1) {
+      throw new RelayError('not_found', `Session ${id} was not found.`);
+    }
+    return this.sessionFromRow(
+      this.requiredRow(
+        this.database.prepare('SELECT * FROM provider_sessions WHERE id = ?').get(id),
+        `Session ${id} was not found after activation.`,
+      ),
+    );
   }
 
   listSessions(workItemId: string): readonly SessionRecord[] {
@@ -529,7 +592,7 @@ export class StateStore {
     return artifact === undefined ? status : { ...status, artifact };
   }
 
-  private getRun(id: string): RunRecord {
+  getRun(id: string): RunRecord {
     return this.runFromRow(
       this.requiredRow(
         this.database.prepare('SELECT * FROM provider_runs WHERE id = ?').get(id),
@@ -580,7 +643,7 @@ export class StateStore {
         status TEXT NOT NULL,
         branch TEXT,
         last_activity_at TEXT NOT NULL,
-        UNIQUE (work_item_id, provider)
+        UNIQUE (work_item_id, provider, provider_session_id)
       );
       CREATE TABLE IF NOT EXISTS provider_runs (
         id TEXT PRIMARY KEY,
