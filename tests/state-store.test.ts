@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -19,6 +19,126 @@ function databasePath(): string {
 
 function openStore(): StateStore {
   return StateStore.open(databasePath());
+}
+
+function createPopulatedV3Database(): string {
+  const path = databasePath();
+  mkdirSync(dirname(path), { recursive: true });
+  const database = new Database(path);
+  database.pragma('foreign_keys = ON');
+  database.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    );
+    INSERT INTO schema_migrations (version, applied_at) VALUES
+      (1, '2026-08-16T00:00:00.000Z'),
+      (2, '2026-08-16T00:01:00.000Z'),
+      (3, '2026-08-16T00:02:00.000Z');
+    CREATE TABLE projects (
+      id TEXT PRIMARY KEY,
+      repo TEXT NOT NULL UNIQUE,
+      default_branch TEXT NOT NULL,
+      locator_path TEXT NOT NULL,
+      current_work_item_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE work_items (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      base_branch TEXT NOT NULL,
+      current_branch TEXT,
+      current_sha TEXT,
+      pull_request INTEGER,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE provider_accounts (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      label TEXT NOT NULL,
+      profile_path TEXT NOT NULL,
+      status TEXT NOT NULL,
+      max_concurrency INTEGER NOT NULL,
+      is_default INTEGER NOT NULL,
+      last_used_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE provider_sessions (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL,
+      provider_session_id TEXT NOT NULL,
+      provider_url TEXT,
+      status TEXT NOT NULL,
+      branch TEXT,
+      last_activity_at TEXT NOT NULL,
+      UNIQUE (work_item_id, provider, provider_session_id)
+    );
+    CREATE TABLE provider_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES provider_sessions(id) ON DELETE CASCADE,
+      work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL,
+      type TEXT NOT NULL,
+      prompt TEXT,
+      status TEXT NOT NULL,
+      mutation_mode TEXT NOT NULL,
+      correlation_id TEXT NOT NULL,
+      origin_provider TEXT,
+      delegation_depth INTEGER NOT NULL,
+      parent_run_id TEXT REFERENCES provider_runs(id),
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      expected_branch TEXT,
+      baseline_sha TEXT,
+      pinned_sha TEXT
+    );
+    CREATE TABLE artifact_snapshots (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+      branch TEXT NOT NULL,
+      sha TEXT NOT NULL,
+      pull_request INTEGER,
+      checks TEXT NOT NULL,
+      mergeable INTEGER,
+      review_decision TEXT,
+      draft INTEGER,
+      observed_at TEXT NOT NULL,
+      verification_status TEXT NOT NULL DEFAULT 'published'
+    );
+  `);
+  database.prepare(
+    `INSERT INTO projects (
+      id, repo, default_branch, locator_path, current_work_item_id, created_at, updated_at
+    ) VALUES ('project-v3', 'acme/v3', 'main', '/tmp/v3', 'work-v3', '2026-08-16T00:00:00.000Z', '2026-08-16T00:00:00.000Z')`,
+  ).run();
+  database.prepare(
+    `INSERT INTO work_items (
+      id, project_id, title, base_branch, current_branch, status, created_at, updated_at
+    ) VALUES ('work-v3', 'project-v3', 'Legacy work', 'main', 'relay/legacy', 'in_progress', '2026-08-16T00:00:00.000Z', '2026-08-16T00:00:00.000Z')`,
+  ).run();
+  database.prepare(
+    `INSERT INTO provider_sessions (
+      id, work_item_id, provider, provider_session_id, status, branch, last_activity_at
+    ) VALUES ('session-v3', 'work-v3', 'claude', 'legacy-session', 'active', 'relay/legacy', '2026-08-16T00:00:00.000Z')`,
+  ).run();
+  database.prepare(
+    `INSERT INTO provider_runs (
+      id, session_id, work_item_id, provider, type, prompt, status, mutation_mode,
+      correlation_id, delegation_depth, expected_branch, baseline_sha, pinned_sha, started_at
+    ) VALUES (
+      'run-v3', 'session-v3', 'work-v3', 'claude', 'delegation', 'legacy prompt',
+      'running', 'read', 'correlation-v3', 0, 'relay/legacy', '${'a'.repeat(40)}',
+      '${'a'.repeat(40)}', '2026-08-16T00:00:00.000Z'
+    )`,
+  ).run();
+  database.close();
+  return path;
 }
 
 function storeWithAccount(
@@ -363,6 +483,22 @@ test('applies ordered schema migrations', () => {
   assert.ok(
     artifactColumns.some(({ name }) => name === 'verification_status'),
   );
+});
+
+test('migrates a populated version-three database without deleting legacy runs', () => {
+  const store = StateStore.open(createPopulatedV3Database());
+
+  const status = store.getStatus('work-v3');
+  assert.equal(store.getProject('project-v3').currentWorkItemId, 'work-v3');
+  assert.equal(status.sessions[0]?.id, 'session-v3');
+  assert.equal(status.sessions[0]?.accountId, undefined);
+  assert.equal(status.runs[0]?.id, 'run-v3');
+  assert.equal(status.runs[0]?.sessionId, 'session-v3');
+  assert.equal(status.runs[0]?.accountId, undefined);
+  assert.equal(status.runs[0]?.model, undefined);
+  assert.equal(status.runs[0]?.baseSha, undefined);
+  assert.equal(status.runs[0]?.resultSha, undefined);
+  store.close();
 });
 
 test('stores only a provider profile reference and selects one explicit default', () => {

@@ -1180,8 +1180,10 @@ export class StateStore {
       }).immediate();
     }
     if (!applied.has(4)) {
-      this.database.transaction(() => {
-        this.database.exec(`
+      this.database.pragma('foreign_keys = OFF');
+      try {
+        this.database.transaction(() => {
+          this.database.exec(`
           CREATE TABLE provider_sessions_scoped (
             id TEXT PRIMARY KEY,
             work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
@@ -1201,17 +1203,56 @@ export class StateStore {
           SELECT id, work_item_id, provider, provider_session_id, provider_url,
                  status, branch, last_activity_at
           FROM provider_sessions;
+          CREATE TABLE provider_runs_scoped (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES provider_sessions_scoped(id) ON DELETE CASCADE,
+            work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            type TEXT NOT NULL,
+            prompt TEXT,
+            status TEXT NOT NULL,
+            mutation_mode TEXT NOT NULL,
+            correlation_id TEXT NOT NULL,
+            origin_provider TEXT,
+            delegation_depth INTEGER NOT NULL,
+            parent_run_id TEXT REFERENCES provider_runs_scoped(id),
+            expected_branch TEXT,
+            baseline_sha TEXT,
+            pinned_sha TEXT,
+            account_id TEXT REFERENCES provider_accounts(id),
+            model TEXT,
+            base_sha TEXT,
+            result_sha TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT
+          );
+          INSERT INTO provider_runs_scoped (
+            id, session_id, work_item_id, provider, type, prompt, status,
+            mutation_mode, correlation_id, origin_provider, delegation_depth,
+            parent_run_id, expected_branch, baseline_sha, pinned_sha, started_at,
+            finished_at
+          )
+          SELECT id, session_id, work_item_id, provider, type, prompt, status,
+                 mutation_mode, correlation_id, origin_provider, delegation_depth,
+                 parent_run_id, expected_branch, baseline_sha, pinned_sha, started_at,
+                 finished_at
+          FROM provider_runs;
+          DROP TABLE provider_runs;
           DROP TABLE provider_sessions;
           ALTER TABLE provider_sessions_scoped RENAME TO provider_sessions;
-          ALTER TABLE provider_runs ADD COLUMN account_id TEXT REFERENCES provider_accounts(id);
-          ALTER TABLE provider_runs ADD COLUMN model TEXT;
-          ALTER TABLE provider_runs ADD COLUMN base_sha TEXT;
-          ALTER TABLE provider_runs ADD COLUMN result_sha TEXT;
+          ALTER TABLE provider_runs_scoped RENAME TO provider_runs;
           CREATE INDEX provider_sessions_account_scope
             ON provider_sessions(work_item_id, provider, account_id, last_activity_at);
         `);
-        this.recordMigration(4);
-      }).immediate();
+          this.recordMigration(4);
+        }).immediate();
+      } finally {
+        this.database.pragma('foreign_keys = ON');
+      }
+      const violations = this.database.pragma('foreign_key_check') as unknown[];
+      if (violations.length > 0) {
+        throw new Error('Migration 4 left foreign-key violations.');
+      }
     }
   }
 
