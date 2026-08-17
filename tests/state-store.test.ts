@@ -21,6 +21,29 @@ function openStore(): StateStore {
   return StateStore.open(databasePath());
 }
 
+function storeWithAccount(
+  id: string,
+  provider: 'claude' | 'codex' | 'jules',
+  options: Partial<{
+    label: string;
+    maxConcurrency: number;
+    status: 'ready' | 'disabled' | 'auth_required' | 'cooldown';
+    isDefault: boolean;
+  }> = {},
+): StateStore {
+  const store = openStore();
+  store.upsertProviderAccount({
+    id,
+    provider,
+    label: options.label ?? id,
+    profilePath: `/profiles/${id}`,
+    status: options.status ?? 'ready',
+    maxConcurrency: options.maxConcurrency ?? 1,
+    isDefault: options.isDefault ?? false,
+  });
+  return store;
+}
+
 function seed(store: StateStore) {
   const project = store.upsertProject({
     repo: 'acme/web',
@@ -330,12 +353,228 @@ test('applies ordered schema migrations', () => {
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2],
+    [1, 2, 3],
   );
   assert.ok(runColumns.some(({ name }) => name === 'baseline_sha'));
   assert.ok(
     artifactColumns.some(({ name }) => name === 'verification_status'),
   );
+});
+
+test('stores only a provider profile reference and selects one explicit default', () => {
+  const store = openStore();
+  store.upsertProviderAccount({
+    id: 'codex-a',
+    provider: 'codex',
+    label: 'Primary',
+    profilePath: '/profiles/codex-a',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: true,
+  });
+  store.upsertProviderAccount({
+    id: 'codex-b',
+    provider: 'codex',
+    label: 'Spare',
+    profilePath: '/profiles/codex-b',
+    status: 'ready',
+    maxConcurrency: 2,
+    isDefault: true,
+  });
+
+  const account = store.getProviderAccount('codex-a');
+  assert.equal(account?.profilePath, '/profiles/codex-a');
+  assert.equal(store.getDefaultProviderAccount('codex')?.id, 'codex-b');
+  assert.equal(
+    store.listProviderAccounts('codex').filter((item) => item.isDefault).length,
+    1,
+  );
+  store.close();
+});
+
+test('returns the latest weekly usage independently for each model bucket', () => {
+  const store = storeWithAccount('claude-a', 'claude');
+  store.recordUsageSnapshot({
+    accountId: 'claude-a',
+    period: 'weekly',
+    model: 'opus',
+    remainingPercent: 35,
+    resetsAt: '2026-08-20T00:00:00.000Z',
+    source: 'manual',
+    observedAt: '2026-08-16T10:00:00.000Z',
+  });
+  store.recordUsageSnapshot({
+    accountId: 'claude-a',
+    period: 'weekly',
+    model: 'sonnet',
+    remainingPercent: 80,
+    resetsAt: '2026-08-20T00:00:00.000Z',
+    source: 'provider',
+    observedAt: '2026-08-16T10:30:00.000Z',
+  });
+  store.recordUsageSnapshot({
+    accountId: 'claude-a',
+    period: 'weekly',
+    model: 'opus',
+    remainingPercent: 28,
+    resetsAt: '2026-08-20T00:00:00.000Z',
+    source: 'manual',
+    observedAt: '2026-08-16T11:00:00.000Z',
+  });
+
+  assert.deepEqual(
+    store
+      .listLatestUsage('claude-a')
+      .map(({ model, remainingPercent }) => ({ model, remainingPercent })),
+    [
+      { model: 'opus', remainingPercent: 28 },
+      { model: 'sonnet', remainingPercent: 80 },
+    ],
+  );
+  store.close();
+});
+
+test('accepts weekly usage boundaries and rejects invalid percentages or reset times', () => {
+  const store = storeWithAccount('claude-a', 'claude');
+  store.recordUsageSnapshot({
+    accountId: 'claude-a',
+    period: 'weekly',
+    model: 'opus',
+    remainingPercent: 0,
+    source: 'manual',
+    observedAt: '2026-08-16T10:00:00.000Z',
+  });
+  store.recordUsageSnapshot({
+    accountId: 'claude-a',
+    period: 'weekly',
+    model: 'sonnet',
+    remainingPercent: 100,
+    resetsAt: '2026-08-20T00:00:00.000Z',
+    source: 'manual',
+    observedAt: '2026-08-16T10:00:00.000Z',
+  });
+
+  for (const remainingPercent of [-1, 101]) {
+    assert.throws(
+      () =>
+        store.recordUsageSnapshot({
+          accountId: 'claude-a',
+          period: 'weekly',
+          model: 'haiku',
+          remainingPercent,
+          source: 'manual',
+          observedAt: '2026-08-16T10:00:00.000Z',
+        }),
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'invalid_argument',
+    );
+  }
+  assert.throws(
+    () =>
+      store.recordUsageSnapshot({
+        accountId: 'claude-a',
+        period: 'weekly',
+        model: 'haiku',
+        remainingPercent: 50,
+        resetsAt: 'not-an-iso-time',
+        source: 'manual',
+        observedAt: '2026-08-16T10:00:00.000Z',
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'invalid_argument',
+  );
+  store.close();
+});
+
+test('enforces account capacity transactionally and reclaims stale leases', () => {
+  const store = storeWithAccount('codex-a', 'codex', { maxConcurrency: 1 });
+  store.acquireAccountLease('codex-a', 'run-a', new Date('2026-08-16T10:00:00Z'));
+  assert.throws(
+    () => store.acquireAccountLease('codex-a', 'run-b', new Date('2026-08-16T10:00:01Z')),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'account_at_capacity',
+  );
+
+  const replacement = store.acquireAccountLease(
+    'codex-a',
+    'run-b',
+    new Date('2026-08-16T11:00:01Z'),
+  );
+  assert.equal(replacement.runId, 'run-b');
+  store.releaseAccountLease('codex-a', 'run-b');
+  store.close();
+});
+
+test('does not acquire leases from disabled or authentication-required accounts', () => {
+  for (const status of ['disabled', 'auth_required'] as const) {
+    const store = storeWithAccount(`codex-${status}`, 'codex', { status });
+    assert.throws(
+      () => store.acquireAccountLease(`codex-${status}`, 'run-a'),
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'account_unavailable',
+    );
+    store.close();
+  }
+});
+
+test('rejects changing an account to a different provider', () => {
+  const store = storeWithAccount('codex-a', 'codex');
+  assert.throws(
+    () =>
+      store.upsertProviderAccount({
+        id: 'codex-a',
+        provider: 'claude',
+        label: 'Wrong provider',
+        profilePath: '/profiles/codex-a',
+        status: 'ready',
+        maxConcurrency: 1,
+        isDefault: false,
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_mismatch',
+  );
+  store.close();
+});
+
+test('stores project configuration by account and rejects credentials', () => {
+  const store = openStore();
+  const { project } = seed(store);
+  store.upsertProviderAccount({
+    id: 'claude-a',
+    provider: 'claude',
+    label: 'Claude',
+    profilePath: '/profiles/claude-a',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+  store.upsertProviderAccount({
+    id: 'claude-b',
+    provider: 'claude',
+    label: 'Claude spare',
+    profilePath: '/profiles/claude-b',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+  store.setProviderAccountConfig(project.id, 'claude-a', { model: 'opus' });
+  store.setProviderAccountConfig(project.id, 'claude-b', { model: 'sonnet' });
+
+  assert.deepEqual(store.getProviderAccountConfig(project.id, 'claude-a'), {
+    model: 'opus',
+  });
+  assert.deepEqual(store.getProviderAccountConfig(project.id, 'claude-b'), {
+    model: 'sonnet',
+  });
+  assert.throws(
+    () =>
+      store.setProviderAccountConfig(project.id, 'claude-a', {
+        credentialReference: 'not-allowed',
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'invalid_argument',
+  );
+  store.close();
 });
 
 test('rejects provider settings that look like credentials', () => {

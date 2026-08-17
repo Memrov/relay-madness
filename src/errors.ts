@@ -1,4 +1,6 @@
 export type RelayErrorCode =
+  | 'account_at_capacity'
+  | 'account_unavailable'
   | 'capability_unavailable'
   | 'command_not_found'
   | 'configuration_missing'
@@ -12,6 +14,7 @@ export type RelayErrorCode =
   | 'not_found'
   | 'process_failed'
   | 'process_timeout'
+  | 'provider_mismatch'
   | 'provider_output_invalid'
   | 'remote_request_failed'
   | 'run_budget_exceeded'

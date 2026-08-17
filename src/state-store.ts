@@ -24,6 +24,49 @@ export interface ProjectRecord extends ProjectInput {
   updatedAt: string;
 }
 
+export type ProviderAccountStatus =
+  | 'ready'
+  | 'disabled'
+  | 'auth_required'
+  | 'cooldown';
+
+export interface ProviderAccountInput {
+  id: string;
+  provider: ProviderName;
+  label: string;
+  profilePath: string;
+  status: ProviderAccountStatus;
+  maxConcurrency: number;
+  isDefault: boolean;
+}
+
+export interface ProviderAccountRecord extends ProviderAccountInput {
+  lastUsedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UsageSnapshotInput {
+  accountId: string;
+  period: 'weekly';
+  model: string;
+  remainingPercent: number;
+  resetsAt?: string;
+  source: 'manual' | 'provider';
+  observedAt: string;
+}
+
+export interface UsageSnapshotRecord extends UsageSnapshotInput {
+  id: string;
+}
+
+export interface AccountLeaseRecord {
+  accountId: string;
+  runId: string;
+  acquiredAt: string;
+  expiresAt: string;
+}
+
 export interface WorkItemInput {
   id?: string;
   projectId: string;
@@ -234,6 +277,233 @@ export class StateStore {
       .get(projectId, provider) as SqlRow | undefined;
     if (row === undefined) return undefined;
     return JSON.parse(String(row.settings_json)) as Record<string, unknown>;
+  }
+
+  upsertProviderAccount(input: ProviderAccountInput): ProviderAccountRecord {
+    this.validateProviderAccount(input);
+    return this.database.transaction(() => {
+      const existing = this.database
+        .prepare('SELECT provider FROM provider_accounts WHERE id = ?')
+        .get(input.id) as SqlRow | undefined;
+      if (existing !== undefined && existing.provider !== input.provider) {
+        throw new RelayError(
+          'provider_mismatch',
+          `Provider account ${input.id} is already registered to ${existing.provider}.`,
+        );
+      }
+
+      const now = new Date().toISOString();
+      if (input.isDefault) {
+        this.database
+          .prepare(
+            'UPDATE provider_accounts SET is_default = 0, updated_at = ? WHERE provider = ?',
+          )
+          .run(now, input.provider);
+      }
+      this.database
+        .prepare(
+          `INSERT INTO provider_accounts (
+            id, provider, label, profile_path, status, max_concurrency,
+            is_default, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            label = excluded.label,
+            profile_path = excluded.profile_path,
+            status = excluded.status,
+            max_concurrency = excluded.max_concurrency,
+            is_default = excluded.is_default,
+            updated_at = excluded.updated_at`,
+        )
+        .run(
+          input.id,
+          input.provider,
+          input.label,
+          input.profilePath,
+          input.status,
+          input.maxConcurrency,
+          Number(input.isDefault),
+          now,
+          now,
+        );
+      return this.getRequiredProviderAccount(input.id);
+    }).immediate();
+  }
+
+  getProviderAccount(id: string): ProviderAccountRecord | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM provider_accounts WHERE id = ?')
+      .get(id) as SqlRow | undefined;
+    return row === undefined ? undefined : this.providerAccountFromRow(row);
+  }
+
+  getDefaultProviderAccount(
+    provider: ProviderName,
+  ): ProviderAccountRecord | undefined {
+    const row = this.database
+      .prepare(
+        'SELECT * FROM provider_accounts WHERE provider = ? AND is_default = 1',
+      )
+      .get(provider) as SqlRow | undefined;
+    return row === undefined ? undefined : this.providerAccountFromRow(row);
+  }
+
+  listProviderAccounts(provider?: ProviderName): readonly ProviderAccountRecord[] {
+    const rows = provider === undefined
+      ? (this.database
+          .prepare('SELECT * FROM provider_accounts ORDER BY provider, created_at, id')
+          .all() as SqlRow[])
+      : (this.database
+          .prepare(
+            'SELECT * FROM provider_accounts WHERE provider = ? ORDER BY created_at, id',
+          )
+          .all(provider) as SqlRow[]);
+    return rows.map((row) => this.providerAccountFromRow(row));
+  }
+
+  setProviderAccountConfig(
+    projectId: string,
+    accountId: string,
+    settings: Readonly<Record<string, unknown>>,
+  ): void {
+    if (containsSensitiveSetting(settings)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Provider account settings may contain references, but not credentials.',
+      );
+    }
+    this.getProject(projectId);
+    this.getRequiredProviderAccount(accountId);
+    this.database
+      .prepare(
+        `INSERT INTO provider_account_configs (project_id, account_id, settings_json)
+         VALUES (?, ?, ?)
+         ON CONFLICT(project_id, account_id) DO UPDATE SET
+           settings_json = excluded.settings_json`,
+      )
+      .run(projectId, accountId, JSON.stringify(settings));
+  }
+
+  getProviderAccountConfig(
+    projectId: string,
+    accountId: string,
+  ): Readonly<Record<string, unknown>> | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT settings_json FROM provider_account_configs
+         WHERE project_id = ? AND account_id = ?`,
+      )
+      .get(projectId, accountId) as SqlRow | undefined;
+    if (row === undefined) return undefined;
+    return JSON.parse(String(row.settings_json)) as Record<string, unknown>;
+  }
+
+  recordUsageSnapshot(input: UsageSnapshotInput): UsageSnapshotRecord {
+    this.validateUsageSnapshot(input);
+    this.getRequiredProviderAccount(input.accountId);
+    const record: UsageSnapshotRecord = { id: randomUUID(), ...input };
+    this.database
+      .prepare(
+        `INSERT INTO usage_snapshots (
+          id, account_id, period, model, remaining_percent, resets_at, source,
+          observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.id,
+        record.accountId,
+        record.period,
+        record.model,
+        record.remainingPercent,
+        record.resetsAt ?? null,
+        record.source,
+        record.observedAt,
+      );
+    return record;
+  }
+
+  listLatestUsage(accountId: string): readonly UsageSnapshotRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT snapshot.*
+         FROM usage_snapshots AS snapshot
+         WHERE snapshot.account_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM usage_snapshots AS newer
+             WHERE newer.account_id = snapshot.account_id
+               AND newer.period = snapshot.period
+               AND newer.model = snapshot.model
+               AND (
+                 newer.observed_at > snapshot.observed_at
+                 OR (newer.observed_at = snapshot.observed_at AND newer.id > snapshot.id)
+               )
+           )
+         ORDER BY snapshot.observed_at DESC, snapshot.id DESC`,
+      )
+      .all(accountId) as SqlRow[];
+    return rows.map((row) => this.usageSnapshotFromRow(row));
+  }
+
+  acquireAccountLease(
+    accountId: string,
+    runId: string,
+    now = new Date(),
+  ): AccountLeaseRecord {
+    if (!isValidDate(now)) {
+      throw new RelayError('invalid_argument', 'Lease time must be a valid date.');
+    }
+    return this.database.transaction(() => {
+      const account = this.getRequiredProviderAccount(accountId);
+      if (account.status !== 'ready') {
+        throw new RelayError(
+          'account_unavailable',
+          `Provider account ${accountId} is ${account.status}.`,
+        );
+      }
+      const acquiredAt = now.toISOString();
+      const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+      this.database
+        .prepare('DELETE FROM account_leases WHERE account_id = ? AND expires_at <= ?')
+        .run(accountId, acquiredAt);
+      const existing = this.database
+        .prepare(
+          'SELECT * FROM account_leases WHERE account_id = ? AND run_id = ?',
+        )
+        .get(accountId, runId) as SqlRow | undefined;
+      if (existing !== undefined) {
+        this.database
+          .prepare(
+            `UPDATE account_leases SET acquired_at = ?, expires_at = ?
+             WHERE account_id = ? AND run_id = ?`,
+          )
+          .run(acquiredAt, expiresAt, accountId, runId);
+      } else {
+        const activeLeases = this.database
+          .prepare('SELECT COUNT(*) AS count FROM account_leases WHERE account_id = ?')
+          .get(accountId) as SqlRow;
+        if (Number(activeLeases.count) >= account.maxConcurrency) {
+          throw new RelayError(
+            'account_at_capacity',
+            `Provider account ${accountId} is at capacity.`,
+          );
+        }
+        this.database
+          .prepare(
+            `INSERT INTO account_leases (account_id, run_id, acquired_at, expires_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(accountId, runId, acquiredAt, expiresAt);
+      }
+      this.database
+        .prepare('UPDATE provider_accounts SET last_used_at = ?, updated_at = ? WHERE id = ?')
+        .run(acquiredAt, acquiredAt, accountId);
+      return { accountId, runId, acquiredAt, expiresAt };
+    }).immediate();
+  }
+
+  releaseAccountLease(accountId: string, runId: string): void {
+    this.database
+      .prepare('DELETE FROM account_leases WHERE account_id = ? AND run_id = ?')
+      .run(accountId, runId);
   }
 
   createWorkItem(input: WorkItemInput): WorkItemRecord {
@@ -778,6 +1048,50 @@ export class StateStore {
         this.recordMigration(2);
       }).immediate();
     }
+    if (!applied.has(3)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          CREATE TABLE provider_accounts (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            label TEXT NOT NULL,
+            profile_path TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('ready','disabled','auth_required','cooldown')),
+            max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0),
+            is_default INTEGER NOT NULL CHECK(is_default IN (0,1)),
+            last_used_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          CREATE UNIQUE INDEX provider_accounts_one_default
+            ON provider_accounts(provider) WHERE is_default = 1;
+          CREATE TABLE provider_account_configs (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
+            settings_json TEXT NOT NULL,
+            PRIMARY KEY(project_id, account_id)
+          );
+          CREATE TABLE account_leases (
+            account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY(account_id, run_id)
+          );
+          CREATE TABLE usage_snapshots (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
+            period TEXT NOT NULL CHECK(period = 'weekly'),
+            model TEXT NOT NULL,
+            remaining_percent REAL NOT NULL CHECK(remaining_percent >= 0 AND remaining_percent <= 100),
+            resets_at TEXT,
+            source TEXT NOT NULL CHECK(source IN ('manual','provider')),
+            observed_at TEXT NOT NULL
+          );
+        `);
+        this.recordMigration(3);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -807,6 +1121,71 @@ export class StateStore {
     return row.current_work_item_id === null
       ? base
       : { ...base, currentWorkItemId: String(row.current_work_item_id) };
+  }
+
+  private getRequiredProviderAccount(id: string): ProviderAccountRecord {
+    const account = this.getProviderAccount(id);
+    if (account === undefined) {
+      throw new RelayError('not_found', `Provider account ${id} was not found.`);
+    }
+    return account;
+  }
+
+  private validateProviderAccount(input: ProviderAccountInput): void {
+    if (
+      input.id.length === 0 ||
+      input.label.length === 0 ||
+      input.profilePath.length === 0 ||
+      !Number.isInteger(input.maxConcurrency) ||
+      input.maxConcurrency <= 0
+    ) {
+      throw new RelayError('invalid_argument', 'Provider account fields are invalid.');
+    }
+  }
+
+  private validateUsageSnapshot(input: UsageSnapshotInput): void {
+    if (
+      input.period !== 'weekly' ||
+      (input.source !== 'manual' && input.source !== 'provider') ||
+      input.model.length === 0 ||
+      !Number.isFinite(input.remainingPercent) ||
+      input.remainingPercent < 0 ||
+      input.remainingPercent > 100 ||
+      !isIsoTimestamp(input.observedAt) ||
+      (input.resetsAt !== undefined && !isIsoTimestamp(input.resetsAt))
+    ) {
+      throw new RelayError('invalid_argument', 'Usage snapshot fields are invalid.');
+    }
+  }
+
+  private providerAccountFromRow(row: SqlRow): ProviderAccountRecord {
+    const record: ProviderAccountRecord = {
+      id: String(row.id),
+      provider: String(row.provider) as ProviderName,
+      label: String(row.label),
+      profilePath: String(row.profile_path),
+      status: String(row.status) as ProviderAccountStatus,
+      maxConcurrency: Number(row.max_concurrency),
+      isDefault: Boolean(row.is_default),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+    if (row.last_used_at !== null) record.lastUsedAt = String(row.last_used_at);
+    return record;
+  }
+
+  private usageSnapshotFromRow(row: SqlRow): UsageSnapshotRecord {
+    const record: UsageSnapshotRecord = {
+      id: String(row.id),
+      accountId: String(row.account_id),
+      period: String(row.period) as 'weekly',
+      model: String(row.model),
+      remainingPercent: Number(row.remaining_percent),
+      source: String(row.source) as UsageSnapshotRecord['source'],
+      observedAt: String(row.observed_at),
+    };
+    if (row.resets_at !== null) record.resetsAt = String(row.resets_at);
+    return record;
   }
 
   private workItemFromRow(row: SqlRow): WorkItemRecord {
@@ -897,4 +1276,13 @@ function containsSensitiveSetting(value: unknown, key = ''): boolean {
     );
   }
   return false;
+}
+
+function isValidDate(value: Date): boolean {
+  return Number.isFinite(value.getTime());
+}
+
+function isIsoTimestamp(value: string): boolean {
+  const parsed = new Date(value);
+  return isValidDate(parsed) && parsed.toISOString() === value;
 }
