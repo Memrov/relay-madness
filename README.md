@@ -32,6 +32,7 @@ This is an experimental, pre-1.0 project. Provider cloud CLIs and APIs can chang
 - Provider-account capacity limits active execution. Concurrent writes use distinct Relay-owned `relay/run/...` result branches, while landing serializes each WorkItem's integration update.
 - Merge is CLI-only, interactive, and bound to the exact approved head SHA.
 - The local MCP server exposes strict account inspection, delegation, handoff, status, and integration-only landing tools. It cannot merge.
+- Callers can attach repository-standard Agent Skills explicitly. Relay pins and transports their exact Git coordinates; it never chooses or executes a skill.
 
 Not included: hosted compute, a daemon, an HTTP bridge, a full-screen TUI, dynamic plugins, transcript synchronization, Windows support, or automatic recursive workflows.
 
@@ -150,6 +151,47 @@ relay reconcile
 relay land RUN_ID
 ```
 
+### Portable Agent Skills
+
+Put cloud-portable skills in the repository-standard Agent Skills layout:
+
+```text
+.agents/skills/
+  review-security/
+    SKILL.md
+    references/
+    scripts/
+    assets/
+```
+
+Each `SKILL.md` must start with YAML frontmatter containing a lowercase kebab-case `name` that matches its directory and a non-empty `description`. The human or orchestrating agent selects skills explicitly; Relay never infers them from a task, provider, account, model, or usage telemetry.
+
+Attach one or more skills to a new delegation or handoff:
+
+```sh
+relay delegate codex "Review the authentication boundary" \
+  --skill review-security \
+  --skill write-tests
+
+relay handoff claude "Review the published implementation" \
+  --skill review-security
+
+relay claude "Start a separate review" --new --skill review-security
+```
+
+In the REPL, use `--` to separate skill options from the instruction:
+
+```text
+claude> /new codex --skill review-security -- Review authentication.
+claude> /handoff jules --skill write-tests -- Add missing edge cases.
+```
+
+`relay_delegate` and `relay_handoff` accept the same optional ordered `skills` array over MCP. Their run result returns the resolved name, repository path, full source commit SHA, and full directory-tree SHA. `relay_send` deliberately has no `skills` input: a provider session's resolved selection is immutable, and recovery reuses it.
+
+The first successfully resolved selection for a WorkItem pins the current remote base-branch commit. Later accounts and providers resolve from that same commit even if the base branch advances. Relay reads the committed Git objects—not modified working-tree files—and sends providers a small coordinate packet instructing them to read the exact commit. Relay never executes skill scripts, installs dependencies, reads `~/.agents/skills`, or interprets skill metadata as permission.
+
+After a WorkItem has a skill-source pin, handoff and recovery compare the candidate commit with that trusted commit. Changes to any `AGENTS.md` or `CLAUDE.md`, `.agents/skills/**`, `.claude/skills/**`, `.github/skills/**`, `.openhands/microagents/**`, or `.mcp.json` stop the provider launch with `instruction_surface_changed` so candidate-authored control instructions cannot silently cross the boundary.
+
 Useful direct commands:
 
 ```sh
@@ -202,6 +244,25 @@ No `relay_merge` MCP tool exists.
 
 Each input schema rejects unknown fields. Responses expose Relay run lineage and compact GitHub state, but not provider session IDs or prompts. Relay failures are returned as typed, redacted MCP tool errors.
 
+Example skill-bearing MCP inputs:
+
+```json
+{
+  "provider": "codex",
+  "task": "Review authentication",
+  "skills": ["review-security"]
+}
+```
+
+```json
+{
+  "provider": "claude",
+  "workItem": "current",
+  "instruction": "Review the published implementation",
+  "skills": ["review-security"]
+}
+```
+
 Generic JSON configuration for Claude Code, VS Code, Cursor, and other STDIO MCP hosts:
 
 ```json
@@ -232,6 +293,7 @@ Configure the MCP host to launch Relay from the target Git checkout, because “
 - The SQLite database and containing state directory are created with user-only permissions.
 - Prompts are stored by default for local run history. Set `RELAY_STORE_PROMPTS=false` before launching Relay to omit new prompts.
 - External commands run without a shell; structured output is schema-validated.
+- Skill Git reads use exact full SHAs with hooks disabled and never check candidate content out into the locator working tree.
 - Diagnostic objects recursively redact credential-shaped keys.
 - MCP is local STDIO only. There is no unauthenticated network listener.
 - Follow provider terms. Do not share credentials or use Relay to bypass provider protective limits, quotas, or account controls.

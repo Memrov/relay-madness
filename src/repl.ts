@@ -2,6 +2,10 @@ import { RelayError } from './errors.js';
 import type { MergeStrategy } from './github-client.js';
 import type { MutationMode, ProviderName } from './provider.js';
 import type { RelayApi, RelayIo } from './app.js';
+import {
+  MAX_SELECTED_SKILLS,
+  SKILL_NAME_PATTERN,
+} from './skills.js';
 
 const PROVIDERS = new Set<ProviderName>(['claude', 'codex', 'jules']);
 
@@ -19,7 +23,7 @@ export async function runRepl(core: RelayApi, io: RelayIo): Promise<void> {
     try {
       if (line === '/help') {
         io.write(
-          '/use PROVIDER · /new TASK · /handoff PROVIDER TASK · /status · /land RUN_ID · /reconcile · /chat · /merge · /quit\n',
+          '/use PROVIDER · /new [PROVIDER] [--skill NAME ... --] TASK · /handoff PROVIDER [--skill NAME ... --] TASK · /status · /land RUN_ID · /reconcile · /chat · /merge · /quit\n',
         );
         continue;
       }
@@ -29,23 +33,28 @@ export async function runRepl(core: RelayApi, io: RelayIo): Promise<void> {
         continue;
       }
       if (line.startsWith('/new ')) {
-        const parsed = providerAndText(line.slice('/new '.length), provider);
+        const parsed = providerSkillsAndText(
+          line.slice('/new '.length),
+          provider,
+        );
         const result = await core.delegate({
           provider: parsed.provider,
           task: parsed.text,
           cwd: io.cwd(),
           mode: 'write',
+          ...(parsed.skills === undefined ? {} : { skills: parsed.skills }),
         });
         writeRun(io, result);
         continue;
       }
       if (line.startsWith('/handoff ')) {
-        const parsed = providerAndText(line.slice('/handoff '.length));
+        const parsed = providerSkillsAndText(line.slice('/handoff '.length));
         const result = await core.handoff({
           provider: parsed.provider,
           instruction: parsed.text,
           workItemId: 'current',
           cwd: io.cwd(),
+          ...(parsed.skills === undefined ? {} : { skills: parsed.skills }),
         });
         writeRun(io, result);
         continue;
@@ -160,6 +169,78 @@ function providerAndText(
     'invalid_argument',
     'A provider and instruction are required.',
   );
+}
+
+function providerSkillsAndText(
+  input: string,
+  fallback?: ProviderName,
+): { provider: ProviderName; text: string; skills?: readonly string[] } {
+  if (!input.split(/\s+/).includes('--skill')) {
+    return providerAndText(input, fallback);
+  }
+
+  const tokens = input.trim().split(/\s+/);
+  const first = tokens[0] ?? '';
+  let provider: ProviderName;
+  if (PROVIDERS.has(first as ProviderName)) {
+    provider = first as ProviderName;
+    tokens.shift();
+  } else if (fallback !== undefined) {
+    provider = fallback;
+  } else {
+    throw new RelayError(
+      'invalid_argument',
+      'A provider is required before skill options.',
+    );
+  }
+
+  const delimiter = tokens.indexOf('--');
+  if (delimiter === -1) {
+    throw new RelayError(
+      'invalid_argument',
+      'Skill-bearing REPL commands require -- before the instruction.',
+    );
+  }
+  const optionTokens = tokens.slice(0, delimiter);
+  const text = tokens.slice(delimiter + 1).join(' ');
+  if (text === '') {
+    throw new RelayError('invalid_argument', 'An instruction is required.');
+  }
+
+  const skills: string[] = [];
+  for (let index = 0; index < optionTokens.length; index += 2) {
+    const flag = optionTokens[index];
+    const name = optionTokens[index + 1];
+    if (flag !== '--skill' || name === undefined) {
+      throw new RelayError(
+        'invalid_argument',
+        'Only repeatable --skill NAME options are supported before --.',
+      );
+    }
+    if (!SKILL_NAME_PATTERN.test(name)) {
+      throw new RelayError(
+        'invalid_argument',
+        `Invalid skill name ${JSON.stringify(name)}. Use lowercase kebab-case.`,
+      );
+    }
+    if (skills.includes(name)) {
+      throw new RelayError(
+        'invalid_argument',
+        `Skill ${name} was selected more than once.`,
+      );
+    }
+    if (skills.length >= MAX_SELECTED_SKILLS) {
+      throw new RelayError(
+        'invalid_argument',
+        `At most ${MAX_SELECTED_SKILLS} skills may be selected.`,
+      );
+    }
+    skills.push(name);
+  }
+  if (skills.length === 0) {
+    throw new RelayError('invalid_argument', 'At least one skill is required.');
+  }
+  return { provider, text, skills };
 }
 
 function parseProvider(input: string): ProviderName {

@@ -9,8 +9,16 @@ import { createRelayMcpServer } from '../src/mcp.js';
 
 const sha = 'b'.repeat(40);
 
-function fakeCore() {
+function fakeCore(options: {
+  skills?: readonly {
+    name: string;
+    path: string;
+    sourceSha: string;
+    treeSha: string;
+  }[];
+} = {}) {
   const calls = {
+    delegate: [] as unknown[],
     handoff: [] as unknown[],
     send: [] as unknown[],
     status: 0,
@@ -53,6 +61,7 @@ function fakeCore() {
       provider: 'jules',
       providerSessionId: 'must-not-leak',
       status: 'active',
+      skills: options.skills ?? [],
       lastActivityAt: '2026-08-16T00:00:00.000Z',
     },
     run: {
@@ -66,13 +75,17 @@ function fakeCore() {
       correlationId: 'correlation_1',
       delegationDepth: 0,
       startedAt: '2026-08-16T00:00:00.000Z',
+      skills: options.skills ?? [],
     },
     artifact,
   } as const;
   const core = {
     doctor: async () => ({}),
     initialize: async () => result.project,
-    delegate: async () => result,
+    delegate: async (input: unknown) => {
+      calls.delegate.push(input);
+      return result;
+    },
     send: async (input: unknown) => {
       calls.send.push(input);
       return result;
@@ -384,6 +397,100 @@ test('forwards handoff account and model selection through Relay Core', async ()
         model: 'jules-latest',
       },
     ]);
+  } finally {
+    await close();
+  }
+});
+
+test('forwards strict ordered skills and returns immutable coordinates', async () => {
+  const skills = [
+    {
+      name: 'review-security',
+      path: '.agents/skills/review-security',
+      sourceSha: sha,
+      treeSha: 'c'.repeat(40),
+    },
+  ] as const;
+  const { core, calls } = fakeCore({ skills });
+  const { client, close } = await connectedMcp(core);
+  try {
+    const delegated = await client.callTool({
+      name: 'relay_delegate',
+      arguments: {
+        provider: 'jules',
+        task: 'Review it',
+        skills: ['review-security'],
+      },
+    });
+    await client.callTool({
+      name: 'relay_handoff',
+      arguments: {
+        provider: 'jules',
+        workItem: 'current',
+        instruction: 'Add tests',
+        skills: ['write-tests', 'review-security'],
+      },
+    });
+
+    assert.deepEqual(calls.delegate, [
+      {
+        provider: 'jules',
+        task: 'Review it',
+        cwd: '/workspace/acme-web',
+        mode: 'write',
+        skills: ['review-security'],
+        workItemId: 'current',
+      },
+    ]);
+    assert.deepEqual(calls.handoff, [
+      {
+        provider: 'jules',
+        instruction: 'Add tests',
+        mode: 'read',
+        workItemId: 'current',
+        cwd: '/workspace/acme-web',
+        skills: ['write-tests', 'review-security'],
+      },
+    ]);
+    assert.deepEqual(
+      (delegated.structuredContent as { skills?: unknown }).skills,
+      skills,
+    );
+  } finally {
+    await close();
+  }
+});
+
+test('rejects malformed or duplicate MCP skill selections before Relay Core', async () => {
+  const { core, calls } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    for (const skills of [
+      ['Review-Security'],
+      ['review-security', 'review-security'],
+    ]) {
+      const response = await client.callTool({
+        name: 'relay_delegate',
+        arguments: {
+          provider: 'codex',
+          task: 'Review it',
+          skills,
+        },
+      });
+      assert.equal(response.isError, true);
+    }
+    const sendResponse = await client.callTool({
+      name: 'relay_send',
+      arguments: {
+        provider: 'codex',
+        workItem: 'current',
+        message: 'Continue',
+        skills: ['review-security'],
+      },
+    });
+    assert.equal(sendResponse.isError, true);
+    assert.deepEqual(calls.delegate, []);
+    assert.deepEqual(calls.send, []);
   } finally {
     await close();
   }

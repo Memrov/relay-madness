@@ -45,6 +45,7 @@ interface CoreCalls {
   merge: unknown[];
   send: unknown[];
   delegate: unknown[];
+  handoff: unknown[];
   initialize: unknown[];
   addAccount: unknown[];
   recordUsage: unknown[];
@@ -61,6 +62,7 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
     merge: [],
     send: [],
     delegate: [],
+    handoff: [],
     initialize: [],
     addAccount: [],
     recordUsage: [],
@@ -98,7 +100,10 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
       calls.send.push(input);
       return { run: { status: 'running' }, workItem: statusFixture.workItem };
     },
-    handoff: async () => ({ run: { status: 'running' } }),
+    handoff: async (input: unknown) => {
+      calls.handoff.push(input);
+      return { run: { status: 'running' } };
+    },
     status: async () => statusFixture,
     addAccount: async (input: unknown) => {
       calls.addAccount.push(input);
@@ -235,6 +240,7 @@ test('surfaces quarantined launch state in human-readable status', async () => {
           correlationId: 'run_uncertain',
           delegationDepth: 0,
           startedAt: '2026-08-16T00:00:00.000Z',
+          skills: [],
         },
       ],
     }),
@@ -523,6 +529,93 @@ test('forwards explicit account and model selection when delegating', async () =
   ]);
 });
 
+test('forwards ordered skill selections from delegate and handoff commands', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+  const cli = createCli(core, io);
+
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'delegate',
+    'codex',
+    'Implement it',
+    '--skill',
+    'write-tests',
+    '--skill',
+    'review-security',
+  ]);
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'handoff',
+    'claude',
+    'Review it',
+    '--work-item',
+    'work_1',
+    '--skill',
+    'review-security',
+  ]);
+
+  assert.deepEqual(calls.delegate[0], {
+    provider: 'codex',
+    task: 'Implement it',
+    cwd: '/workspace/acme-web',
+    mode: 'write',
+    skills: ['write-tests', 'review-security'],
+  });
+  assert.deepEqual(calls.handoff, [
+    {
+      provider: 'claude',
+      instruction: 'Review it',
+      mode: 'read',
+      workItemId: 'work_1',
+      cwd: '/workspace/acme-web',
+      skills: ['review-security'],
+    },
+  ]);
+});
+
+test('allows shortcut skills only when explicitly starting a new WorkItem', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+
+  await createCli(core, io).parseAsync([
+    'node',
+    'relay',
+    'claude',
+    'Review auth',
+    '--new',
+    '--skill',
+    'review-security',
+  ]);
+  assert.deepEqual(calls.delegate, [
+    {
+      provider: 'claude',
+      task: 'Review auth',
+      cwd: '/workspace/acme-web',
+      mode: 'read',
+      skills: ['review-security'],
+    },
+  ]);
+
+  await assert.rejects(
+    createCli(core, io).parseAsync([
+      'node',
+      'relay',
+      'claude',
+      'Continue',
+      '--skill',
+      'review-security',
+    ]),
+    (error: unknown) =>
+      error instanceof Error &&
+      'code' in error &&
+      error.code === 'invalid_argument',
+  );
+  assert.deepEqual(calls.send, []);
+});
+
 test('lands only the WorkItem integration branch through the landing coordinator', async () => {
   const { core, calls } = fakeCore();
   const io = memoryIo();
@@ -577,6 +670,38 @@ test('REPL handoff keeps the selected provider explicit', async () => {
   const io = memoryIo({ lines: ['/handoff jules Add edge cases', '/quit'] });
 
   await runRepl(core, io);
+});
+
+test('REPL forwards explicit ordered skills for new work and handoff', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo({
+    lines: [
+      '/new claude --skill review-security --skill write-tests -- Review auth',
+      '/handoff jules --skill write-tests -- Add edge cases',
+      '/quit',
+    ],
+  });
+
+  await runRepl(core, io);
+
+  assert.deepEqual(calls.delegate, [
+    {
+      provider: 'claude',
+      task: 'Review auth',
+      cwd: '/workspace/acme-web',
+      mode: 'write',
+      skills: ['review-security', 'write-tests'],
+    },
+  ]);
+  assert.deepEqual(calls.handoff, [
+    {
+      provider: 'jules',
+      instruction: 'Add edge cases',
+      workItemId: 'current',
+      cwd: '/workspace/acme-web',
+      skills: ['write-tests'],
+    },
+  ]);
 });
 
 test('REPL merge binds approval to the pull request and SHA it displayed', async () => {

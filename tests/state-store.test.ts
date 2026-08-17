@@ -322,6 +322,103 @@ test('persists a project, WorkItem, session, run, and artifact snapshot', () => 
   store.close();
 });
 
+test('pins one WorkItem skill source and persists immutable session and run skills', () => {
+  const store = openStore();
+  const { workItem } = seed(store);
+  const sourceSha = 'a'.repeat(40);
+  const skills = [
+    {
+      name: 'review-security',
+      path: '.agents/skills/review-security',
+      sourceSha,
+      treeSha: 'b'.repeat(40),
+    },
+  ] as const;
+
+  assert.equal(store.getWorkItem(workItem.id).skillSourceSha, undefined);
+  assert.equal(
+    store.pinWorkItemSkillSource(workItem.id, sourceSha).skillSourceSha,
+    sourceSha,
+  );
+  assert.equal(
+    store.pinWorkItemSkillSource(workItem.id, sourceSha).skillSourceSha,
+    sourceSha,
+  );
+  assert.throws(
+    () => store.pinWorkItemSkillSource(workItem.id, 'c'.repeat(40)),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'state_conflict',
+  );
+
+  const session = store.upsertSession({
+    workItemId: workItem.id,
+    provider: 'codex',
+    providerSessionId: 'skill-session',
+    status: 'active',
+    skills,
+  });
+  assert.deepEqual(session.skills, skills);
+  assert.deepEqual(
+    store.upsertSession({
+      workItemId: workItem.id,
+      provider: 'codex',
+      providerSessionId: 'skill-session',
+      status: 'complete',
+    }).skills,
+    skills,
+  );
+  assert.throws(
+    () =>
+      store.upsertSession({
+        workItemId: workItem.id,
+        provider: 'codex',
+        providerSessionId: 'skill-session',
+        status: 'complete',
+        skills: [
+          {
+            name: 'write-tests',
+            path: '.agents/skills/write-tests',
+            sourceSha,
+            treeSha: 'd'.repeat(40),
+          },
+        ],
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'state_conflict',
+  );
+
+  const run = store.createRun({
+    sessionId: session.id,
+    provider: 'codex',
+    type: 'delegation',
+    mutationMode: 'read',
+  });
+  assert.deepEqual(run.skills, skills);
+  assert.deepEqual(store.getStatus(workItem.id).runs[0]?.skills, skills);
+  store.close();
+});
+
+test('fails closed when stored skill coordinates are corrupt', () => {
+  const path = databasePath();
+  const store = StateStore.open(path);
+  const { session } = seed(store);
+  store.close();
+
+  const database = new Database(path);
+  database
+    .prepare('UPDATE provider_sessions SET skills_json = ? WHERE id = ?')
+    .run('{broken-json', session.id);
+  database.close();
+
+  const reopened = StateStore.open(path);
+  assert.throws(
+    () => reopened.getSession(session.workItemId, 'claude'),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'state_conflict',
+  );
+  reopened.close();
+});
+
 test('updates a project without creating a duplicate', () => {
   const store = openStore();
   const first = store.upsertProject({
@@ -707,7 +804,15 @@ test('applies ordered schema migrations', () => {
     .all() as Array<{ version: number }>;
   const runColumns = database.pragma('table_info(provider_runs)') as Array<{
     name: string;
+    notnull: number;
+    dflt_value: string | null;
   }>;
+  const workItemColumns = database.pragma('table_info(work_items)') as Array<{
+    name: string;
+  }>;
+  const sessionColumns = database.pragma(
+    'table_info(provider_sessions)',
+  ) as Array<{ name: string; notnull: number; dflt_value: string | null }>;
   const artifactColumns = database.pragma(
     'table_info(artifact_snapshots)',
   ) as Array<{ name: string }>;
@@ -724,7 +829,22 @@ test('applies ordered schema migrations', () => {
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3, 4, 5, 6, 7, 8],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  );
+  assert.ok(
+    workItemColumns.some(({ name }) => name === 'skill_source_sha'),
+  );
+  assert.ok(
+    sessionColumns.some(
+      ({ name, notnull, dflt_value: defaultValue }) =>
+        name === 'skills_json' && notnull === 1 && defaultValue === "'[]'",
+    ),
+  );
+  assert.ok(
+    runColumns.some(
+      ({ name, notnull, dflt_value: defaultValue }) =>
+        name === 'skills_json' && notnull === 1 && defaultValue === "'[]'",
+    ),
   );
   assert.ok(runColumns.some(({ name }) => name === 'baseline_sha'));
   assert.ok(runColumns.some(({ name }) => name === 'account_id'));
@@ -792,12 +912,14 @@ test('migrates a populated version-three database without deleting legacy runs',
   assert.equal(store.getProject('project-v3').currentWorkItemId, 'work-v3');
   assert.equal(status.sessions[0]?.id, 'session-v3');
   assert.equal(status.sessions[0]?.accountId, undefined);
+  assert.deepEqual(status.sessions[0]?.skills, []);
   assert.equal(status.runs[0]?.id, 'run-v3');
   assert.equal(status.runs[0]?.sessionId, 'session-v3');
   assert.equal(status.runs[0]?.accountId, undefined);
   assert.equal(status.runs[0]?.model, undefined);
   assert.equal(status.runs[0]?.baseSha, undefined);
   assert.equal(status.runs[0]?.resultSha, undefined);
+  assert.deepEqual(status.runs[0]?.skills, []);
   store.close();
 });
 
