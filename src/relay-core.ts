@@ -83,6 +83,10 @@ export interface RelayRunResult {
   artifact?: ArtifactRecord;
 }
 
+export interface RelayStatus extends WorkItemStatus {
+  project: ProjectRecord;
+}
+
 export interface HandoffResult extends RelayRunResult {
   prompt: string;
 }
@@ -412,7 +416,7 @@ export class RelayCore {
     return (await this.reconcileRun(context, run, branch)).artifact;
   }
 
-  async status(input: WorkItemSelector): Promise<WorkItemStatus> {
+  async status(input: WorkItemSelector): Promise<RelayStatus> {
     const context = await this.resolveWorkItem(input);
     const before = this.dependencies.store.getStatus(context.workItem.id);
     const currentByProvider = new Map<ProviderName, SessionRecord>();
@@ -460,7 +464,10 @@ export class RelayCore {
     }
 
     await this.reconcile({ workItemId: context.workItem.id });
-    return this.dependencies.store.getStatus(context.workItem.id);
+    return {
+      project: context.project,
+      ...this.dependencies.store.getStatus(context.workItem.id),
+    };
   }
 
   async sessions(input: WorkItemSelector): Promise<readonly SessionRecord[]> {

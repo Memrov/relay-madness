@@ -8,12 +8,15 @@ import {
   formatCliError,
   type RelayIo,
 } from './app.js';
+import { serveRelayMcp } from './mcp.js';
 
 const application = createRelayApplication();
 const io = nodeIo();
 
 try {
-  await createCli(application.core, io).parseAsync(process.argv);
+  await createCli(application.core, io, {
+    serveMcp: async () => await serveRelayMcp(application.core),
+  }).parseAsync(process.argv);
 } catch (error) {
   io.writeError(formatCliError(error));
   process.exitCode = 1;
@@ -23,12 +26,18 @@ try {
 }
 
 function nodeIo(): RelayIo {
-  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  let readline: ReturnType<typeof createInterface> | undefined;
   return {
     cwd: () => process.cwd(),
     write: (text) => process.stdout.write(text),
     writeError: (text) => process.stderr.write(text),
-    readLine: async (prompt) => await readline.question(prompt),
-    close: () => readline.close(),
+    readLine: async (prompt) => {
+      readline ??= createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      return await readline.question(prompt);
+    },
+    close: () => readline?.close(),
   };
 }
