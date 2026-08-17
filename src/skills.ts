@@ -14,6 +14,8 @@ const RESOLVED_SKILL_KEYS = ['name', 'path', 'sourceSha', 'treeSha'] as const;
 const PROTECTED_PATHS = [
   'AGENTS.md',
   'CLAUDE.md',
+  ':(glob)**/AGENTS.md',
+  ':(glob)**/CLAUDE.md',
   '.agents/skills',
   '.claude/skills',
   '.github/skills',

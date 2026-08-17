@@ -118,8 +118,8 @@ The packet requires the provider to report when the exact Git objects are unavai
 Provider candidates are untrusted until landed. Before a cross-provider handoff or recovery starts from a candidate SHA, Relay compares that candidate with `skill_source_sha` for changes to agent-control surfaces:
 
 ```text
-AGENTS.md
-CLAUDE.md
+**/AGENTS.md
+**/CLAUDE.md
 .agents/skills/**
 .claude/skills/**
 .github/skills/**

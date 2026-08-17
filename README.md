@@ -190,7 +190,7 @@ claude> /handoff jules --skill write-tests -- Add missing edge cases.
 
 The first successfully resolved selection for a WorkItem pins the current remote base-branch commit. Later accounts and providers resolve from that same commit even if the base branch advances. Relay reads the committed Git objects—not modified working-tree files—and sends providers a small coordinate packet instructing them to read the exact commit. Relay never executes skill scripts, installs dependencies, reads `~/.agents/skills`, or interprets skill metadata as permission.
 
-After a WorkItem has a skill-source pin, handoff and recovery compare the candidate commit with that trusted commit. Changes to `AGENTS.md`, `CLAUDE.md`, `.agents/skills/**`, `.claude/skills/**`, `.github/skills/**`, `.openhands/microagents/**`, or `.mcp.json` stop the provider launch with `instruction_surface_changed` so candidate-authored control instructions cannot silently cross the boundary.
+After a WorkItem has a skill-source pin, handoff and recovery compare the candidate commit with that trusted commit. Changes to any `AGENTS.md` or `CLAUDE.md`, `.agents/skills/**`, `.claude/skills/**`, `.github/skills/**`, `.openhands/microagents/**`, or `.mcp.json` stop the provider launch with `instruction_surface_changed` so candidate-authored control instructions cannot silently cross the boundary.
 
 Useful direct commands:
 

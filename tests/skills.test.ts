@@ -164,6 +164,12 @@ test('detects only protected instruction-surface changes', async () => {
   writeFile(fixture.checkout, 'src/index.ts', 'export const value = 2;\n');
   const ordinarySha = commitAndPush(fixture.checkout, 'ordinary change');
   writeFile(fixture.checkout, 'AGENTS.md', 'candidate instructions\n');
+  writeFile(fixture.checkout, 'src/AGENTS.md', 'nested candidate instructions\n');
+  writeFile(
+    fixture.checkout,
+    'packages/api/CLAUDE.md',
+    'nested Claude instructions\n',
+  );
   writeFile(fixture.checkout, '.mcp.json', '{}\n');
   writeFile(
     fixture.checkout,
@@ -187,7 +193,13 @@ test('detects only protected instruction-surface changes', async () => {
       trustedSha,
       candidateSha: protectedSha,
     }),
-    ['.claude/skills/candidate/SKILL.md', '.mcp.json', 'AGENTS.md'],
+    [
+      '.claude/skills/candidate/SKILL.md',
+      '.mcp.json',
+      'AGENTS.md',
+      'packages/api/CLAUDE.md',
+      'src/AGENTS.md',
+    ],
   );
 });
 
