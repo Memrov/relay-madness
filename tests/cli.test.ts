@@ -45,13 +45,24 @@ interface CoreCalls {
   send: unknown[];
   delegate: unknown[];
   initialize: unknown[];
+  addAccount: unknown[];
+  recordUsage: unknown[];
+  land: unknown[];
 }
 
 function fakeCore(overrides: Partial<RelayApi> = {}): {
   core: RelayApi;
   calls: CoreCalls;
 } {
-  const calls: CoreCalls = { merge: [], send: [], delegate: [], initialize: [] };
+  const calls: CoreCalls = {
+    merge: [],
+    send: [],
+    delegate: [],
+    initialize: [],
+    addAccount: [],
+    recordUsage: [],
+    land: [],
+  };
   const core = {
     doctor: async () => ({
       github: { authenticated: true, method: 'gh CLI' },
@@ -84,6 +95,62 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
     },
     handoff: async () => ({ run: { status: 'running' } }),
     status: async () => statusFixture,
+    addAccount: async (input: unknown) => {
+      calls.addAccount.push(input);
+      return {
+        ...(input as object),
+        createdAt: '2026-08-16T00:00:00.000Z',
+        updatedAt: '2026-08-16T00:00:00.000Z',
+      };
+    },
+    accounts: async () => [
+      {
+        id: 'codex-a',
+        label: 'Primary',
+        provider: 'codex',
+        status: 'ready',
+        capacity: 1,
+        activeLeaseCount: 0,
+        latestUsage: [
+          {
+            id: 'usage_1',
+            accountId: 'codex-a',
+            period: 'weekly',
+            model: 'gpt-5.6-sol',
+            remainingPercent: 62,
+            resetsAt: '2026-08-20T00:00:00.000Z',
+            source: 'manual',
+            observedAt: '2026-08-16T00:00:00.000Z',
+          },
+        ],
+      },
+    ],
+    recordUsage: async (input: unknown) => {
+      calls.recordUsage.push(input);
+      return { id: 'usage_1', ...(input as object) };
+    },
+    usage: async () => [
+      {
+        id: 'usage_1',
+        accountId: 'codex-a',
+        period: 'weekly',
+        model: 'gpt-5.6-sol',
+        remainingPercent: 62,
+        resetsAt: '2026-08-20T00:00:00.000Z',
+        source: 'manual',
+        observedAt: '2026-08-16T00:00:00.000Z',
+      },
+    ],
+    land: async (runId: string) => {
+      calls.land.push(runId);
+      return {
+        runId,
+        status: 'landed',
+        stagingBranch: 'relay/stage/run_1-deadbeef',
+        stagingSha: sha,
+        landedSha: 'a'.repeat(40),
+      };
+    },
     sessions: async () => [],
     providers: async () => ({}),
     reconcile: async () => statusFixture.artifact,
@@ -206,6 +273,116 @@ test('initializes only non-secret provider references', async () => {
       },
     },
   ]);
+});
+
+test('manages account and caller-supplied weekly usage without listing profile paths', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+  const cli = createCli(core, io);
+
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'account',
+    'add',
+    'codex',
+    'codex-a',
+    '--label',
+    'Primary',
+    '--profile',
+    '/profiles/codex-a',
+    '--default',
+  ]);
+  await cli.parseAsync(['node', 'relay', 'accounts', '--json']);
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'usage',
+    'set',
+    'codex-a',
+    '--model',
+    'gpt-5.6-sol',
+    '--remaining-percent',
+    '62',
+    '--resets-at',
+    '2026-08-20T00:00:00Z',
+  ]);
+  await cli.parseAsync(['node', 'relay', 'usage', '--account', 'codex-a', '--json']);
+
+  assert.deepEqual(calls.addAccount, [
+    {
+      provider: 'codex',
+      id: 'codex-a',
+      label: 'Primary',
+      profilePath: '/profiles/codex-a',
+      status: 'ready',
+      maxConcurrency: 1,
+      isDefault: true,
+    },
+  ]);
+  assert.deepEqual(calls.recordUsage, [
+    {
+      accountId: 'codex-a',
+      period: 'weekly',
+      model: 'gpt-5.6-sol',
+      remainingPercent: 62,
+      resetsAt: '2026-08-20T00:00:00.000Z',
+      source: 'manual',
+    },
+  ]);
+  assert.equal(io.stdout.includes('/profiles/codex-a'), false);
+  assert.match(io.stdout, /"accountId": "codex-a"/);
+});
+
+test('forwards explicit account and model selection when delegating', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+
+  await createCli(core, io).parseAsync([
+    'node',
+    'relay',
+    'delegate',
+    'codex',
+    'Implement it',
+    '--account',
+    'codex-a',
+    '--model',
+    'gpt-5.6-sol',
+  ]);
+
+  assert.deepEqual(calls.delegate, [
+    {
+      provider: 'codex',
+      task: 'Implement it',
+      cwd: '/workspace/acme-web',
+      mode: 'write',
+      accountId: 'codex-a',
+      model: 'gpt-5.6-sol',
+    },
+  ]);
+});
+
+test('lands only the WorkItem integration branch through the landing coordinator', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+
+  await createCli(core, io).parseAsync([
+    'node',
+    'relay',
+    'land',
+    'run_1',
+    '--json',
+  ]);
+
+  assert.deepEqual(calls.land, ['run_1']);
+  assert.deepEqual(calls.merge, []);
+  assert.deepEqual(JSON.parse(io.stdout), {
+    runId: 'run_1',
+    status: 'landed',
+    stagingBranch: 'relay/stage/run_1-deadbeef',
+    stagingSha: sha,
+    landedSha: 'a'.repeat(40),
+  });
 });
 
 test('plain REPL text goes to the selected provider and current WorkItem', async () => {

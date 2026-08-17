@@ -105,6 +105,16 @@ A ProviderRun records one message, delegation, handoff, inspection, or publicati
 
 Callers may not override Relay-generated lineage fields.
 
+### Provider accounts and usage telemetry
+
+A ProviderAccount holds a provider, label, local profile reference, status, concurrency capacity, and optional default flag. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are references only: Relay never stores provider credentials. macOS Claude authentication uses Keychain, so multiple Claude profiles should use isolated Linux bridge environments rather than attempting a shared macOS credential store.
+
+Weekly usage snapshots are caller-supplied advisory scheduling telemetry keyed by account and model. Relay records a finite 0–100 remaining percentage and normalized reset timestamp, but does not scrape provider interfaces, infer usage, or use snapshots to select an account or model. Users must follow provider terms, never share credentials, and must not use Relay to bypass quotas, protective limits, or account controls.
+
+### Candidate landing
+
+Every eligible completed write creates one immutable candidate from its isolated append-only `relay/run/...` branch. Landing is intentionally staged: the first `land(runId)` call creates an exact-SHA staging branch and checks it; the second fast-forwards only the WorkItem integration branch when that same staging SHA passes. Each WorkItem has one integration PR. Landing never merges the base branch or `main`; final base-branch merge remains the separate interactive human-approved flow.
+
 ### ArtifactSnapshot
 
 An ArtifactSnapshot records a full commit SHA, branch, publication or verification status, pull request, draft state, mergeability, review decision, and normalized check summary observed from GitHub at a specific time. Snapshots are historical; current operations reconcile GitHub again and clear canonical WorkItem SHA/PR fields if the expected branch has disappeared.
@@ -236,12 +246,14 @@ Provider cloud environments do not receive Relay bridge credentials. A delegated
 
 ## MCP surface
 
-`relay mcp` runs a STDIO server using the official TypeScript MCP SDK. It exposes four tools:
+`relay mcp` runs a STDIO server using the official TypeScript MCP SDK. It exposes six tools:
 
 - `relay_delegate` starts durable coding work;
 - `relay_send` continues a reusable provider session;
 - `relay_handoff` reconciles GitHub and transfers work to another provider;
 - `relay_status` returns provider and GitHub state.
+- `relay_accounts` read-only returns account ID, label, provider, status, capacity, active lease count, and latest model usage; it never returns profile paths.
+- `relay_land` is destructive because it mutates the WorkItem integration branch. It accepts only a run ID, returns candidate status and exact SHAs, and never merges `main`.
 
 All inputs use strict schemas and reject unknown fields. WorkItem and provider access is resolved by Relay Core rather than reimplemented in the MCP layer. Tool responses use stable machine-readable error codes and concise human-readable text.
 
@@ -283,7 +295,7 @@ Real-account tests are opt-in, never run in public CI, and require explicit envi
 
 Runtime dependencies are limited to the official MCP TypeScript packages, Zod, Commander, and `better-sqlite3`. Process execution, HTTP requests, identifiers, paths, and the REPL use Node standard-library APIs.
 
-Existing open-source orchestrators may be studied for interoperability patterns. Code is copied only when its license is compatible with Apache-2.0, the copied portion materially reduces risk, and required attribution is preserved in `NOTICE`. GPL, AGPL, source-available, or unknown-license code is not incorporated into the core package.
+Existing open-source orchestrators may be studied for interoperability patterns. Code is copied only when its license is compatible with Apache-2.0, the copied portion materially reduces risk, and required attribution is preserved in `NOTICE`. MIT and Apache-2.0 source is never copied without that attribution. GPL, AGPL, source-available, or unknown-license code is not incorporated into the core package.
 
 ## Repository and release shape
 

@@ -19,7 +19,7 @@ export async function runRepl(core: RelayApi, io: RelayIo): Promise<void> {
     try {
       if (line === '/help') {
         io.write(
-          '/use PROVIDER · /new TASK · /handoff PROVIDER TASK · /status · /reconcile · /chat · /merge · /quit\n',
+          '/use PROVIDER · /new TASK · /handoff PROVIDER TASK · /status · /land RUN_ID · /reconcile · /chat · /merge · /quit\n',
         );
         continue;
       }
@@ -53,8 +53,17 @@ export async function runRepl(core: RelayApi, io: RelayIo): Promise<void> {
       if (line === '/status') {
         const status = await core.status(current(io));
         io.write(
-          `${status.workItem.title} · ${status.artifact?.sha ?? 'not published'} · PR ${status.artifact?.pullRequest ?? 'none'} · ${status.artifact?.checks ?? 'unknown'}\n`,
+          `${status.workItem.title} · ${status.workItem.integrationBranch} · ${status.artifact?.sha ?? 'not published'} · PR ${status.artifact?.pullRequest ?? 'none'} · ${status.artifact?.checks ?? 'unknown'} · ${status.candidates?.length ?? 0} candidates\n`,
         );
+        continue;
+      }
+      if (line.startsWith('/land ')) {
+        const runId = line.slice('/land '.length).trim();
+        if (runId === '') {
+          throw new RelayError('invalid_argument', 'A candidate run ID is required.');
+        }
+        const result = await core.land(runId);
+        io.write(`${result.runId} · ${result.status}\n`);
         continue;
       }
       if (line === '/reconcile') {

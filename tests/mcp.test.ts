@@ -10,7 +10,7 @@ import { createRelayMcpServer } from '../src/mcp.js';
 const sha = 'b'.repeat(40);
 
 function fakeCore() {
-  const calls = { handoff: 0, status: 0 };
+  const calls = { handoff: 0, status: 0, merge: 0, land: 0 };
   const workItem = {
     id: 'work_1',
     projectId: 'project_1',
@@ -72,6 +72,36 @@ function fakeCore() {
       calls.handoff += 1;
       return { ...result, prompt: 'hidden prompt' };
     },
+    accounts: async () => [
+      {
+        id: 'codex-a',
+        label: 'Primary',
+        provider: 'codex',
+        status: 'ready',
+        capacity: 1,
+        activeLeaseCount: 0,
+        latestUsage: [
+          {
+            id: 'usage_1',
+            accountId: 'codex-a',
+            period: 'weekly',
+            model: 'gpt-5.6-sol',
+            remainingPercent: 62,
+            source: 'manual',
+            observedAt: '2026-08-16T00:00:00.000Z',
+          },
+        ],
+      },
+    ],
+    land: async (runId: string) => {
+      calls.land += 1;
+      return {
+        runId,
+        status: 'landed',
+        stagingSha: sha,
+        landedSha: 'a'.repeat(40),
+      };
+    },
     status: async () => {
       calls.status += 1;
       return {
@@ -86,7 +116,9 @@ function fakeCore() {
     providers: async () => ({}),
     reconcile: async () => artifact,
     chat: async () => 0,
-    merge: async () => {},
+    merge: async () => {
+      calls.merge += 1;
+    },
   } as unknown as RelayApi;
   return { core, calls };
 }
@@ -108,20 +140,92 @@ async function connectedMcp(core: RelayApi) {
   };
 }
 
-test('exposes exactly the four non-merge tools', async () => {
+test('exposes account inspection and integration-only landing without a merge tool', async () => {
   const { core } = fakeCore();
   const { client, close } = await connectedMcp(core);
   try {
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name).sort(),
-      ['relay_delegate', 'relay_handoff', 'relay_send', 'relay_status'],
+      [
+        'relay_accounts',
+        'relay_delegate',
+        'relay_handoff',
+        'relay_land',
+        'relay_send',
+        'relay_status',
+      ],
     );
     assert.equal(
       listed.tools.find((tool) => tool.name === 'relay_status')?.annotations
         ?.readOnlyHint,
       true,
     );
+    assert.equal(
+      listed.tools.find((tool) => tool.name === 'relay_accounts')?.annotations
+        ?.readOnlyHint,
+      true,
+    );
+    assert.equal(
+      listed.tools.find((tool) => tool.name === 'relay_land')?.annotations
+        ?.destructiveHint,
+      true,
+    );
+  } finally {
+    await close();
+  }
+});
+
+test('returns redacted account capacity, leases, and latest usage to MCP clients', async () => {
+  const { core } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    const response = await client.callTool({
+      name: 'relay_accounts',
+      arguments: {},
+    });
+    assert.deepEqual(response.structuredContent, {
+      accounts: [
+        {
+          id: 'codex-a',
+          label: 'Primary',
+          provider: 'codex',
+          status: 'ready',
+          capacity: 1,
+          activeLeaseCount: 0,
+          latestUsage: [
+            {
+              model: 'gpt-5.6-sol',
+              remainingPercent: 62,
+              source: 'manual',
+              observedAt: '2026-08-16T00:00:00.000Z',
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(JSON.stringify(response).includes('profilePath'), false);
+  } finally {
+    await close();
+  }
+});
+
+test('lands a candidate through the integration branch without merging main', async () => {
+  const { core, calls } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    const response = await client.callTool({
+      name: 'relay_land',
+      arguments: { runId: 'run_1' },
+    });
+    assert.deepEqual(response.structuredContent, {
+      runId: 'run_1',
+      status: 'landed',
+      stagingSha: sha,
+      landedSha: 'a'.repeat(40),
+    });
+    assert.equal(calls.land, 1);
+    assert.equal(calls.merge, 0);
   } finally {
     await close();
   }
@@ -232,6 +336,36 @@ test('rejects unknown input fields before reaching Relay Core', async () => {
     });
     assert.equal(response.isError, true);
     assert.equal(calls.status, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('accepts account and model selection but rejects unknown delegate and handoff fields', async () => {
+  const { core, calls } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    const accepted = await client.callTool({
+      name: 'relay_delegate',
+      arguments: {
+        provider: 'codex',
+        task: 'Implement it',
+        account: 'codex-a',
+        model: 'gpt-5.6-sol',
+      },
+    });
+    assert.equal(accepted.isError, undefined);
+    const rejected = await client.callTool({
+      name: 'relay_handoff',
+      arguments: {
+        provider: 'jules',
+        workItem: 'current',
+        instruction: 'Review it',
+        unknown: true,
+      },
+    });
+    assert.equal(rejected.isError, true);
+    assert.equal(calls.handoff, 0);
   } finally {
     await close();
   }

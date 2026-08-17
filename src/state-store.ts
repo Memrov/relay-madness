@@ -505,6 +505,22 @@ export class StateStore {
     return rows.map((row) => this.usageSnapshotFromRow(row));
   }
 
+  countActiveAccountLeases(accountId: string, now = new Date()): number {
+    if (!isValidDate(now)) {
+      throw new RelayError('invalid_argument', 'Lease time must be a valid date.');
+    }
+    const nowText = now.toISOString();
+    return this.database.transaction(() => {
+      this.database
+        .prepare('DELETE FROM account_leases WHERE account_id = ? AND expires_at <= ?')
+        .run(accountId, nowText);
+      const row = this.database
+        .prepare('SELECT COUNT(*) AS count FROM account_leases WHERE account_id = ?')
+        .get(accountId) as SqlRow;
+      return Number(row.count);
+    }).immediate();
+  }
+
   acquireAccountLease(
     accountId: string,
     runId: string,

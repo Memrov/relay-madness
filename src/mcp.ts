@@ -23,6 +23,68 @@ const outputSchema = z.object({
   pullRequest: z.number().int().positive().optional(),
   checks: z.enum(['passing', 'failing', 'pending', 'unknown']).optional(),
   providers: z.partialRecord(providerSchema, z.string()).optional(),
+  integrationBranch: z.string().optional(),
+  candidates: z.array(
+    z.object({
+      runId: z.string(),
+      status: z.enum([
+        'ready',
+        'staged',
+        'landed',
+        'conflict',
+        'checks_failed',
+        'stale',
+        'discarded',
+      ]),
+      sourceBranch: z.string(),
+      sourceSha: z.string(),
+      baseSha: z.string(),
+      integrationBranch: z.string(),
+      stagingBranch: z.string().optional(),
+      stagingSha: z.string().optional(),
+      landedSha: z.string().optional(),
+      conflictFiles: z.array(z.string()),
+    }),
+  ).optional(),
+});
+
+const accountsOutputSchema = z.object({
+  accounts: z.array(
+    z.object({
+      id: z.string(),
+      label: z.string(),
+      provider: providerSchema,
+      status: z.enum(['ready', 'disabled', 'auth_required', 'cooldown']),
+      capacity: z.number().int().positive(),
+      activeLeaseCount: z.number().int().nonnegative(),
+      latestUsage: z.array(
+        z.object({
+          model: z.string(),
+          remainingPercent: z.number().min(0).max(100),
+          resetsAt: z.string().optional(),
+          source: z.enum(['manual', 'provider']),
+          observedAt: z.string(),
+        }),
+      ),
+    }),
+  ),
+});
+
+const landingOutputSchema = z.object({
+  runId: z.string(),
+  status: z.enum([
+    'ready',
+    'staged',
+    'landed',
+    'conflict',
+    'checks_failed',
+    'stale',
+    'discarded',
+  ]),
+  stagingBranch: z.string().optional(),
+  stagingSha: z.string().optional(),
+  landedSha: z.string().optional(),
+  conflictFiles: z.array(z.string()).optional(),
 });
 
 export interface RelayMcpOptions {
@@ -53,6 +115,8 @@ export function createRelayMcpServer(
           title: z.string().min(1).optional(),
           mode: modeSchema.default('write'),
           parentRunId: z.string().min(1).optional(),
+          account: z.string().min(1).optional(),
+          model: z.string().min(1).optional(),
         })
         .strict(),
       outputSchema,
@@ -63,7 +127,7 @@ export function createRelayMcpServer(
         openWorldHint: true,
       },
     },
-    async ({ provider, task, workItem, title, mode, parentRunId }) => {
+    async ({ provider, task, workItem, title, mode, parentRunId, account, model }) => {
       return await executeTool(async () => {
         const result = await delegateCurrentOrNew(core, {
           provider,
@@ -73,6 +137,8 @@ export function createRelayMcpServer(
           ...(workItem === undefined ? {} : { workItem }),
           ...(title === undefined ? {} : { title }),
           ...(parentRunId === undefined ? {} : { parentRunId }),
+          ...(account === undefined ? {} : { accountId: account }),
+          ...(model === undefined ? {} : { model }),
         });
         return publicRun(result);
       });
@@ -129,6 +195,8 @@ export function createRelayMcpServer(
           workItem: workItemSchema,
           mode: modeSchema.default('read'),
           parentRunId: z.string().min(1).optional(),
+          account: z.string().min(1).optional(),
+          model: z.string().min(1).optional(),
         })
         .strict(),
       outputSchema,
@@ -139,7 +207,7 @@ export function createRelayMcpServer(
         openWorldHint: true,
       },
     },
-    async ({ provider, instruction, workItem, mode, parentRunId }) => {
+    async ({ provider, instruction, workItem, mode, parentRunId, account, model }) => {
       return await executeTool(async () => {
         const result = await core.handoff({
           provider,
@@ -147,6 +215,8 @@ export function createRelayMcpServer(
           mode,
           ...selection(workItem, cwd),
           ...(parentRunId === undefined ? {} : { parentRunId }),
+          ...(account === undefined ? {} : { accountId: account }),
+          ...(model === undefined ? {} : { model }),
         });
         return publicRun(result);
       });
@@ -176,6 +246,46 @@ export function createRelayMcpServer(
     },
   );
 
+  server.registerTool(
+    'relay_accounts',
+    {
+      title: 'Inspect provider account capacity and usage',
+      description:
+        'Read account labels, availability, active leases, and caller-supplied weekly usage telemetry. Profile paths are never exposed.',
+      inputSchema: z.object({}).strict(),
+      outputSchema: accountsOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      return await executeTool(async () => ({ accounts: publicAccounts(await core.accounts()) }));
+    },
+  );
+
+  server.registerTool(
+    'relay_land',
+    {
+      title: 'Stage or land a candidate on its WorkItem integration branch',
+      description:
+        'Advance one candidate through the staged landing lifecycle. This mutates only the WorkItem integration branch and never merges main or the base branch.',
+      inputSchema: z.object({ runId: z.string().min(1) }).strict(),
+      outputSchema: landingOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ runId }) => {
+      return await executeTool(async () => publicLanding(await core.land(runId)));
+    },
+  );
+
   return server;
 }
 
@@ -200,6 +310,8 @@ async function delegateCurrentOrNew(
     title?: string;
     mode: MutationMode;
     parentRunId?: string;
+    accountId?: string;
+    model?: string;
     cwd: string;
   },
 ) {
@@ -212,6 +324,8 @@ async function delegateCurrentOrNew(
     ...(input.parentRunId === undefined
       ? {}
       : { parentRunId: input.parentRunId }),
+    ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
+    ...(input.model === undefined ? {} : { model: input.model }),
   };
   if (input.workItem !== undefined && input.workItem !== 'current') {
     return await core.delegate({ ...base, workItemId: input.workItem });
@@ -268,6 +382,54 @@ function publicStatus(status: Awaited<ReturnType<RelayApi['status']>>) {
     pullRequest: status.artifact?.pullRequest,
     checks: status.artifact?.checks,
     providers: providerStates,
+    integrationBranch: status.workItem.integrationBranch,
+    candidates: status.candidates?.map(publicCandidate),
+  });
+}
+
+function publicAccounts(accounts: Awaited<ReturnType<RelayApi['accounts']>>) {
+  return accounts.map((account) => ({
+    id: account.id,
+    label: account.label,
+    provider: account.provider,
+    status: account.status,
+    capacity: account.capacity,
+    activeLeaseCount: account.activeLeaseCount,
+    latestUsage: account.latestUsage.map((usage) =>
+      compact({
+        model: usage.model,
+        remainingPercent: usage.remainingPercent,
+        resetsAt: usage.resetsAt,
+        source: usage.source,
+        observedAt: usage.observedAt,
+      }),
+    ),
+  }));
+}
+
+function publicLanding(result: Awaited<ReturnType<RelayApi['land']>>) {
+  return compact({
+    runId: result.runId,
+    status: result.status,
+    stagingBranch: result.stagingBranch,
+    stagingSha: result.stagingSha,
+    landedSha: result.landedSha,
+    conflictFiles: result.conflictFiles,
+  });
+}
+
+function publicCandidate(candidate: NonNullable<Awaited<ReturnType<RelayApi['status']>>['candidates']>[number]) {
+  return compact({
+    runId: candidate.runId,
+    status: candidate.status,
+    sourceBranch: candidate.sourceBranch,
+    sourceSha: candidate.sourceSha,
+    baseSha: candidate.baseSha,
+    integrationBranch: candidate.integrationBranch,
+    stagingBranch: candidate.stagingBranch,
+    stagingSha: candidate.stagingSha,
+    landedSha: candidate.landedSha,
+    conflictFiles: candidate.conflictFiles,
   });
 }
 

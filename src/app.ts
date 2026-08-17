@@ -5,6 +5,7 @@ import { Command, Option } from 'commander';
 
 import { RelayError, redact } from './errors.js';
 import { GitHubClient, type MergeStrategy } from './github-client.js';
+import { LandingCoordinator, type LandingResult } from './landing.js';
 import { ProcessRunner } from './process-runner.js';
 import type {
   CloudProvider,
@@ -16,9 +17,16 @@ import { CodexProvider } from './providers/codex.js';
 import { JulesProvider } from './providers/jules.js';
 import { RelayCore } from './relay-core.js';
 import { runRepl } from './repl.js';
-import { StateStore } from './state-store.js';
+import {
+  StateStore,
+  type CandidateRecord,
+  type ProviderAccountInput,
+  type ProviderAccountRecord,
+  type UsageSnapshotInput,
+  type UsageSnapshotRecord,
+} from './state-store.js';
 
-export type RelayApi = Pick<
+type RelayCoreApi = Pick<
   RelayCore,
   | 'doctor'
   | 'initialize'
@@ -33,6 +41,31 @@ export type RelayApi = Pick<
   | 'merge'
 >;
 
+export interface RelayAccountSummary {
+  id: string;
+  label: string;
+  provider: ProviderName;
+  status: ProviderAccountRecord['status'];
+  capacity: number;
+  activeLeaseCount: number;
+  latestUsage: readonly UsageSnapshotRecord[];
+}
+
+export type RelayStatus = Awaited<ReturnType<RelayCore['status']>> & {
+  candidates?: readonly CandidateRecord[];
+};
+
+export type RelayApi = Omit<RelayCoreApi, 'status'> & {
+  addAccount(input: ProviderAccountInput): Promise<ProviderAccountRecord>;
+  accounts(): Promise<readonly RelayAccountSummary[]>;
+  recordUsage(
+    input: Omit<UsageSnapshotInput, 'observedAt'>,
+  ): Promise<UsageSnapshotRecord>;
+  usage(accountId: string): Promise<readonly UsageSnapshotRecord[]>;
+  land(runId: string): Promise<LandingResult>;
+  status(input: Parameters<RelayCore['status']>[0]): Promise<RelayStatus>;
+};
+
 export interface RelayIo {
   cwd(): string;
   write(text: string): void;
@@ -46,7 +79,7 @@ export interface CliOptions {
 }
 
 export interface RelayApplication {
-  core: RelayCore;
+  core: RelayApi;
   close(): void;
 }
 
@@ -69,13 +102,65 @@ export function createRelayApplication(options: {
     ['codex', new CodexProvider(runner, { env })],
     ['jules', new JulesProvider({ apiKey: () => env.JULES_API_KEY })],
   ]);
-  const core = new RelayCore({
+  const github = new GitHubClient(runner, { env });
+  const relayCore = new RelayCore({
     store,
-    github: new GitHubClient(runner, { env }),
+    github,
     providers,
     storePrompts: env.RELAY_STORE_PROMPTS !== 'false',
   });
-  return { core, close: () => store.close() };
+  const landing = new LandingCoordinator({ store, github, runner });
+  return {
+    core: createRelayApi(relayCore, store, landing),
+    close: () => store.close(),
+  };
+}
+
+function createRelayApi(
+  core: RelayCore,
+  store: StateStore,
+  landing: LandingCoordinator,
+): RelayApi {
+  return {
+    doctor: core.doctor.bind(core),
+    initialize: core.initialize.bind(core),
+    delegate: core.delegate.bind(core),
+    send: core.send.bind(core),
+    handoff: core.handoff.bind(core),
+    status: async (input) => {
+      const status = await core.status(input);
+      return {
+        ...status,
+        candidates: status.runs.flatMap((run) => {
+          const candidate = store.getCandidate(run.id);
+          return candidate === undefined ? [] : [candidate];
+        }),
+      };
+    },
+    sessions: core.sessions.bind(core),
+    providers: core.providers.bind(core),
+    reconcile: core.reconcile.bind(core),
+    chat: core.chat.bind(core),
+    merge: core.merge.bind(core),
+    addAccount: async (input) => store.upsertProviderAccount(input),
+    accounts: async () =>
+      store.listProviderAccounts().map((account) => ({
+        id: account.id,
+        label: account.label,
+        provider: account.provider,
+        status: account.status,
+        capacity: account.maxConcurrency,
+        activeLeaseCount: store.countActiveAccountLeases(account.id),
+        latestUsage: store.listLatestUsage(account.id),
+      })),
+    recordUsage: async (input) =>
+      store.recordUsageSnapshot({
+        ...input,
+        observedAt: new Date().toISOString(),
+      }),
+    usage: async (accountId) => store.listLatestUsage(accountId),
+    land: async (runId) => await landing.land(runId),
+  };
 }
 
 export function createCli(
@@ -147,6 +232,8 @@ export function createCli(
     .argument('<task>', 'work to perform')
     .option('--title <title>', 'WorkItem title')
     .option('--work-item <id>', 'existing WorkItem ID')
+    .option('--account <id>', 'provider account ID')
+    .option('--model <model>', 'provider model identifier')
     .addOption(modeOption('write'))
     .option('--json', 'print machine-readable JSON')
     .action(async (providerText: string, task: string, commandOptions) => {
@@ -161,6 +248,12 @@ export function createCli(
         ...(commandOptions.workItem === undefined
           ? {}
           : { workItemId: commandOptions.workItem as string }),
+        ...(commandOptions.account === undefined
+          ? {}
+          : { accountId: commandOptions.account as string }),
+        ...(commandOptions.model === undefined
+          ? {}
+          : { model: commandOptions.model as string }),
       });
       writeResult(io, result, commandOptions.json === true);
     });
@@ -189,6 +282,8 @@ export function createCli(
     .argument('<provider>', 'claude, codex, or jules')
     .argument('<instruction>', 'handoff instruction')
     .option('--work-item <id>', 'WorkItem ID')
+    .option('--account <id>', 'provider account ID')
+    .option('--model <model>', 'provider model identifier')
     .addOption(modeOption('read'))
     .option('--json', 'print machine-readable JSON')
     .action(async (providerText: string, instruction: string, commandOptions) => {
@@ -197,8 +292,94 @@ export function createCli(
         instruction,
         mode: commandOptions.mode as MutationMode,
         ...selector(io, commandOptions.workItem as string | undefined),
+        ...(commandOptions.account === undefined
+          ? {}
+          : { accountId: commandOptions.account as string }),
+        ...(commandOptions.model === undefined
+          ? {}
+          : { model: commandOptions.model as string }),
       });
       writeResult(io, result, commandOptions.json === true);
+    });
+
+  const account = program
+    .command('account')
+    .description('Manage local provider account references');
+  account
+    .command('add')
+    .description('Register a local provider profile reference')
+    .argument('<provider>', 'claude, codex, or jules')
+    .argument('<id>', 'provider account ID')
+    .requiredOption('--label <label>', 'human-readable account label')
+    .requiredOption('--profile <path>', 'local profile reference')
+    .option('--default', 'use this account by default for its provider')
+    .action(async (providerText: string, id: string, commandOptions) => {
+      const saved = await core.addAccount({
+        id,
+        provider: providerName(providerText),
+        label: commandOptions.label as string,
+        profilePath: commandOptions.profile as string,
+        status: 'ready',
+        maxConcurrency: 1,
+        isDefault: commandOptions.default === true,
+      });
+      io.write(`Registered ${saved.label} (${saved.id}).\n`);
+    });
+
+  program
+    .command('accounts')
+    .description('List provider account capacity and weekly usage')
+    .option('--json', 'print machine-readable JSON')
+    .action(async ({ json }: { json?: boolean }) => {
+      const accounts = await core.accounts();
+      if (json === true) return writeJson(io, accounts);
+      for (const entry of accounts) {
+        io.write(
+          `${titleCase(entry.provider)}  ${entry.label}  ${entry.status}  ${entry.activeLeaseCount}/${entry.capacity} active\n`,
+        );
+      }
+    });
+
+  const usage = program
+    .command('usage')
+    .description('Record or inspect caller-supplied weekly usage telemetry')
+    .option('--account <id>', 'provider account ID')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (commandOptions: { account?: string; json?: boolean }) => {
+      if (commandOptions.account === undefined) {
+        throw new RelayError('invalid_argument', '--account is required.');
+      }
+      const snapshots = await core.usage(commandOptions.account);
+      if (commandOptions.json === true) return writeJson(io, snapshots);
+      for (const snapshot of snapshots) {
+        io.write(`${snapshot.model}  ${snapshot.remainingPercent}% remaining\n`);
+      }
+    });
+  usage
+    .command('set')
+    .description('Record a caller-supplied weekly usage snapshot')
+    .argument('<account>', 'provider account ID')
+    .requiredOption('--model <model>', 'provider model identifier')
+    .requiredOption('--remaining-percent <percent>', 'remaining weekly usage percent')
+    .option('--resets-at <timestamp>', 'usage reset time as an ISO timestamp')
+    .action(async (accountId: string, commandOptions) => {
+      const remainingPercent = Number(commandOptions.remainingPercent);
+      if (!Number.isFinite(remainingPercent) || remainingPercent < 0 || remainingPercent > 100) {
+        throw new RelayError(
+          'invalid_argument',
+          '--remaining-percent must be a finite number from 0 through 100.',
+        );
+      }
+      const resetsAt = normalizeIsoTimestamp(commandOptions.resetsAt as string | undefined);
+      await core.recordUsage({
+        accountId,
+        period: 'weekly',
+        model: commandOptions.model as string,
+        remainingPercent,
+        source: 'manual',
+        ...(resetsAt === undefined ? {} : { resetsAt }),
+      });
+      io.write(`Recorded weekly usage for ${accountId}.\n`);
     });
 
   program
@@ -223,6 +404,17 @@ export function createCli(
       for (const session of sessions) {
         io.write(`${titleCase(session.provider)}  ${session.status}\n`);
       }
+    });
+
+  program
+    .command('land')
+    .description('Stage or land a candidate on its WorkItem integration branch; never merges main')
+    .argument('<run-id>', 'candidate run ID')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (runId: string, commandOptions: { json?: boolean }) => {
+      const result = await core.land(runId);
+      if (commandOptions.json === true) return writeJson(io, result);
+      io.write(`${result.runId} — ${result.status}\n`);
     });
 
   program
@@ -420,11 +612,15 @@ function writeStatus(
 ): void {
   io.write(`WorkItem  ${status.workItem.title}\n`);
   io.write(`Branch    ${status.workItem.currentBranch ?? 'not published'}\n`);
+  io.write(`Integration ${status.workItem.integrationBranch}\n`);
   io.write(`SHA       ${status.artifact?.sha ?? 'not published'}\n`);
   io.write(`PR        ${status.artifact?.pullRequest ?? 'none'}\n`);
   io.write(`Checks    ${status.artifact?.checks ?? 'unknown'}\n`);
   for (const session of status.sessions) {
     io.write(`${titleCase(session.provider).padEnd(10)} ${session.status}\n`);
+  }
+  for (const candidate of status.candidates ?? []) {
+    io.write(`Candidate ${candidate.runId}  ${candidate.status}\n`);
   }
 }
 
@@ -459,6 +655,15 @@ function titleCase(value: string): string {
 
 function isYes(value: string | undefined): boolean {
   return value?.trim().toLowerCase() === 'y' || value?.trim().toLowerCase() === 'yes';
+}
+
+function normalizeIsoTimestamp(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    throw new RelayError('invalid_argument', '--resets-at must be a valid ISO timestamp.');
+  }
+  return timestamp.toISOString();
 }
 
 const PROVIDERS = ['claude', 'codex', 'jules'] as const;
