@@ -28,7 +28,8 @@ if (args[0] === 'auth' && args[1] === 'status') {
     process.stderr.write('gh: forbidden (HTTP 403)');
     process.exitCode = 1;
   } else if (
-    scenario === 'missing' ||
+    scenario === 'deleted' ||
+    (scenario === 'missing' && !args[1]?.includes('heads/main')) ||
     (scenario === 'target-missing' && args[1]?.includes('-jules-'))
   ) {
     process.stderr.write('gh: Not Found (HTTP 404)');
@@ -37,6 +38,10 @@ if (args[0] === 'auth' && args[1] === 'status') {
     output({ ref: 'refs/heads/relay/auth', object: { sha, type: 'commit' } });
   }
 } else if (args[0] === 'pr' && args[1] === 'list') {
+  if (scenario === 'no-pr') {
+    output([]);
+    process.exit();
+  }
   const requestedHead = args[args.indexOf('--head') + 1] ?? 'relay/auth';
   output([
     {

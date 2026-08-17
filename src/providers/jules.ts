@@ -95,6 +95,8 @@ export class JulesProvider implements CloudProvider {
       publishPullRequest: true,
       cancel: false,
       subscriptionAuth: false,
+      selectModel: false,
+      profileIsolation: false,
     };
   }
 

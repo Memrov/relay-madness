@@ -5,6 +5,13 @@ const args = process.argv.slice(2);
 const scenario = process.env.FAKE_CLAUDE_SCENARIO ?? 'start';
 const log = process.env.FAKE_COMMAND_LOG;
 if (log) appendFileSync(log, `${JSON.stringify(args)}\n`);
+const environmentLog = process.env.FAKE_ENVIRONMENT_LOG;
+if (environmentLog) {
+  appendFileSync(
+    environmentLog,
+    `${JSON.stringify({ CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR })}\n`,
+  );
+}
 
 if (args[0] === 'auth' && args[1] === 'status') {
   process.stdout.write(JSON.stringify({
@@ -16,7 +23,7 @@ if (args[0] === 'auth' && args[1] === 'status') {
   process.stdout.write('2.1.217 (Claude Code)');
 } else if (args[0] === '--help') {
   process.stdout.write('--cloud Start or attach to an existing cloud session');
-} else if (args[0] === '--cloud' && args.length === 2) {
+} else if (args.includes('--cloud') && !args.includes('-p')) {
   if (scenario === 'malformed') {
     process.stdout.write('cloud session launched');
   } else if (scenario === 'attach') {

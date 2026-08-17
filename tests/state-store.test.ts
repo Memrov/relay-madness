@@ -353,9 +353,13 @@ test('applies ordered schema migrations', () => {
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3],
+    [1, 2, 3, 4],
   );
   assert.ok(runColumns.some(({ name }) => name === 'baseline_sha'));
+  assert.ok(runColumns.some(({ name }) => name === 'account_id'));
+  assert.ok(runColumns.some(({ name }) => name === 'model'));
+  assert.ok(runColumns.some(({ name }) => name === 'base_sha'));
+  assert.ok(runColumns.some(({ name }) => name === 'result_sha'));
   assert.ok(
     artifactColumns.some(({ name }) => name === 'verification_status'),
   );
@@ -388,6 +392,56 @@ test('stores only a provider profile reference and selects one explicit default'
   assert.equal(
     store.listProviderAccounts('codex').filter((item) => item.isDefault).length,
     1,
+  );
+  store.close();
+});
+
+test('keeps identical provider session IDs isolated by account', () => {
+  const store = openStore();
+  const { project } = seed(store);
+  const workItem = store.getCurrentWorkItem(project.id)!;
+  store.upsertProviderAccount({
+    id: 'claude-a',
+    provider: 'claude',
+    label: 'Claude A',
+    profilePath: '/profiles/claude-a',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+  store.upsertProviderAccount({
+    id: 'claude-b',
+    provider: 'claude',
+    label: 'Claude B',
+    profilePath: '/profiles/claude-b',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+
+  const first = store.upsertSession({
+    workItemId: workItem.id,
+    provider: 'claude',
+    accountId: 'claude-a',
+    providerSessionId: 'shared-session',
+    status: 'active',
+  });
+  const second = store.upsertSession({
+    workItemId: workItem.id,
+    provider: 'claude',
+    accountId: 'claude-b',
+    providerSessionId: 'shared-session',
+    status: 'active',
+  });
+
+  assert.notEqual(first.id, second.id);
+  assert.equal(
+    store.getSession(workItem.id, 'claude', 'claude-a')?.id,
+    first.id,
+  );
+  assert.equal(
+    store.getSession(workItem.id, 'claude', 'claude-b')?.id,
+    second.id,
   );
   store.close();
 });

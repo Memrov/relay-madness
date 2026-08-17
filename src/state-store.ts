@@ -91,6 +91,7 @@ export interface WorkItemRecord {
 export interface SessionInput {
   workItemId: string;
   provider: ProviderName;
+  accountId?: string;
   providerSessionId: string;
   providerUrl?: string;
   status: 'pending' | 'active' | 'complete' | 'failed' | 'expired';
@@ -110,6 +111,7 @@ export type RunType =
   | 'publication';
 
 export interface RunInput {
+  id?: string;
   sessionId: string;
   provider: ProviderName;
   type: RunType;
@@ -122,6 +124,10 @@ export interface RunInput {
   expectedBranch?: string;
   baselineSha?: string;
   pinnedSha?: string;
+  accountId?: string;
+  model?: string;
+  baseSha?: string;
+  resultSha?: string;
 }
 
 export interface RunRecord extends RunInput {
@@ -606,42 +612,76 @@ export class StateStore {
         this.database
           .prepare(
             `UPDATE provider_sessions SET status = 'expired'
-             WHERE work_item_id = ? AND provider = ?
+             WHERE work_item_id = ? AND provider = ? AND account_id IS ?
                AND provider_session_id <> ? AND status = 'active'`,
           )
-          .run(input.workItemId, input.provider, input.providerSessionId);
+          .run(
+            input.workItemId,
+            input.provider,
+            input.accountId ?? null,
+            input.providerSessionId,
+          );
       }
-      this.database
+      const existing = this.database
         .prepare(
-          `INSERT INTO provider_sessions (
-            id, work_item_id, provider, provider_session_id, provider_url,
-            status, branch, last_activity_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(work_item_id, provider, provider_session_id) DO UPDATE SET
-            provider_url = excluded.provider_url,
-            status = excluded.status,
-            branch = excluded.branch,
-            last_activity_at = excluded.last_activity_at`,
+          `SELECT id FROM provider_sessions
+           WHERE work_item_id = ? AND provider = ? AND account_id IS ?
+             AND provider_session_id = ?`,
         )
-        .run(
-          randomUUID(),
+        .get(
           input.workItemId,
           input.provider,
+          input.accountId ?? null,
           input.providerSessionId,
-          input.providerUrl ?? null,
-          input.status,
-          input.branch ?? null,
-          now,
-        );
+        ) as SqlRow | undefined;
+      if (existing === undefined) {
+        this.database
+          .prepare(
+            `INSERT INTO provider_sessions (
+              id, work_item_id, provider, account_id, provider_session_id, provider_url,
+              status, branch, last_activity_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            randomUUID(),
+            input.workItemId,
+            input.provider,
+            input.accountId ?? null,
+            input.providerSessionId,
+            input.providerUrl ?? null,
+            input.status,
+            input.branch ?? null,
+            now,
+          );
+      } else {
+        this.database
+          .prepare(
+            `UPDATE provider_sessions SET provider_url = ?, status = ?, branch = ?,
+             last_activity_at = ? WHERE id = ?`,
+          )
+          .run(
+            input.providerUrl ?? null,
+            input.status,
+            input.branch ?? null,
+            now,
+            existing.id,
+          );
+      }
     })();
     return this.sessionFromRow(
       this.requiredRow(
         this.database
           .prepare(
             `SELECT * FROM provider_sessions
-             WHERE work_item_id = ? AND provider = ? AND provider_session_id = ?`,
+             WHERE work_item_id = ? AND provider = ? AND account_id IS ?
+               AND provider_session_id = ?`,
           )
-          .get(input.workItemId, input.provider, input.providerSessionId),
+          .get(
+            input.workItemId,
+            input.provider,
+            input.accountId ?? null,
+            input.providerSessionId,
+          ),
         `Session for ${input.provider} was not persisted.`,
       ),
     );
@@ -650,17 +690,19 @@ export class StateStore {
   getSession(
     workItemId: string,
     provider: ProviderName,
+    accountId?: string,
   ): SessionRecord | undefined {
     const row = this.database
       .prepare(
         `SELECT * FROM provider_sessions WHERE work_item_id = ? AND provider = ?
+           AND account_id IS ?
          ORDER BY CASE status
            WHEN 'active' THEN 0
            WHEN 'pending' THEN 1
            ELSE 2
          END, last_activity_at DESC, rowid DESC LIMIT 1`,
       )
-      .get(workItemId, provider) as SqlRow | undefined;
+      .get(workItemId, provider, accountId ?? null) as SqlRow | undefined;
     return row === undefined ? undefined : this.sessionFromRow(row);
   }
 
@@ -676,7 +718,7 @@ export class StateStore {
     return this.database.transaction(() => {
       const current = this.requiredRow(
         this.database
-          .prepare('SELECT work_item_id, provider FROM provider_sessions WHERE id = ?')
+        .prepare('SELECT work_item_id, provider, account_id FROM provider_sessions WHERE id = ?')
           .get(id),
         `Session ${id} was not found.`,
       );
@@ -685,10 +727,10 @@ export class StateStore {
         this.database
           .prepare(
             `UPDATE provider_sessions SET status = 'expired'
-             WHERE work_item_id = ? AND provider = ? AND id <> ?
+             WHERE work_item_id = ? AND provider = ? AND account_id IS ? AND id <> ?
                AND status = 'active'`,
           )
-          .run(current.work_item_id, current.provider, id);
+          .run(current.work_item_id, current.provider, current.account_id, id);
       }
       this.database
         .prepare(
@@ -755,7 +797,7 @@ export class StateStore {
         }
       }
 
-      const id = randomUUID();
+      const id = input.id ?? randomUUID();
       const now = new Date().toISOString();
       const correlationId = input.correlationId ?? id;
       this.database
@@ -763,8 +805,9 @@ export class StateStore {
           `INSERT INTO provider_runs (
             id, session_id, work_item_id, provider, type, prompt, status,
             mutation_mode, correlation_id, origin_provider, delegation_depth,
-            parent_run_id, expected_branch, baseline_sha, pinned_sha, started_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            parent_run_id, expected_branch, baseline_sha, pinned_sha, account_id,
+            model, base_sha, result_sha, started_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -781,6 +824,10 @@ export class StateStore {
           input.expectedBranch ?? null,
           input.baselineSha ?? null,
           input.pinnedSha ?? null,
+          input.accountId ?? null,
+          input.model ?? null,
+          input.baseSha ?? null,
+          input.resultSha ?? null,
           now,
         );
       return this.getRun(id);
@@ -806,6 +853,19 @@ export class StateStore {
         .run(status, finishedAt, id);
       return this.getRun(id);
     })();
+  }
+
+  setRunResultSha(id: string, resultSha: string): RunRecord {
+    if (!/^[0-9a-f]{40}$/i.test(resultSha)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Run result SHA must contain exactly 40 hexadecimal characters.',
+      );
+    }
+    this.database
+      .prepare('UPDATE provider_runs SET result_sha = ? WHERE id = ?')
+      .run(resultSha, id);
+    return this.getRun(id);
   }
 
   countRuns(workItemId: string): number {
@@ -1119,6 +1179,40 @@ export class StateStore {
         this.recordMigration(3);
       }).immediate();
     }
+    if (!applied.has(4)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          CREATE TABLE provider_sessions_scoped (
+            id TEXT PRIMARY KEY,
+            work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            account_id TEXT REFERENCES provider_accounts(id),
+            provider_session_id TEXT NOT NULL,
+            provider_url TEXT,
+            status TEXT NOT NULL,
+            branch TEXT,
+            last_activity_at TEXT NOT NULL,
+            UNIQUE (work_item_id, provider, account_id, provider_session_id)
+          );
+          INSERT INTO provider_sessions_scoped (
+            id, work_item_id, provider, provider_session_id, provider_url,
+            status, branch, last_activity_at
+          )
+          SELECT id, work_item_id, provider, provider_session_id, provider_url,
+                 status, branch, last_activity_at
+          FROM provider_sessions;
+          DROP TABLE provider_sessions;
+          ALTER TABLE provider_sessions_scoped RENAME TO provider_sessions;
+          ALTER TABLE provider_runs ADD COLUMN account_id TEXT REFERENCES provider_accounts(id);
+          ALTER TABLE provider_runs ADD COLUMN model TEXT;
+          ALTER TABLE provider_runs ADD COLUMN base_sha TEXT;
+          ALTER TABLE provider_runs ADD COLUMN result_sha TEXT;
+          CREATE INDEX provider_sessions_account_scope
+            ON provider_sessions(work_item_id, provider, account_id, last_activity_at);
+        `);
+        this.recordMigration(4);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -1241,6 +1335,7 @@ export class StateStore {
       lastActivityAt: String(row.last_activity_at),
     };
     if (row.provider_url !== null) record.providerUrl = String(row.provider_url);
+    if (row.account_id !== null) record.accountId = String(row.account_id);
     if (row.branch !== null) record.branch = String(row.branch);
     return record;
   }
@@ -1268,6 +1363,10 @@ export class StateStore {
     }
     if (row.baseline_sha !== null) record.baselineSha = String(row.baseline_sha);
     if (row.pinned_sha !== null) record.pinnedSha = String(row.pinned_sha);
+    if (row.account_id !== null) record.accountId = String(row.account_id);
+    if (row.model !== null) record.model = String(row.model);
+    if (row.base_sha !== null) record.baseSha = String(row.base_sha);
+    if (row.result_sha !== null) record.resultSha = String(row.result_sha);
     if (row.finished_at !== null) record.finishedAt = String(row.finished_at);
     return record;
   }

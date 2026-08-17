@@ -230,5 +230,7 @@ test('reports the documented Jules capabilities', async () => {
     publishPullRequest: true,
     cancel: false,
     subscriptionAuth: false,
+    selectModel: false,
+    profileIsolation: false,
   });
 });

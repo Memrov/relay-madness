@@ -20,10 +20,12 @@ function codexForScenario(scenario: string) {
   const root = mkdtempSync(join(tmpdir(), 'relay-codex-test-'));
   roots.push(root);
   const commandLog = join(root, 'commands.jsonl');
+  const environmentLog = join(root, 'environment.jsonl');
   const env = {
     PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
     FAKE_CODEX_SCENARIO: scenario,
     FAKE_COMMAND_LOG: commandLog,
+    FAKE_ENVIRONMENT_LOG: environmentLog,
   };
   return {
     provider: new CodexProvider(new ProcessRunner(), { env }),
@@ -34,6 +36,12 @@ function codexForScenario(scenario: string) {
         .split('\n')
         .filter(Boolean)
         .map((line) => JSON.parse(line) as string[]),
+    readEnvironments: () =>
+      readFileSync(environmentLog, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { CODEX_HOME?: string }),
   };
 }
 
@@ -68,6 +76,33 @@ test('submits a cloud task to the configured environment and branch', async () =
     'relay/auth',
     'Review auth',
   ]);
+});
+
+test('runs Codex with the selected account home and requested cloud model', async () => {
+  const { provider, cwd, readCommands, readEnvironments } = codexForScenario('exec');
+
+  await provider.start({
+    prompt: 'Build it',
+    cwd,
+    mode: 'write',
+    branch: 'main',
+    environmentId: 'env-1',
+    profilePath: '/profiles/codex-a',
+    model: 'gpt-5.6-sol',
+  });
+
+  assert.deepEqual(readCommands()[0], [
+    'cloud',
+    'exec',
+    '--env',
+    'env-1',
+    '-c',
+    'model="gpt-5.6-sol"',
+    '--branch',
+    'main',
+    'Build it',
+  ]);
+  assert.equal(readEnvironments()[0]?.CODEX_HOME, '/profiles/codex-a');
 });
 
 test('inspects task status from cloud list JSON', async () => {

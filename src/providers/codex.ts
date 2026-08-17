@@ -59,6 +59,8 @@ export class CodexProvider implements CloudProvider {
       publishPullRequest: false,
       cancel: false,
       subscriptionAuth: true,
+      selectModel: available,
+      profileIsolation: available,
     };
   }
 
@@ -93,13 +95,14 @@ export class CodexProvider implements CloudProvider {
   async start(input: StartRunInput): Promise<ProviderExecution> {
     const environmentId = requireEnvironment(input.environmentId);
     const args = ['cloud', 'exec', '--env', environmentId];
+    if (input.model !== undefined) args.push('-c', `model="${validatedModel(input.model)}"`);
     if (input.branch !== undefined) args.push('--branch', input.branch);
     args.push(input.prompt);
 
     const result = await this.runner.run(
       'codex',
       args,
-      this.runOptions(input.cwd),
+      this.runOptions(input.cwd, input.profilePath),
     );
     return parseSubmission(result.stdout);
   }
@@ -116,7 +119,7 @@ export class CodexProvider implements CloudProvider {
     const result = await this.runner.run(
       'codex',
       ['cloud', 'list', '--env', environmentId, '--json', '--limit', '20'],
-      this.runOptions(),
+      this.runOptions(undefined, input.profilePath),
     );
     const tasks = parseTaskList(result.stdout);
     const task = tasks.find((candidate) => candidate.id === input.providerSessionId);
@@ -137,7 +140,7 @@ export class CodexProvider implements CloudProvider {
     return await this.runner.spawnInteractive(
       'codex',
       ['cloud'],
-      this.interactiveOptions(input.cwd),
+      this.interactiveOptions(input.cwd, input.profilePath),
     );
   }
 
@@ -150,19 +153,29 @@ export class CodexProvider implements CloudProvider {
     }
   }
 
-  private runOptions(cwd?: string): RunOptions {
+  private runOptions(cwd?: string, profilePath?: string): RunOptions {
     const options: RunOptions = {};
     if (cwd !== undefined) options.cwd = cwd;
-    if (this.options.env !== undefined) options.env = this.options.env;
+    if (this.options.env !== undefined || profilePath !== undefined) {
+      options.env = {
+        ...this.options.env,
+        ...(profilePath === undefined ? {} : { CODEX_HOME: profilePath }),
+      };
+    }
     if (this.options.timeoutMs !== undefined) {
       options.timeoutMs = this.options.timeoutMs;
     }
     return options;
   }
 
-  private interactiveOptions(cwd: string) {
+  private interactiveOptions(cwd: string, profilePath?: string) {
     const options: { cwd: string; env?: NodeJS.ProcessEnv } = { cwd };
-    if (this.options.env !== undefined) options.env = this.options.env;
+    if (this.options.env !== undefined || profilePath !== undefined) {
+      options.env = {
+        ...this.options.env,
+        ...(profilePath === undefined ? {} : { CODEX_HOME: profilePath }),
+      };
+    }
     return options;
   }
 }
@@ -175,6 +188,16 @@ function requireEnvironment(environmentId: string | undefined): string {
     );
   }
   return environmentId;
+}
+
+function validatedModel(model: string): string {
+  if (!/^[A-Za-z0-9._:-]+$/.test(model)) {
+    throw new RelayError(
+      'invalid_argument',
+      'Codex model names may contain only letters, numbers, dots, underscores, colons, and hyphens.',
+    );
+  }
+  return model;
 }
 
 function parseSubmission(output: string): ProviderExecution {

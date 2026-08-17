@@ -56,6 +56,8 @@ export class ClaudeProvider implements CloudProvider {
       publishPullRequest: false,
       cancel: false,
       subscriptionAuth: true,
+      selectModel: available,
+      profileIsolation: available,
     };
   }
 
@@ -95,8 +97,12 @@ export class ClaudeProvider implements CloudProvider {
   async start(input: StartRunInput): Promise<ProviderExecution> {
     const result = await this.runner.run(
       'claude',
-      ['--cloud', input.prompt],
-      this.runOptions(input.cwd),
+      [
+        ...(input.model === undefined ? [] : ['--model', input.model]),
+        '--cloud',
+        input.prompt,
+      ],
+      this.runOptions(input.cwd, input.profilePath),
     );
     return parseClaudeExecution(result.stdout);
   }
@@ -105,6 +111,7 @@ export class ClaudeProvider implements CloudProvider {
     const result = await this.runner.run(
       'claude',
       [
+        ...(input.model === undefined ? [] : ['--model', input.model]),
         '-p',
         input.message,
         '--cloud',
@@ -112,7 +119,7 @@ export class ClaudeProvider implements CloudProvider {
         '--output-format',
         'json',
       ],
-      this.runOptions(input.cwd),
+      this.runOptions(input.cwd, input.profilePath),
     );
     return parseClaudeExecution(result.stdout);
   }
@@ -121,7 +128,7 @@ export class ClaudeProvider implements CloudProvider {
     return await this.runner.spawnInteractive(
       'claude',
       ['--cloud', input.providerSessionId],
-      this.interactiveOptions(input.cwd),
+      this.interactiveOptions(input.cwd, input.profilePath),
     );
   }
 
@@ -133,19 +140,29 @@ export class ClaudeProvider implements CloudProvider {
     }
   }
 
-  private runOptions(cwd?: string): RunOptions {
+  private runOptions(cwd?: string, profilePath?: string): RunOptions {
     const options: RunOptions = {};
     if (cwd !== undefined) options.cwd = cwd;
-    if (this.options.env !== undefined) options.env = this.options.env;
+    if (this.options.env !== undefined || profilePath !== undefined) {
+      options.env = {
+        ...this.options.env,
+        ...(profilePath === undefined ? {} : { CLAUDE_CONFIG_DIR: profilePath }),
+      };
+    }
     if (this.options.timeoutMs !== undefined) {
       options.timeoutMs = this.options.timeoutMs;
     }
     return options;
   }
 
-  private interactiveOptions(cwd: string) {
+  private interactiveOptions(cwd: string, profilePath?: string) {
     const options: { cwd: string; env?: NodeJS.ProcessEnv } = { cwd };
-    if (this.options.env !== undefined) options.env = this.options.env;
+    if (this.options.env !== undefined || profilePath !== undefined) {
+      options.env = {
+        ...this.options.env,
+        ...(profilePath === undefined ? {} : { CLAUDE_CONFIG_DIR: profilePath }),
+      };
+    }
     return options;
   }
 }

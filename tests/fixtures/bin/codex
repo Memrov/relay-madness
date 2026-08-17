@@ -5,6 +5,10 @@ const args = process.argv.slice(2);
 const scenario = process.env.FAKE_CODEX_SCENARIO ?? 'exec';
 const log = process.env.FAKE_COMMAND_LOG;
 if (log) appendFileSync(log, `${JSON.stringify(args)}\n`);
+const environmentLog = process.env.FAKE_ENVIRONMENT_LOG;
+if (environmentLog) {
+  appendFileSync(environmentLog, `${JSON.stringify({ CODEX_HOME: process.env.CODEX_HOME })}\n`);
+}
 
 if (args[0] === 'login' && args[1] === 'status') {
   if (scenario === 'logged-out') {

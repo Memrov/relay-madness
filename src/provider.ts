@@ -23,6 +23,8 @@ export interface ProviderCapabilities {
   publishPullRequest: boolean;
   cancel: boolean;
   subscriptionAuth: boolean;
+  selectModel: boolean;
+  profileIsolation: boolean;
 }
 
 export interface AuthStatus {
@@ -40,6 +42,8 @@ export interface StartRunInput {
   repo?: string;
   source?: string;
   title?: string;
+  profilePath?: string;
+  model?: string;
 }
 
 export interface SendRunInput {
@@ -47,16 +51,22 @@ export interface SendRunInput {
   message: string;
   cwd: string;
   environmentId?: string;
+  profilePath?: string;
+  model?: string;
 }
 
 export interface InspectRunInput {
   providerSessionId: string;
   environmentId?: string;
+  profilePath?: string;
+  model?: string;
 }
 
 export interface AttachInput {
   providerSessionId: string;
   cwd: string;
+  profilePath?: string;
+  model?: string;
 }
 
 export interface ProviderArtifact {

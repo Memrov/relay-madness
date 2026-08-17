@@ -20,10 +20,12 @@ function claudeForScenario(scenario: string) {
   const root = mkdtempSync(join(tmpdir(), 'relay-claude-test-'));
   roots.push(root);
   const commandLog = join(root, 'commands.jsonl');
+  const environmentLog = join(root, 'environment.jsonl');
   const env = {
     PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
     FAKE_CLAUDE_SCENARIO: scenario,
     FAKE_COMMAND_LOG: commandLog,
+    FAKE_ENVIRONMENT_LOG: environmentLog,
   };
   const readCommands = () =>
     readFileSync(commandLog, 'utf8')
@@ -31,10 +33,17 @@ function claudeForScenario(scenario: string) {
       .split('\n')
       .filter(Boolean)
       .map((line) => JSON.parse(line) as string[]);
+  const readEnvironments = () =>
+    readFileSync(environmentLog, 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { CLAUDE_CONFIG_DIR?: string });
   return {
     provider: new ClaudeProvider(new ProcessRunner(), { env }),
     cwd: root,
     readCommands,
+    readEnvironments,
   };
 }
 
@@ -60,6 +69,21 @@ test('starts a Claude cloud session and parses its documented URL', async () => 
     status: 'running',
   });
   assert.deepEqual(readCommands()[0], ['--cloud', 'Implement auth']);
+});
+
+test('runs Claude with the selected config directory and model', async () => {
+  const { provider, cwd, readCommands, readEnvironments } = claudeForScenario('start');
+
+  await provider.start({
+    prompt: 'Build it',
+    cwd,
+    mode: 'write',
+    profilePath: '/profiles/claude-a',
+    model: 'opus',
+  });
+
+  assert.equal(readEnvironments()[0]?.CLAUDE_CONFIG_DIR, '/profiles/claude-a');
+  assert.ok(readCommands()[0]?.includes('--model'));
 });
 
 test('sends a follow-up to the existing session', async () => {
