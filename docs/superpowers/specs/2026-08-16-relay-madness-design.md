@@ -101,7 +101,7 @@ A ProviderSession records a provider’s logical session or task identity. It do
 
 ### ProviderRun
 
-A ProviderRun records one message, delegation, handoff, inspection, or publication attempt. Every run receives a Relay-generated correlation ID, parent run ID, origin, delegation depth, deadline, and mutation mode.
+A ProviderRun records one message, delegation, handoff, inspection, or publication attempt. Every run receives a Relay-generated correlation ID, optional parent run ID, origin, delegation depth, and mutation mode.
 
 Callers may not override Relay-generated lineage fields.
 
@@ -146,7 +146,7 @@ interface CloudProvider {
 }
 ```
 
-Capabilities are probed at runtime and cached briefly. The schema distinguishes `start`, `structuredStart`, `queueFollowup`, `interactiveAttach`, `structuredStatus`, `events`, `selectBranch`, `publishPullRequest`, `cancel`, and `subscriptionAuth`.
+Capabilities are probed at runtime. The schema distinguishes `start`, `structuredStart`, `queueFollowup`, `interactiveAttach`, `structuredStatus`, `events`, `selectBranch`, `publishPullRequest`, `cancel`, and `subscriptionAuth`.
 
 Higher-level code checks capabilities before selecting a path. An unsupported operation returns a typed `capability_unavailable` result; Relay does not emulate undocumented provider behavior.
 
@@ -162,7 +162,7 @@ The Jules adapter uses the official REST API for session creation, follow-up mes
 
 ### Codex adapter
 
-The Codex adapter invokes the authenticated `codex` CLI. It supports cloud task submission, listing, status inspection, and diff retrieval using a stored project environment ID. Programmatic follow-up is reported unavailable until OpenAI publishes a stable command or API. `relay chat codex` launches the native cloud interface as the interactive escape hatch.
+The Codex adapter invokes the authenticated `codex` CLI. It supports cloud task submission, listing, and status inspection using a stored project environment ID. Programmatic follow-up is reported unavailable until OpenAI publishes a stable command or API. `relay chat codex` launches the native cloud interface as the interactive escape hatch.
 
 ## Handoffs
 
@@ -219,7 +219,7 @@ SQLite is the only Relay-owned durable store. The database contains:
 
 Foreign keys are enabled. Mutating state transitions run in transactions. The database and containing directory are created with user-only permissions.
 
-Prompts are stored only when the user has not enabled `privacy.storePrompts=false`. Provider credentials, environment variables containing credentials, raw process environments, and authentication output are never stored. Diagnostic output redacts values whose keys match token, secret, key, authorization, or credential patterns.
+Prompts are stored unless Relay was launched with `RELAY_STORE_PROMPTS=false`. Provider credentials, environment variables containing credentials, raw process environments, and authentication output are never stored. Diagnostic output redacts values whose keys match token, secret, key, authorization, or credential patterns.
 
 ## Recursion and resource controls
 
@@ -229,7 +229,7 @@ Relay owns delegation lineage and enforces these defaults:
 - maximum active mutating runs per WorkItem: 1;
 - maximum active read-only runs per WorkItem: 3;
 - maximum total runs per WorkItem: 20;
-- default run deadline: 60 minutes;
+- abandoned mutation lease reclamation: 60 minutes;
 - explicit repository and provider membership in the Project.
 
 Provider cloud environments do not receive Relay bridge credentials. A delegated provider therefore cannot silently call back into Relay unless a future, explicitly configured deployment grants that capability.
@@ -251,7 +251,7 @@ The first release does not expose `relay_merge` through MCP and does not expose 
 
 Errors cross boundaries as typed Relay errors with a stable code, actionable message, and optional redacted cause. The CLI maps them to nonzero exit codes and concise terminal output. MCP maps them to structured tool errors.
 
-Provider subprocesses have explicit deadlines, preserve stdout and stderr separately, and include the executable plus argument names in diagnostics without printing prompts or credentials. Malformed provider output is retained only in redacted debug logs when debug logging is enabled.
+Provider subprocesses support explicit deadlines, preserve stdout and stderr separately, and report typed failures. Structured output is schema-validated, and diagnostic objects redact credential-shaped keys.
 
 Reconciliation failures do not discard provider results. They leave the run in `provider_complete`, `awaiting_publish`, or `published` with a recorded reason so the user can recover.
 

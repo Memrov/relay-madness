@@ -3,6 +3,41 @@
   "version": "0.1.0",
   "description": "A thin universal relay for provider-hosted coding agents, with GitHub as artifact truth.",
   "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Memrov/relay-madness.git"
+  },
+  "homepage": "https://github.com/Memrov/relay-madness#readme",
+  "bugs": {
+    "url": "https://github.com/Memrov/relay-madness/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "mcp",
+    "claude",
+    "codex",
+    "jules",
+    "github"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "main": "./dist/app.js",
+  "types": "./dist/app.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/app.d.ts",
+      "import": "./dist/app.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
+    }
+  },
   "bin": {
     "relay": "dist/cli.js"
   },
@@ -13,7 +48,8 @@
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "verify": "npm run check && npm test && npm run build"
+    "verify": "npm run check && npm test && npm run build",
+    "prepack": "npm run verify"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
