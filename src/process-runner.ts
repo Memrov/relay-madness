@@ -115,6 +115,7 @@ export class ProcessRunner {
               command,
               exitCode: code,
               signal,
+              stdout,
               stderr,
             }),
           );
