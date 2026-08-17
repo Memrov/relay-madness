@@ -90,15 +90,14 @@ Relay tells providers which isolated `relay/run/...` branch to use and verifies 
 
 ### Claude
 
-Install and authenticate Claude Code, then make sure the installed version exposes cloud sessions. Relay starts with `claude --cloud`, continues with the same opaque session ID, and uses the native cloud interface for attachment when supported.
+Install and authenticate Claude Code, then make sure the installed version exposes cloud sessions. Relay starts with `claude --cloud` through a captured pseudo-terminal because current Claude releases reject cloud submission over ordinary pipes. Relay stores the opaque `session_...` or `cse_...` ID and canonical `claude.ai/code` URL returned by the CLI.
 
 ```sh
 claude
 relay doctor
 ```
 
-Cloud CLI behavior is capability-probed because Anthropic rolls features out independently.
-Claude cloud starts, follow-ups, and attachment are read-only in Relay until the CLI exposes exact result-branch publication.
+Cloud CLI behavior is capability-probed because Anthropic rolls features out independently. Relay continues an existing cloud session with Anthropic's documented queue-and-exit form, `claude -p "..." --cloud <session-id> --output-format json`. This is distinct from `claude -p --resume`, which resumes a CLI-local transcript rather than a Claude Code on the web session. Interactive `claude --cloud <session-id>` attachment remains disabled unless Relay can verify the account-level entitlement; queue-and-exit follow-up does not depend on that rollout. Claude cloud remains read-only in Relay until the provider exposes exact result-branch publication.
 
 ### Codex
 
@@ -200,7 +199,6 @@ relay codex "Look for security regressions"
 relay jules "Identify missing edge-case tests" --mode read
 relay sessions --json
 relay providers --json
-relay chat claude
 ```
 
 Running `relay` opens the plain REPL:

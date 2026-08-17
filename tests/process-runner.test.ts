@@ -29,6 +29,21 @@ test('passes shell metacharacters as literal arguments', async () => {
   assert.equal(result.stdout, marker);
 });
 
+test('captures a pseudo-terminal command without evaluating literal arguments', async () => {
+  const marker = '$(printf unsafe);`printf unsafe`;single\'quote';
+  const result = await new ProcessRunner().run(
+    process.execPath,
+    [
+      '-e',
+      'process.stdout.write(`${String(process.stdout.isTTY)}:${process.argv[1]}`)',
+      marker,
+    ],
+    { pty: true },
+  );
+
+  assert.equal(result.stdout.trim(), `true:${marker}`);
+});
+
 test('kills a command after its deadline', async () => {
   await assert.rejects(
     new ProcessRunner().run(

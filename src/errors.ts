@@ -17,6 +17,7 @@ export type RelayErrorCode =
   | 'process_timeout'
   | 'provider_mismatch'
   | 'provider_output_invalid'
+  | 'provider_rejected'
   | 'remote_request_failed'
   | 'run_budget_exceeded'
   | 'state_conflict'

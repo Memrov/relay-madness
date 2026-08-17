@@ -2,7 +2,6 @@ import * as z from 'zod/v4';
 
 import { RelayError } from '../errors.js';
 import type {
-  AttachInput,
   AuthStatus,
   CloudProvider,
   ProviderCapabilities,
@@ -18,12 +17,19 @@ const authSchema = z.object({
   apiProvider: z.string().optional(),
 });
 
-const executionSchema = z.object({
-  ok: z.boolean().optional(),
-  session_id: z.string().min(1).optional(),
-  sessionId: z.string().min(1).optional(),
-  url: z.url().optional(),
+const followupSchema = z.object({
+  ok: z.literal(true),
+  session_id: z.string().min(1),
+  url: z.url(),
 });
+
+const rejectionSchema = z.object({
+  ok: z.literal(false),
+  session_id: z.string().min(1),
+  error: z.string().min(1),
+});
+
+const CLAUDE_SESSION_ID = /^(?:session_|cse_)[A-Za-z0-9_-]{1,184}$/;
 
 interface ClaudeProviderOptions {
   env?: NodeJS.ProcessEnv;
@@ -46,7 +52,7 @@ export class ClaudeProvider implements CloudProvider {
     const available = version !== undefined;
     const helpText = help ?? '';
     const cloud = available && /(?:^|\s)--cloud(?:\s|$)/m.test(helpText);
-    const followup =
+    const queueFollowup =
       cloud &&
       /(?:^|\s)(?:-p|--print)(?:[\s,]|$)/m.test(helpText) &&
       /(?:^|\s)--output-format(?:\s|$)/m.test(helpText);
@@ -55,9 +61,8 @@ export class ClaudeProvider implements CloudProvider {
     return {
       start: cloud,
       structuredStart: false,
-      queueFollowup: followup,
-      interactiveAttach:
-        cloud && /attach to an existing cloud session/i.test(helpText),
+      queueFollowup,
+      interactiveAttach: false,
       structuredStatus: false,
       events: false,
       selectBranch: false,
@@ -111,34 +116,33 @@ export class ClaudeProvider implements CloudProvider {
         '--cloud',
         input.prompt,
       ],
-      this.runOptions(input.cwd, input.profilePath),
+      this.runOptions(input.cwd, input.profilePath, true),
     );
     return parseClaudeExecution(result.stdout);
   }
 
   async send(input: SendRunInput): Promise<ProviderExecution> {
-    const result = await this.runner.run(
-      'claude',
-      [
-        ...(input.model === undefined ? [] : ['--model', input.model]),
-        '-p',
-        input.message,
-        '--cloud',
-        input.providerSessionId,
-        '--output-format',
-        'json',
-      ],
-      this.runOptions(input.cwd, input.profilePath),
-    );
-    return parseClaudeExecution(result.stdout);
-  }
-
-  async attach(input: AttachInput): Promise<number> {
-    return await this.runner.spawnInteractive(
-      'claude',
-      ['--cloud', input.providerSessionId],
-      this.interactiveOptions(input.cwd, input.profilePath),
-    );
+    validateClaudeSessionId(input.providerSessionId);
+    try {
+      const result = await this.runner.run(
+        'claude',
+        [
+          ...(input.model === undefined ? [] : ['--model', input.model]),
+          '-p',
+          input.message,
+          '--cloud',
+          input.providerSessionId,
+          '--output-format',
+          'json',
+        ],
+        this.runOptions(input.cwd, input.profilePath),
+      );
+      return parseClaudeFollowup(result.stdout, input.providerSessionId);
+    } catch (error) {
+      const rejection = parseClaudeRejection(error, input.providerSessionId);
+      if (rejection !== undefined) throw rejection;
+      throw error;
+    }
   }
 
   private async probe(args: readonly string[]): Promise<string | undefined> {
@@ -149,7 +153,11 @@ export class ClaudeProvider implements CloudProvider {
     }
   }
 
-  private runOptions(cwd?: string, profilePath?: string): RunOptions {
+  private runOptions(
+    cwd?: string,
+    profilePath?: string,
+    pty = false,
+  ): RunOptions {
     const options: RunOptions = {};
     if (cwd !== undefined) options.cwd = cwd;
     if (this.options.env !== undefined || profilePath !== undefined) {
@@ -161,44 +169,86 @@ export class ClaudeProvider implements CloudProvider {
     if (this.options.timeoutMs !== undefined) {
       options.timeoutMs = this.options.timeoutMs;
     }
-    return options;
-  }
-
-  private interactiveOptions(cwd: string, profilePath?: string) {
-    const options: { cwd: string; env?: NodeJS.ProcessEnv } = { cwd };
-    if (this.options.env !== undefined || profilePath !== undefined) {
-      options.env = {
-        ...this.options.env,
-        ...(profilePath === undefined ? {} : { CLAUDE_CONFIG_DIR: profilePath }),
-      };
-    }
+    if (pty) options.pty = true;
     return options;
   }
 }
 
-function parseClaudeExecution(output: string): ProviderExecution {
-  const trimmed = output.trim();
-  let parsed: z.infer<typeof executionSchema> | undefined;
+function parseClaudeRejection(
+  error: unknown,
+  expectedSessionId: string,
+): RelayError | undefined {
+  if (!(error instanceof RelayError) || error.code !== 'process_failed') {
+    return undefined;
+  }
+  const stdout = error.details?.stdout;
+  if (typeof stdout !== 'string') return undefined;
   try {
-    parsed = executionSchema.parse(JSON.parse(trimmed));
+    const rejection = rejectionSchema.parse(JSON.parse(stdout));
+    validateClaudeSessionId(rejection.session_id);
+    if (rejection.session_id !== expectedSessionId) return undefined;
+    return new RelayError(
+      'provider_rejected',
+      'Claude rejected the cloud follow-up before accepting it.',
+      { provider: 'claude', sessionId: expectedSessionId },
+      { cause: error },
+    );
   } catch {
-    // Claude start output is not guaranteed to be JSON.
+    return undefined;
   }
-  const providerSessionId = parsed?.session_id ?? parsed?.sessionId;
-  if (providerSessionId !== undefined) {
-    validateClaudeSessionId(providerSessionId);
-    if (parsed?.url === undefined) {
-      return { providerSessionId, status: 'running' };
-    }
-    parseClaudeSessionIdFromUrl(parsed.url, providerSessionId);
-    return { providerSessionId, url: parsed.url, status: 'running' };
-  }
+}
 
-  const urlText = trimmed.match(/https:\/\/[^\s]+/)?.[0];
-  if (urlText !== undefined) {
-    const cleanUrl = urlText.replace(/[),.;]+$/, '');
-    const providerSessionId = parseClaudeSessionIdFromUrl(cleanUrl);
-    return { providerSessionId, url: cleanUrl, status: 'running' };
+function parseClaudeFollowup(
+  output: string,
+  expectedSessionId: string,
+): ProviderExecution {
+  let parsed: z.infer<typeof followupSchema>;
+  try {
+    parsed = followupSchema.parse(JSON.parse(output));
+  } catch (cause) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Claude cloud follow-up did not return a successful JSON acknowledgement.',
+      undefined,
+      { cause },
+    );
+  }
+  validateClaudeSessionId(parsed.session_id);
+  const urlSessionId = parseClaudeSessionIdFromUrl(parsed.url);
+  if (
+    parsed.session_id !== expectedSessionId ||
+    urlSessionId !== expectedSessionId
+  ) {
+    throw new RelayError(
+      'provider_output_invalid',
+      'Claude cloud follow-up did not match the requested session.',
+    );
+  }
+  return {
+    providerSessionId: expectedSessionId,
+    url: claudeSessionUrl(expectedSessionId),
+    status: 'running',
+  };
+}
+
+function parseClaudeExecution(output: string): ProviderExecution {
+  for (const match of output.matchAll(/https:\/\/[^\s]+/g)) {
+    const candidate = match[0].replace(/[),.;]+$/, '');
+    try {
+      const providerSessionId = parseClaudeSessionIdFromUrl(candidate);
+      return {
+        providerSessionId,
+        url: claudeSessionUrl(providerSessionId),
+        status: 'running',
+      };
+    } catch (error) {
+      if (
+        !(error instanceof RelayError) ||
+        error.code !== 'provider_output_invalid'
+      ) {
+        throw error;
+      }
+    }
   }
 
   throw new RelayError(
@@ -207,7 +257,7 @@ function parseClaudeExecution(output: string): ProviderExecution {
   );
 }
 
-function parseClaudeSessionIdFromUrl(value: string, expectedSessionId?: string): string {
+function parseClaudeSessionIdFromUrl(value: string): string {
   let url: URL;
   try {
     url = new URL(value);
@@ -219,14 +269,13 @@ function parseClaudeSessionIdFromUrl(value: string, expectedSessionId?: string):
       { cause },
     );
   }
-  const match = /^\/code\/(session_[A-Za-z0-9]+)$/.exec(url.pathname);
+  const match = /^\/code\/([^/]+)$/.exec(url.pathname);
   if (
     url.protocol !== 'https:' ||
     url.hostname !== 'claude.ai' ||
     url.port !== '' ||
     url.username !== '' ||
     url.password !== '' ||
-    url.search !== '' ||
     url.hash !== '' ||
     match === null
   ) {
@@ -237,17 +286,15 @@ function parseClaudeSessionIdFromUrl(value: string, expectedSessionId?: string):
   }
   const sessionId = match[1]!;
   validateClaudeSessionId(sessionId);
-  if (expectedSessionId !== undefined && sessionId !== expectedSessionId) {
-    throw new RelayError(
-      'provider_output_invalid',
-      'Claude cloud session URL did not match its session identifier.',
-    );
-  }
   return sessionId;
 }
 
+function claudeSessionUrl(sessionId: string): string {
+  return `https://claude.ai/code/${sessionId}`;
+}
+
 function validateClaudeSessionId(value: string): void {
-  if (!/^session_[A-Za-z0-9]+$/.test(value)) {
+  if (!CLAUDE_SESSION_ID.test(value)) {
     throw new RelayError(
       'provider_output_invalid',
       'Claude cloud returned an invalid session identifier.',

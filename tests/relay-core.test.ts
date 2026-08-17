@@ -45,6 +45,8 @@ class FakeProvider implements CloudProvider {
   readonly attachments: AttachInput[] = [];
   startStatus: ProviderRunStatus = 'running';
   sendStatus: ProviderRunStatus = 'running';
+  startError: RelayError | undefined;
+  sendError: RelayError | undefined;
   onStart?: (input: StartRunInput) => void;
   capabilityOverrides: Partial<ProviderCapabilities> = {};
 
@@ -76,6 +78,7 @@ class FakeProvider implements CloudProvider {
   async start(input: StartRunInput): Promise<ProviderExecution> {
     this.starts.push(input);
     this.onStart?.(input);
+    if (this.startError !== undefined) throw this.startError;
     return {
       providerSessionId: `${this.name}_session_${this.starts.length}`,
       status: this.startStatus,
@@ -85,6 +88,7 @@ class FakeProvider implements CloudProvider {
 
   async send(input: SendRunInput): Promise<ProviderExecution> {
     this.sends.push(input);
+    if (this.sendError !== undefined) throw this.sendError;
     return {
       providerSessionId: input.providerSessionId,
       status: this.sendStatus,
@@ -828,6 +832,46 @@ test('quarantines capacity and refuses retry after remote acceptance cannot be p
   assert.equal(harness.claude.starts.length, 2);
 });
 
+test('retries a definitively rejected start without a pending-session lock', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  const project = await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  harness.claude.startError = new RelayError(
+    'provider_rejected',
+    'Claude rejected the start.',
+  );
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      accountId: 'claude-a',
+      task: 'Review auth',
+      title: 'Rejected start',
+      cwd: harness.cwd,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_rejected',
+  );
+
+  const workItem = harness.store.getCurrentWorkItem(project.id)!;
+  const rejected = harness.store.getStatus(workItem.id);
+  assert.equal(rejected.runs[0]?.status, 'failed');
+  assert.equal(rejected.sessions[0]?.status, 'failed');
+  assert.equal(harness.store.countActiveAccountLeases('claude-a'), 0);
+
+  harness.claude.startError = undefined;
+  await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'Retry review',
+    workItemId: workItem.id,
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  assert.equal(harness.claude.starts.length, 2);
+});
+
 test('reuses an active provider session for send', async () => {
   const harness = await relayHarness();
   const delegated = await harness.core.delegate({
@@ -851,6 +895,55 @@ test('reuses an active provider session for send', async () => {
   );
   assert.equal(harness.claude.starts.length, 1);
   assert.equal(harness.claude.sends.length, 1);
+});
+
+test('fails a definitively rejected follow-up without quarantining account capacity', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  harness.claude.startStatus = 'provider_complete';
+  const delegated = await harness.core.delegate({
+    provider: 'claude',
+    accountId: 'claude-a',
+    task: 'Review auth',
+    title: 'Definite rejection',
+    cwd: harness.cwd,
+    mode: 'read',
+  });
+  assert.equal(harness.store.countActiveAccountLeases('claude-a'), 0);
+  harness.claude.sendError = new RelayError(
+    'provider_rejected',
+    'Claude rejected the follow-up.',
+  );
+
+  await assert.rejects(
+    harness.core.send({
+      provider: 'claude',
+      accountId: 'claude-a',
+      message: 'Continue',
+      workItemId: delegated.workItem.id,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_rejected',
+  );
+
+  const rejected = harness.store
+    .getStatus(delegated.workItem.id)
+    .runs.find((run) => run.type === 'message');
+  assert.equal(rejected?.status, 'failed');
+  assert.equal(rejected?.launchState, undefined);
+  assert.equal(harness.store.countActiveAccountLeases('claude-a'), 0);
+
+  harness.claude.sendError = undefined;
+  await harness.core.send({
+    provider: 'claude',
+    accountId: 'claude-a',
+    message: 'Retry',
+    workItemId: delegated.workItem.id,
+    mode: 'read',
+  });
+  assert.equal(harness.claude.sends.length, 2);
 });
 
 test('marks provider completion as awaiting publish until GitHub resolves the branch', async () => {

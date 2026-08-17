@@ -13,6 +13,7 @@ export interface RunOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  pty?: boolean;
 }
 
 export interface InteractiveOptions {
@@ -34,7 +35,11 @@ export class ProcessRunner {
     }
 
     return await new Promise<ProcessResult>((resolve, reject) => {
-      const child = spawn(command, [...args], {
+      const invocation =
+        options.pty === true
+          ? pseudoTerminalInvocation(command, args)
+          : { command, args };
+      const child = spawn(invocation.command, [...invocation.args], {
         cwd: options.cwd,
         env: { ...process.env, ...options.env },
         shell: false,
@@ -109,20 +114,22 @@ export class ProcessRunner {
         }
 
         const code = exitCode ?? 1;
+        const capturedStdout =
+          options.pty === true ? normalizePseudoTerminalOutput(stdout) : stdout;
         if (code !== 0) {
           reject(
             new RelayError('process_failed', `${command} exited with ${code}.`, {
               command,
               exitCode: code,
               signal,
-              stdout,
+              stdout: capturedStdout,
               stderr,
             }),
           );
           return;
         }
 
-        resolve({ command, exitCode: code, stdout, stderr });
+        resolve({ command, exitCode: code, stdout: capturedStdout, stderr });
       });
     });
   }
@@ -155,4 +162,40 @@ export class ProcessRunner {
       child.once('close', (exitCode) => resolve(exitCode ?? 1));
     });
   }
+}
+
+function pseudoTerminalInvocation(
+  command: string,
+  args: readonly string[],
+): { command: string; args: readonly string[] } {
+  if (process.platform === 'darwin') {
+    return {
+      command: '/usr/bin/script',
+      args: ['-q', '/dev/null', command, ...args],
+    };
+  }
+  if (process.platform === 'linux') {
+    return {
+      command: 'script',
+      args: [
+        '-q',
+        '-e',
+        '-c',
+        [command, ...args].map(shellQuote).join(' '),
+        '/dev/null',
+      ],
+    };
+  }
+  throw new RelayError(
+    'capability_unavailable',
+    `Pseudo-terminal execution is unavailable on ${process.platform}.`,
+  );
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function normalizePseudoTerminalOutput(value: string): string {
+  return value.replace(/^(?:\^D\u0008\u0008)+/, '').replaceAll('\r\n', '\n');
 }

@@ -25,10 +25,57 @@ if (args[0] === 'auth' && args[1] === 'status') {
   process.stdout.write(
     scenario === 'installed-no-cloud'
       ? '--help Show help'
+      : scenario === 'current-help'
+        ? '--cloud [description|session_id|url] Create a cloud session with the given description, or attach to an existing one by session ID or claude.ai/code URL\n--model MODEL'
       : '--cloud Start or attach to an existing cloud session\n-p, --print Print mode\n--output-format json\n--model MODEL\nCLAUDE_CONFIG_DIR profile isolation',
   );
+} else if (args[0] === '-p' && args.includes('--cloud')) {
+  process.stdout.write(JSON.stringify(
+    scenario === 'send-mismatch'
+      ? {
+          ok: true,
+          session_id: 'session_abc123',
+          url: 'https://claude.ai/code/session_other?from=cli&m=0',
+        }
+      : scenario === 'send-cse'
+        ? {
+            ok: true,
+            session_id: 'cse_abc-123_def',
+            url: 'https://claude.ai/code/cse_abc-123_def?from=cli&m=0',
+          }
+      : scenario === 'send-failed'
+        ? {
+            ok: false,
+            session_id: 'session_abc123',
+            error: 'session is archived',
+          }
+      : {
+          ok: true,
+          session_id: 'session_abc123',
+          url: 'https://claude.ai/code/session_abc123?from=cli&m=0',
+        },
+  ));
+  if (scenario === 'send-failed') process.exitCode = 1;
 } else if (args.includes('--cloud') && !args.includes('-p')) {
-  if (scenario === 'malformed') {
+  if (scenario === 'start-requires-tty' && process.stdout.isTTY !== true) {
+    process.stderr.write('Error: --cloud requires an interactive terminal.');
+    process.exitCode = 2;
+  } else if (scenario === 'start-query-url') {
+    process.stdout.write(
+      'Created cloud session: Inspect the repository\n' +
+      'View: https://claude.ai/code/session_abc123?from=cli&m=0\n' +
+      'Resume with: claude --teleport session_abc123\n',
+    );
+  } else if (scenario === 'start-cse-url') {
+    process.stdout.write(
+      'View: https://claude.ai/code/cse_abc-123_def?from=cli&m=0\n',
+    );
+  } else if (scenario === 'start-prefixed-url') {
+    process.stdout.write(
+      'Learn more: https://docs.example.test/cloud\n' +
+      'View: https://claude.ai/code/session_abc123?from=cli&m=0\n',
+    );
+  } else if (scenario === 'malformed') {
     process.stdout.write('cloud session launched');
   } else if (scenario === 'invalid-url-host') {
     process.stdout.write('Session created: https://claude.ai.example/code/session_abc123');
@@ -36,25 +83,9 @@ if (args[0] === 'auth' && args[1] === 'status') {
     process.stdout.write('Session created: https://claude.ai/tasks/session_abc123');
   } else if (scenario === 'invalid-url-id') {
     process.stdout.write('Session created: https://claude.ai/code/not-a-session');
-  } else if (scenario === 'attach') {
-    process.exitCode = 0;
   } else {
     process.stdout.write('Session created: https://claude.ai/code/session_abc123');
   }
-} else if (args[0] === '-p') {
-  process.stdout.write(JSON.stringify(
-    scenario === 'invalid-json-url'
-      ? {
-          ok: true,
-          session_id: 'session_abc123',
-          url: 'https://claude.ai/code/session_other',
-        }
-      : {
-          ok: true,
-          session_id: 'session_abc123',
-          url: 'https://claude.ai/code/session_abc123',
-        },
-  ));
 } else {
   process.stderr.write(`unsupported fake claude command: ${args.join(' ')}`);
   process.exitCode = 2;
