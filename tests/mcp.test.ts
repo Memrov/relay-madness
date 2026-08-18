@@ -58,7 +58,7 @@ function fakeCore(options: {
     session: {
       id: 'hidden',
       workItemId: 'work_1',
-      provider: 'jules',
+      provider: 'claude',
       providerSessionId: 'must-not-leak',
       status: 'active',
       skills: options.skills ?? [],
@@ -68,7 +68,7 @@ function fakeCore(options: {
       id: 'run_1',
       sessionId: 'hidden',
       workItemId: 'work_1',
-      provider: 'jules',
+      provider: 'claude',
       type: 'handoff',
       mutationMode: 'read',
       status: 'running',
@@ -161,6 +161,32 @@ async function connectedMcp(core: RelayApi) {
     },
   };
 }
+
+test('advertises the Relay Cluster MCP implementation identity', async () => {
+  const { core } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    assert.equal(client.getServerVersion()?.name, 'relay-cluster');
+  } finally {
+    await close();
+  }
+});
+
+test('rejects providers outside the Codex and Claude MCP schema', async () => {
+  const { core, calls } = fakeCore();
+  const { client, close } = await connectedMcp(core);
+  try {
+    const response = await client.callTool({
+      name: 'relay_delegate',
+      arguments: { provider: 'jules', task: 'Review it' },
+    });
+
+    assert.equal(response.isError, true);
+    assert.deepEqual(calls.delegate, []);
+  } finally {
+    await close();
+  }
+});
 
 test('exposes account inspection and integration-only landing without a merge tool', async () => {
   const { core } = fakeCore();
@@ -260,7 +286,7 @@ test('routes a handoff through Relay Core without exposing provider IDs', async 
     const response = await client.callTool({
       name: 'relay_handoff',
       arguments: {
-        provider: 'jules',
+        provider: 'claude',
         workItem: 'current',
         instruction: 'Add tests',
       },
@@ -269,7 +295,7 @@ test('routes a handoff through Relay Core without exposing provider IDs', async 
       workItem: 'work_1',
       repo: 'acme/web',
       title: 'Authentication',
-      provider: 'jules',
+      provider: 'claude',
       runId: 'run_1',
       correlationId: 'correlation_1',
       delegationDepth: 0,
@@ -282,7 +308,7 @@ test('routes a handoff through Relay Core without exposing provider IDs', async 
     assert.equal(JSON.stringify(response).includes('must-not-leak'), false);
     assert.deepEqual(calls.handoff, [
       {
-        provider: 'jules',
+        provider: 'claude',
         instruction: 'Add tests',
         mode: 'read',
         workItemId: 'current',
@@ -311,7 +337,7 @@ test('returns compact GitHub and provider status', async () => {
       sha,
       pullRequest: 143,
       checks: 'passing',
-      providers: { jules: 'active' },
+      providers: { claude: 'active' },
     });
     assert.equal(calls.status, 1);
   } finally {
@@ -349,7 +375,7 @@ test('reports the reusable provider session instead of a failed replacement', as
     });
     assert.deepEqual(
       (response.structuredContent as { providers?: unknown }).providers,
-      { jules: 'active' },
+      { claude: 'active' },
     );
   } finally {
     await close();
@@ -378,23 +404,23 @@ test('forwards handoff account and model selection through Relay Core', async ()
     const response = await client.callTool({
       name: 'relay_handoff',
       arguments: {
-        provider: 'jules',
+        provider: 'claude',
         workItem: 'current',
         instruction: 'Review it',
-        account: 'jules-a',
-        model: 'jules-latest',
+        account: 'claude-a',
+        model: 'opus',
       },
     });
     assert.equal(response.isError, undefined);
     assert.deepEqual(calls.handoff, [
       {
-        provider: 'jules',
+        provider: 'claude',
         instruction: 'Review it',
         mode: 'read',
         workItemId: 'current',
         cwd: '/workspace/acme-web',
-        accountId: 'jules-a',
-        model: 'jules-latest',
+        accountId: 'claude-a',
+        model: 'opus',
       },
     ]);
   } finally {
@@ -417,7 +443,7 @@ test('forwards strict ordered skills and returns immutable coordinates', async (
     const delegated = await client.callTool({
       name: 'relay_delegate',
       arguments: {
-        provider: 'jules',
+        provider: 'claude',
         task: 'Review it',
         skills: ['review-security'],
       },
@@ -425,7 +451,7 @@ test('forwards strict ordered skills and returns immutable coordinates', async (
     await client.callTool({
       name: 'relay_handoff',
       arguments: {
-        provider: 'jules',
+        provider: 'claude',
         workItem: 'current',
         instruction: 'Add tests',
         skills: ['write-tests', 'review-security'],
@@ -434,7 +460,7 @@ test('forwards strict ordered skills and returns immutable coordinates', async (
 
     assert.deepEqual(calls.delegate, [
       {
-        provider: 'jules',
+        provider: 'claude',
         task: 'Review it',
         cwd: '/workspace/acme-web',
         mode: 'write',
@@ -444,7 +470,7 @@ test('forwards strict ordered skills and returns immutable coordinates', async (
     ]);
     assert.deepEqual(calls.handoff, [
       {
-        provider: 'jules',
+        provider: 'claude',
         instruction: 'Add tests',
         mode: 'read',
         workItemId: 'current',
@@ -503,23 +529,23 @@ test('forwards send account and model selection through Relay Core', async () =>
     await client.callTool({
       name: 'relay_send',
       arguments: {
-        provider: 'jules',
+        provider: 'claude',
         workItem: 'work_1',
         message: 'Continue',
-        account: 'jules-a',
-        model: 'gemini-2.5-pro',
+        account: 'claude-a',
+        model: 'opus',
       },
     });
 
     assert.deepEqual(calls.send, [
       {
-        provider: 'jules',
+        provider: 'claude',
         message: 'Continue',
         mode: 'read',
         workItemId: 'work_1',
         cwd: '/workspace/acme-web',
-        accountId: 'jules-a',
-        model: 'gemini-2.5-pro',
+        accountId: 'claude-a',
+        model: 'opus',
       },
     ]);
   } finally {
@@ -542,7 +568,7 @@ test('rejects unknown delegate, handoff, and landing fields before reaching Rela
     const rejected = await client.callTool({
       name: 'relay_handoff',
       arguments: {
-        provider: 'jules',
+        provider: 'claude',
         workItem: 'current',
         instruction: 'Review it',
         unknown: true,

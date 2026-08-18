@@ -1,17 +1,21 @@
 import { RelayError } from './errors.js';
 import type { MergeStrategy } from './github-client.js';
-import type { MutationMode, ProviderName } from './provider.js';
+import {
+  SUPPORTED_PROVIDERS,
+  type MutationMode,
+  type ProviderName,
+} from './provider.js';
 import type { RelayApi, RelayIo } from './app.js';
 import {
   MAX_SELECTED_SKILLS,
   SKILL_NAME_PATTERN,
 } from './skills.js';
 
-const PROVIDERS = new Set<ProviderName>(['claude', 'codex', 'jules']);
+const PROVIDERS = new Set<ProviderName>(SUPPORTED_PROVIDERS);
 
 export async function runRepl(core: RelayApi, io: RelayIo): Promise<void> {
   let provider: ProviderName = 'claude';
-  io.write('Relay Madness — GitHub is artifact truth. Type /help for commands.\n');
+  io.write('Relay Cluster — GitHub is artifact truth. Type /help for commands.\n');
 
   while (true) {
     const input = await io.readLine(`${provider}> `);

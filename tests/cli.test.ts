@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
   createCli,
+  createRelayApplication,
   type RelayApi,
   type RelayIo,
 } from '../src/app.js';
@@ -80,10 +84,6 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
         },
         codex: {
           auth: { authenticated: true, method: 'ChatGPT' },
-          capabilities: {},
-        },
-        jules: {
-          auth: { authenticated: false, detail: 'missing key' },
           capabilities: {},
         },
       },
@@ -202,6 +202,65 @@ function memoryIo(options: {
   };
 }
 
+test('advertises only Codex and Claude provider commands', () => {
+  const { core } = fakeCore();
+  const io = memoryIo();
+  const cli = createCli(core, io);
+  const init = cli.commands.find((command) => command.name() === 'init');
+  const delegate = cli.commands.find((command) => command.name() === 'delegate');
+
+  assert.ok(init);
+  assert.ok(delegate);
+  assert.doesNotMatch(cli.helpInformation(), /\bjules\b/i);
+  assert.doesNotMatch(init.helpInformation(), /\bjules\b/i);
+  assert.doesNotMatch(delegate.helpInformation(), /\bjules\b/i);
+});
+
+test('rejects an unsupported provider before delegation', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+
+  await assert.rejects(
+    createCli(core, io).parseAsync([
+      'node',
+      'relay',
+      'delegate',
+      'jules',
+      'Review it',
+    ]),
+    (error: unknown) =>
+      error instanceof Error &&
+      'code' in error &&
+      error.code === 'invalid_argument',
+  );
+  assert.deepEqual(calls.delegate, []);
+});
+
+test('identifies the REPL as Relay Cluster and rejects unsupported switches', async () => {
+  const { core } = fakeCore();
+  const io = memoryIo({ lines: ['/use jules', '/quit'] });
+
+  await runRepl(core, io);
+
+  assert.match(io.stdout, /^Relay Cluster/);
+  assert.match(io.stderr, /invalid_argument: Unknown provider jules\./);
+});
+
+test('stores new application state under the Relay Cluster identity', () => {
+  const root = mkdtempSync(join(tmpdir(), 'relay-cluster-state-test-'));
+  try {
+    const application = createRelayApplication({
+      env: { XDG_STATE_HOME: root },
+    });
+    application.close();
+
+    assert.equal(existsSync(join(root, 'relay-cluster', 'relay.db')), true);
+    assert.equal(existsSync(join(root, 'relay-madness')), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('prints machine-readable status', async () => {
   const { core } = fakeCore();
   const io = memoryIo();
@@ -262,7 +321,7 @@ test('doctor reports each dependency independently', async () => {
   assert.match(io.stdout, /GitHub\s+✓/);
   assert.match(io.stdout, /Claude\s+✗/);
   assert.match(io.stdout, /Codex\s+✓/);
-  assert.match(io.stdout, /Jules\s+✗/);
+  assert.doesNotMatch(io.stdout, /Jules/i);
   assert.match(
     io.stdout,
     /Provider identities are trusted GitHub writers; Relay prompts do not enforce branch authorization\./,
@@ -348,8 +407,6 @@ test('initializes only non-secret provider references', async () => {
     'init',
     '--codex-env',
     'env_123',
-    '--jules-source',
-    'sources/github-acme-web',
   ]);
 
   assert.deepEqual(calls.initialize, [
@@ -357,7 +414,6 @@ test('initializes only non-secret provider references', async () => {
       cwd: '/workspace/acme-web',
       providerConfigs: {
         codex: { environmentId: 'env_123' },
-        jules: { source: 'sources/github-acme-web' },
       },
     },
   ]);
@@ -659,7 +715,7 @@ test('REPL handoff keeps the selected provider explicit', async () => {
   const { core } = fakeCore({
     handoff: async (input) => {
       assert.deepEqual(input, {
-        provider: 'jules' satisfies ProviderName,
+        provider: 'codex' satisfies ProviderName,
         instruction: 'Add edge cases',
         workItemId: 'current',
         cwd: '/workspace/acme-web',
@@ -667,7 +723,7 @@ test('REPL handoff keeps the selected provider explicit', async () => {
       return { run: { status: 'running' } } as never;
     },
   });
-  const io = memoryIo({ lines: ['/handoff jules Add edge cases', '/quit'] });
+  const io = memoryIo({ lines: ['/handoff codex Add edge cases', '/quit'] });
 
   await runRepl(core, io);
 });
@@ -677,7 +733,7 @@ test('REPL forwards explicit ordered skills for new work and handoff', async () 
   const io = memoryIo({
     lines: [
       '/new claude --skill review-security --skill write-tests -- Review auth',
-      '/handoff jules --skill write-tests -- Add edge cases',
+      '/handoff codex --skill write-tests -- Add edge cases',
       '/quit',
     ],
   });
@@ -695,7 +751,7 @@ test('REPL forwards explicit ordered skills for new work and handoff', async () 
   ]);
   assert.deepEqual(calls.handoff, [
     {
-      provider: 'jules',
+      provider: 'codex',
       instruction: 'Add edge cases',
       workItemId: 'current',
       cwd: '/workspace/acme-web',
