@@ -1,5 +1,8 @@
 # Relay Madness Full Build Implementation Plan
 
+> [!IMPORTANT]
+> **Historical predecessor plan.** The current product is Relay Cluster and supports only Codex Cloud and Claude Code cloud. Names and provider scope below are retained as an implementation record; see the [current design](../specs/2026-08-17-relay-cluster-rebrand-design.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build and publish the complete first Relay Madness release: a thin TypeScript CLI and STDIO MCP server that coordinates Claude, Codex, and Jules cloud work while verifying durable results through GitHub.

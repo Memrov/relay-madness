@@ -1,5 +1,8 @@
 # Portable Agent Skills Implementation Plan
 
+> [!IMPORTANT]
+> **Historical implementation plan.** Portable Agent Skills remain part of Relay Cluster, but any predecessor name or provider example below is superseded by the current Codex-and-Claude scope. See the [current design](../specs/2026-08-17-relay-cluster-rebrand-design.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task by task.
 
 **Goal:** Let callers explicitly attach repository-standard Agent Skills to new Relay delegations and handoffs while Relay validates, pins, persists, and transports the exact skill coordinates safely across provider accounts.

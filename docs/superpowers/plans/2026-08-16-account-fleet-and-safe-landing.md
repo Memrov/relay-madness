@@ -1,5 +1,8 @@
 # Account Fleet and Safe Landing Implementation Plan
 
+> [!IMPORTANT]
+> **Historical implementation plan.** Its account, usage, branch-isolation, and landing mechanisms remain relevant, but the current product is Relay Cluster with only Codex Cloud and Claude Code cloud. See the [current design](../specs/2026-08-17-relay-cluster-rebrand-design.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let Relay coordinate many independently authenticated provider accounts and concurrent isolated worker runs, expose weekly model-usage telemetry to an external orchestrator, and serialize candidate integration through a GitHub-verified landing queue.

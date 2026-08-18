@@ -1,10 +1,10 @@
-# Contributing to Relay Madness
+# Contributing to Relay Cluster
 
 Thanks for helping keep Relay small.
 
 ## Development
 
-Relay Madness requires Node.js 22.12 or newer on macOS or Linux.
+Relay Cluster requires Node.js 22.12 or newer on macOS or Linux.
 
 ```sh
 npm ci

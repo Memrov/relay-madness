@@ -1,158 +1,199 @@
-# Relay Madness
+# Relay Cluster
 
-Relay Madness is a thin universal control plane for provider-hosted coding agents. It coordinates Claude Code cloud sessions, OpenAI Codex cloud tasks, and Google Jules sessions without hosting an LLM, a development VM, or project dependencies.
+Turn your Codex and Claude Code subscriptions into a personal coding compute cluster. Relay Cluster gives your orchestrating agent one MCP server and CLI to dispatch cloud work, manage account capacity, and verify every result through GitHub.
+
+> **One orchestrator. Many cloud agents. GitHub is truth.**
+
+Relay Cluster is experimental, open-source, and pre-1.0. Provider cloud CLIs can change underneath it.
+
+## Why it exists
+
+Codex Cloud and Claude Code on the web already provide remote coding computers, agent harnesses, authentication, and subscription-backed usage. Those computers are isolated by provider, account, session, and interface. An orchestrating agent still needs a small way to address them, track capacity, transfer repository state, and prove that claimed work reached GitHub.
+
+Relay Cluster is that control plane. It does not decide how to split a goal or which model should do a task. A human or orchestrating agent makes those choices and calls Relay's primitives.
+
+The design applies the [blackboard model of problem solving](https://ojs.aaai.org/aimagazine/index.php/aimagazine/article/view/537): independent workers operate against shared durable state while a controller decides what happens next.
 
 ```text
-CLI / REPL ─┐
-            ├── Relay Core ── provider clouds
-MCP STDIO ──┘       │
-                    ├── SQLite coordination truth
-                    └── GitHub artifact truth
+                       human or orchestrating agent
+                                  │
+                           CLI or MCP STDIO
+                                  │
+                                  ▼
+                           Relay Cluster core
+                         coordination + leases
+                            ┌─────┴─────┐
+                            ▼           ▼
+                       Codex Cloud  Claude Cloud
+                            └─────┬─────┘
+                                  ▼
+                                GitHub
+                    branches · commits · PRs · checks
 ```
 
-The contract is deliberately small:
+- Codex and Claude are execution workers.
+- GitHub is the shared blackboard.
+- The caller is the controller.
+- Relay Cluster persists coordination, enforces lineage and capacity, and verifies GitHub state.
 
-- Relay owns coordination: Projects, WorkItems, sessions, runs, lineage, and locks.
-- Providers own execution: their cloud computers, agent harnesses, and conversations.
-- GitHub owns durable artifacts: branches, commits, pull requests, reviews, and checks.
-- A provider saying “complete” never proves that code was published.
+A provider message is evidence about execution. A GitHub branch and commit are evidence about code.
 
-This is an experimental, pre-1.0 project. Provider cloud CLIs and APIs can change underneath it.
+## What Relay Cluster does
 
-## What works
+- Reuses logical provider sessions instead of creating one for every message.
+- Keeps WorkItems, sessions, runs, lineage, launch checkpoints, and provider-account leases in local SQLite.
+- Lets the caller select a provider, account, model, and repository Agent Skills explicitly.
+- Records caller-supplied weekly usage so an orchestrator can make its own scheduling decision.
+- Pins read-only work to an exact commit.
+- Gives every concurrent writer a separate `relay/run/...` result branch.
+- Reconciles provider results against remote branches, full commit SHAs, pull requests, and checks.
+- Stages candidates before advancing a WorkItem integration branch.
+- Requires human confirmation and an unchanged approved SHA for the final merge.
+- Exposes the same core through the `relay` CLI/REPL and a local STDIO MCP server.
 
-- One logical WorkItem can span Claude, Codex, and Jules.
-- Claude and Jules sessions support programmatic follow-up.
-- Codex supports cloud task creation and structured inspection; scripted cloud follow-up is intentionally unavailable until OpenAI documents a stable surface.
-- Write mode is capability-gated: Codex can target Relay's exact result branch; Claude and Jules currently fail closed with `capability_unavailable` because their adapters cannot prove that output contract.
-- Handoffs contain a repository, branch, full commit SHA, PR, and instruction—not another model's transcript.
-- GitHub reconciliation distinguishes `provider_complete`, `awaiting_publish`, `published`, and `verified`.
-- A completed write is credited only when its expected remote branch appears or advances beyond the SHA observed before dispatch.
-- Read-only work is pinned to the branch SHA observed at dispatch and fails visibly if that head moves.
-- Provider-account capacity limits active execution. Concurrent writes use distinct Relay-owned `relay/run/...` result branches, while landing serializes each WorkItem's integration update.
-- Merge is CLI-only, interactive, and bound to the exact approved head SHA.
-- The local MCP server exposes strict account inspection, delegation, handoff, status, and integration-only landing tools. It cannot merge.
-- Callers can attach repository-standard Agent Skills explicitly. Relay pins and transports their exact Git coordinates; it never chooses or executes a skill.
+## What it deliberately does not do
 
-Not included: hosted compute, a daemon, an HTTP bridge, a full-screen TUI, dynamic plugins, transcript synchronization, Windows support, or automatic recursive workflows.
+- Host model inference, development VMs, builds, dependencies, or a queue service.
+- Proxy subscription tokens or turn subscriptions into an unofficial model API.
+- Copy provider or GitHub credentials into its database.
+- Scrape quotas, rotate accounts, select models, or choose Agent Skills automatically.
+- Synchronize provider transcripts or context windows.
+- Treat “done” from a provider as proof of a published result.
+- Let MCP clients merge the base branch.
+- Bypass provider terms, quotas, protective limits, or account controls.
 
-## Requirements
+Use only accounts you are authorized to control and follow each provider's terms.
+
+## Quick start
+
+Requirements:
 
 - Node.js 22.12 or newer
 - macOS or Linux
-- GitHub CLI (`gh`) authenticated for the repository
-- at least one supported provider account and tool
+- authenticated GitHub CLI (`gh`)
+- authenticated `codex` and/or `claude` CLI with the relevant cloud feature enabled
 
-Install from GitHub while the package is pre-release:
+Install from GitHub while the npm package is pre-release:
 
 ```sh
-npm install --global github:Memrov/relay-madness
+npm install --global github:Memrov/relay-cluster
 relay --help
 ```
 
-For development:
-
-```sh
-git clone https://github.com/Memrov/relay-madness.git
-cd relay-madness
-npm ci
-npm run verify
-npm link
-```
-
-Relay stores coordination state in `$XDG_STATE_HOME/relay-madness/relay.db`, or `~/.local/state/relay-madness/relay.db` when `XDG_STATE_HOME` is unset.
-
-Git installs run the TypeScript build through the package's `prepare` lifecycle, so the `relay` binary is present even though generated `dist/` files are not committed.
-
-## Set up a project
-
-Run Relay from a checkout connected to GitHub:
+From a Git checkout connected to GitHub:
 
 ```sh
 gh auth login
 relay doctor
-relay init
+relay init --codex-env YOUR_CODEX_ENVIRONMENT_ID
+
+relay delegate codex "Implement the change" --title "Example change"
+relay status
+# After the Codex result is verified through GitHub:
+relay handoff claude "Review the current implementation" --mode read
 ```
 
-Add provider-specific non-secret references when needed:
+Relay stores new coordination state in `$XDG_STATE_HOME/relay-cluster/relay.db`, or `~/.local/state/relay-cluster/relay.db` when `XDG_STATE_HOME` is unset. The old unpublished `relay-madness` state directory is neither read nor migrated.
+
+## Provider setup and honest capabilities
+
+Relay probes installed CLI capabilities and fails closed when a provider cannot satisfy an operation.
+
+| Capability | Codex Cloud | Claude Code cloud |
+| --- | --- | --- |
+| Subscription authentication | Yes | Yes |
+| Start cloud work | Yes, when `codex cloud` is available | Yes, when `claude --cloud` is available |
+| Structured status | Yes | No |
+| Programmatic follow-up | Not documented; unavailable | Queue-and-exit when the CLI exposes it |
+| Native chat escape hatch | `relay chat codex` | Not advertised by Relay |
+| Exact Relay result branch | Supported by the adapter | Unavailable; write mode fails closed |
+| Current safe Relay mode | Read or write | Read-only |
+
+### Codex Cloud
+
+Authenticate the Codex CLI, connect a cloud environment to the repository, and store only its non-secret environment identifier:
 
 ```sh
-relay init \
-  --codex-env YOUR_CODEX_ENVIRONMENT_ID \
-  --jules-source sources/github/OWNER/REPO
+codex login
+relay init --codex-env YOUR_CODEX_ENVIRONMENT_ID
+relay providers --json
 ```
 
-Relay never copies provider or GitHub credentials into SQLite. `gh`, `claude`, and `codex` own their credentials. The Jules adapter reads `JULES_API_KEY` from the process environment at execution time.
+Relay uses `codex cloud exec` and `codex cloud list --json`. It never invents an undocumented continuation command: `relay send codex ...` returns `capability_unavailable`, while `relay chat codex` opens the provider-native cloud UI.
 
-### GitHub writer trust boundary
+The adapter requests Relay's exact result branch for write work. A real Codex write, candidate, landing, pull-request, and merge lifecycle is still the release gate before npm publication.
 
-Relay tells providers which isolated `relay/run/...` branch to use and verifies the artifacts they publish, but a provider's native GitHub credential can still write any ref that credential is allowed to write. Provider prompts are not a GitHub authorization boundary, and Relay cannot locally enforce server-side repository permissions. Treat provider identities as trusted writers unless you configure GitHub rulesets and least-privileged provider identities to limit them to `relay/run/*`; protect base and integration branches in GitHub itself. `relay doctor` repeats this warning for interactive use.
+### Claude Code cloud
 
-### Claude
-
-Install and authenticate Claude Code, then make sure the installed version exposes cloud sessions. Relay starts with `claude --cloud` through a captured pseudo-terminal because current Claude releases reject cloud submission over ordinary pipes. Relay stores the opaque `session_...` or `cse_...` ID and canonical `claude.ai/code` URL returned by the CLI.
+Install and authenticate Claude Code, then verify that the installed CLI exposes cloud sessions:
 
 ```sh
 claude
 relay doctor
+relay providers --json
 ```
 
-Cloud CLI behavior is capability-probed because Anthropic rolls features out independently. Relay continues an existing cloud session with Anthropic's documented queue-and-exit form, `claude -p "..." --cloud <session-id> --output-format json`. This is distinct from `claude -p --resume`, which resumes a CLI-local transcript rather than a Claude Code on the web session. Interactive `claude --cloud <session-id>` attachment remains disabled unless Relay can verify the account-level entitlement; queue-and-exit follow-up does not depend on that rollout. Claude cloud remains read-only in Relay until the provider exposes exact result-branch publication.
+Relay starts cloud work through a captured pseudo-terminal because current Claude releases reject that submission path over ordinary pipes. When capability probing finds the documented queue-and-exit flags, Relay can continue the same web session with `claude -p ... --cloud SESSION_ID --output-format json`.
 
-### Codex
+Claude is read-only in Relay Cluster today. The current provider surface cannot prove publication to an exact Relay-owned result branch, so a Claude write request fails with `capability_unavailable` rather than pretending that an arbitrary provider branch is safe.
 
-Authenticate the Codex CLI and create/connect a Codex cloud environment for the repository. Store only that environment ID:
+## Multiple accounts and weekly usage
 
-```sh
-codex login
-relay init --codex-env YOUR_ENVIRONMENT_ID
-```
-
-Relay uses `codex cloud exec` and `codex cloud list --json`. Codex cloud is currently an experimental CLI surface. There is no invented follow-up command: `relay send codex ...` returns `capability_unavailable`, while `relay chat codex` opens the native cloud experience.
-
-### Account profiles and weekly usage
-
-Relay stores only local profile references, never credentials. Use one profile reference per provider account and select it explicitly when delegating:
+Each account record contains a label, a non-secret local profile reference, capacity, and optional usage snapshots. The native CLI continues to own credentials.
 
 ```sh
-relay account add codex codex-a --label Primary --profile /profiles/codex-a --default
+relay account add codex codex-a \
+  --label Primary \
+  --profile /profiles/codex-a \
+  --default
+
+relay usage set codex-a \
+  --model gpt-5.6-sol \
+  --remaining-percent 62 \
+  --resets-at 2026-08-20T00:00:00Z
+
 relay accounts --json
-relay usage set codex-a --model gpt-5.6-sol --remaining-percent 62 --resets-at 2026-08-20T00:00:00Z
-relay usage --account codex-a --json
 relay delegate codex "Implement it" --account codex-a --model gpt-5.6-sol
 ```
 
-`CODEX_HOME` and `CLAUDE_CONFIG_DIR` are profile references passed only to the selected local provider CLI. Weekly usage entries are caller-supplied scheduling telemetry: Relay does not scrape provider UIs, infer quota, select an account, or select a model from them. For multiple Claude profiles, use separate Linux bridge environments; macOS profile separation relies on Keychain and is not a safe multi-profile bridge.
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR` are passed only to the selected provider process. Usage is informational and caller-supplied: Relay does not scrape a provider UI, decide that an account is exhausted, or choose the next account or model.
 
-### Jules
+For multiple Claude identities, prefer isolated Linux bridge environments. macOS Claude authentication can rely on Keychain, so a directory reference alone is not a safe multi-account isolation boundary.
 
-Connect the repository in Jules, create an API key, and discover its source resource name through the Jules API. Export the key; do not pass it to `relay init`:
+## CLI and REPL
 
-```sh
-export JULES_API_KEY=YOUR_KEY
-relay init --jules-source sources/github/OWNER/REPO
-```
-
-Relay uses the official Jules `v1alpha` REST API for sessions, follow-ups, status, activities, and plan approval. The alpha schema can change.
-Jules is read-only in Relay: `AUTO_CREATE_PR` chooses a provider-owned branch, so it cannot satisfy Relay's exact `relay/run/...` result-ref contract.
-
-## Use it
-
-Durable development work is explicit:
+Durable work is a delegation. Conversation continuation is a send. A handoff starts another provider from verified GitHub state rather than copying a transcript.
 
 ```sh
 relay delegate codex "Implement passwordless login" --title "Passwordless login"
-relay send claude "Review the integration tests" --mode read
+relay handoff claude "Review the current implementation for security issues" --mode read
+relay send claude "Also review the integration tests" --mode read
+relay sessions --json
 relay status
-relay handoff codex "Review the current implementation for security issues"
-relay handoff jules "Review the security findings" --mode read
-relay reconcile
-relay land RUN_ID
 ```
 
-### Portable Agent Skills
+Shortcuts use the current WorkItem or start one with `--new`:
 
-Put cloud-portable skills in the repository-standard Agent Skills layout:
+```sh
+relay claude "Review the current implementation" --mode read
+relay codex "Start a separate approach" --new --mode write
+```
+
+Running `relay` opens the plain REPL:
+
+```text
+relay
+claude> /use codex
+codex> /handoff claude Review the pinned commit.
+codex> /status
+codex> /quit
+```
+
+Slash commands are `/use`, `/new`, `/handoff`, `/status`, `/land`, `/reconcile`, `/chat`, `/merge`, `/help`, and `/quit`.
+
+## Portable Agent Skills
+
+Relay accepts explicit repository skills in the [Agent Skills](https://github.com/agentskills/agentskills) layout:
 
 ```text
 .agents/skills/
@@ -163,105 +204,27 @@ Put cloud-portable skills in the repository-standard Agent Skills layout:
     assets/
 ```
 
-Each `SKILL.md` must start with YAML frontmatter containing a lowercase kebab-case `name` that matches its directory and a non-empty `description`. The human or orchestrating agent selects skills explicitly; Relay never infers them from a task, provider, account, model, or usage telemetry.
-
-Attach one or more skills to a new delegation or handoff:
-
 ```sh
-relay delegate codex "Review the authentication boundary" \
-  --skill review-security \
-  --skill write-tests
-
-relay handoff claude "Review the published implementation" \
-  --skill review-security
-
-relay claude "Start a separate review" --new --skill review-security
+relay delegate codex "Review authentication" --skill review-security
+relay handoff claude "Review the published implementation" --skill review-security
 ```
 
-In the REPL, use `--` to separate skill options from the instruction:
-
-```text
-claude> /new codex --skill review-security -- Review authentication.
-claude> /handoff jules --skill write-tests -- Add missing edge cases.
-```
-
-`relay_delegate` and `relay_handoff` accept the same optional ordered `skills` array over MCP. Their run result returns the resolved name, repository path, full source commit SHA, and full directory-tree SHA. `relay_send` deliberately has no `skills` input: a provider session's resolved selection is immutable, and recovery reuses it.
-
-The first successfully resolved selection for a WorkItem pins the current remote base-branch commit. Later accounts and providers resolve from that same commit even if the base branch advances. Relay reads the committed Git objects—not modified working-tree files—and sends providers a small coordinate packet instructing them to read the exact commit. Relay never executes skill scripts, installs dependencies, reads `~/.agents/skills`, or interprets skill metadata as permission.
-
-After a WorkItem has a skill-source pin, handoff and recovery compare the candidate commit with that trusted commit. Changes to any `AGENTS.md` or `CLAUDE.md`, `.agents/skills/**`, `.claude/skills/**`, `.github/skills/**`, `.openhands/microagents/**`, or `.mcp.json` stop the provider launch with `instruction_surface_changed` so candidate-authored control instructions cannot silently cross the boundary.
-
-Useful direct commands:
-
-```sh
-relay claude "Review the current PR"
-relay codex "Look for security regressions"
-relay jules "Identify missing edge-case tests" --mode read
-relay sessions --json
-relay providers --json
-```
-
-Running `relay` opens the plain REPL:
-
-```text
-relay
-claude> /use jules
-jules> /handoff codex Review the pinned commit.
-jules> /status
-jules> /quit
-```
-
-Slash commands are `/use`, `/new`, `/handoff`, `/status`, `/land`, `/reconcile`, `/chat`, `/merge`, `/help`, and `/quit`.
-
-Write runs always publish isolated, append-only `relay/run/...` branches. A completed write becomes a candidate, then `relay land RUN_ID` performs a staged two-call lifecycle: the first call creates and checks an immutable staging commit; the second fast-forwards only that WorkItem's integration branch after exact-SHA checks pass. Relay maintains one integration PR per WorkItem. Landing never merges `main` or the base branch; the final base merge remains the separate, human-confirmed `relay merge` flow.
-
-Relay persists a launch-attempt ID before submitting provider work. If it cannot prove whether a remote launch was accepted, the run becomes `launch_uncertain`, `relay status` calls for explicit operator resolution, and Relay quarantines that account's capacity instead of retrying automatically. After inspecting and resolving the provider-side launch, use `relay resolve-launch RUN_ID`; Relay asks for confirmation before cancelling the quarantined local attempt and releasing its capacity. If other running work shares that provider session, Relay quarantines those runs and their capacity independently rather than making them invisible when the session is invalidated.
-
-## Safe merge
-
-Only the interactive CLI can merge:
-
-```sh
-relay merge --strategy squash
-```
-
-Relay refreshes GitHub first, prints the PR, exact 40-character head SHA, checks, and review state, and accepts only `y` or `yes`. It then rechecks that the PR is non-draft, mergeable, approved when required, passing required checks, and still at the approved SHA before invoking `gh pr merge --match-head-commit`.
-
-No `relay_merge` MCP tool exists.
+The caller chooses skills. Relay resolves them from a trusted full Git commit, stores immutable coordinates, and sends a small coordinate packet. It never executes skill scripts or loads home-directory skills. Changes to protected instruction surfaces such as `AGENTS.md`, `CLAUDE.md`, `.agents/skills/**`, or `.mcp.json` stop a later handoff or recovery from silently accepting candidate-authored control instructions.
 
 ## MCP
 
-`relay mcp` is a local STDIO server. It exposes:
+`relay mcp` starts a local STDIO server named `relay-cluster`. It exposes:
 
 - `relay_delegate`
 - `relay_send`
 - `relay_handoff`
 - `relay_status`
-- `relay_accounts` (read-only; profile paths are never returned)
-- `relay_land` (destructive; mutates only the WorkItem integration branch and never merges `main`)
+- `relay_accounts` (read-only; profile paths are omitted)
+- `relay_land` (destructive; integration branch only)
 
-Each input schema rejects unknown fields. Responses expose Relay run lineage and compact GitHub state, but not provider session IDs or prompts. Relay failures are returned as typed, redacted MCP tool errors.
+There is intentionally no `relay_merge` MCP tool.
 
-Example skill-bearing MCP inputs:
-
-```json
-{
-  "provider": "codex",
-  "task": "Review authentication",
-  "skills": ["review-security"]
-}
-```
-
-```json
-{
-  "provider": "claude",
-  "workItem": "current",
-  "instruction": "Review the published implementation",
-  "skills": ["review-security"]
-}
-```
-
-Generic JSON configuration for Claude Code, VS Code, Cursor, and other STDIO MCP hosts:
+Generic STDIO configuration:
 
 ```json
 {
@@ -274,7 +237,7 @@ Generic JSON configuration for Claude Code, VS Code, Cursor, and other STDIO MCP
 }
 ```
 
-Codex uses TOML:
+Codex TOML:
 
 ```toml
 [mcp_servers.relay]
@@ -282,56 +245,65 @@ command = "relay"
 args = ["mcp"]
 ```
 
-Configure the MCP host to launch Relay from the target Git checkout, because “current” WorkItem resolution uses that working directory. Consult the current host documentation for the exact config location: [Codex MCP](https://developers.openai.com/codex/mcp/), [Claude Code MCP](https://docs.anthropic.com/en/docs/claude-code/mcp), [VS Code MCP](https://code.visualstudio.com/docs/copilot/chat/mcp-servers), or [Cursor MCP](https://docs.cursor.com/context/model-context-protocol).
+Launch the MCP server from the target Git checkout because the `current` WorkItem is resolved from that working directory. Inputs use strict schemas; outputs contain compact run and GitHub state, not prompts or provider session IDs.
 
-## Privacy and security
+## GitHub truth and safe landing
 
-- Credentials remain with provider CLIs, `gh`, or `JULES_API_KEY` in the process environment.
-- Provider config rejects credential-shaped setting names.
-- The SQLite database and containing state directory are created with user-only permissions.
-- Prompts are stored by default for local run history. Set `RELAY_STORE_PROMPTS=false` before launching Relay to omit new prompts.
-- External commands run without a shell; structured output is schema-validated.
-- Skill Git reads use exact full SHAs with hooks disabled and never check candidate content out into the locator working tree.
-- Diagnostic objects recursively redact credential-shaped keys.
-- MCP is local STDIO only. There is no unauthenticated network listener.
-- Follow provider terms. Do not share credentials or use Relay to bypass provider protective limits, quotas, or account controls.
+Concurrent writers never share a result branch. Every write run receives a unique `relay/run/...` branch and an immutable base SHA. GitHub reconciliation records a result only when the expected remote branch exists at a full commit SHA.
 
-See [SECURITY.md](SECURITY.md) for reporting and trust boundaries.
+A verified write becomes a candidate. `relay land RUN_ID` uses a staged lifecycle:
 
-## Architecture
+1. Prepare an immutable `relay/stage/...` commit on top of the WorkItem integration branch.
+2. Wait for checks on that exact staging SHA.
+3. On a later call, fast-forward only the `relay/work/...` integration branch if it has not moved.
+4. Maintain one integration pull request for the WorkItem.
 
-Both terminal and MCP clients call the same `RelayCore`. Adapters translate provider protocols and expose honest capabilities. `StateStore` persists coordination in SQLite through ordered migrations. `GitHubClient` verifies explicit refs, full SHAs, matching open PR heads, required checks, and safe merge preconditions. Historical snapshots remain available locally, while status, handoff, recovery, and merge always refresh current GitHub state and never act on a stale snapshot.
-
-The concurrency boundary is:
-
-- delegation depth: 2 when callers propagate `parentRunId`;
-- configured provider-account capacity for active execution;
-- one unique `relay/run/...` result branch per concurrent write run;
-- one serialized landing lease per WorkItem integration branch;
-- total runs per WorkItem: 20;
-- expired account and landing lease reclamation: 60 minutes.
-
-See the [architecture design](docs/superpowers/specs/2026-08-16-relay-madness-design.md) for the complete model.
-
-## Why this is different
-
-Projects such as [Agent Orchestrator](https://github.com/Untrivial-ai/agent-orchestrator) and [OpenHands](https://github.com/OpenHands/OpenHands) are broader agent workspaces or execution platforms. They are useful prior art, but Relay Madness chooses a narrower boundary: it does not run the coding computer. It coordinates provider-hosted agents and treats GitHub as their interoperability layer.
-
-The implementation uses the official [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk). Relevant open-source projects were studied for interface and lifecycle patterns; no third-party source was copied into the first release. Any future copied MIT or Apache-2.0 source must retain its required attribution in [NOTICE](NOTICE); unattributed copying is not acceptable.
-
-## Tests
-
-Public CI never contacts a provider account. Fake `claude`, `codex`, and `gh` executables plus schema-complete Jules HTTP fixtures cover parsing, session reuse, recovery, reconciliation failures, branch advancement, pinned reads, handoffs, transactional locks, recursion limits, merge gates, the CLI, package installation, and a real in-memory MCP client/server exchange.
+Landing never merges `main` or another base branch. The final merge remains interactive:
 
 ```sh
-npm run check
-npm test
-npm run build
+relay merge --strategy squash
+```
+
+Relay prints the pull request, full head SHA, checks, and review state. It accepts only `y` or `yes`, then rechecks that the open PR is non-draft, mergeable, appropriately reviewed, passing required checks, and still at the approved SHA before invoking GitHub's SHA-bound merge.
+
+If Relay cannot prove whether a provider accepted a launch, it records `launch_uncertain` and quarantines capacity instead of retrying a possibly duplicated side effect. After manually inspecting the provider, use `relay resolve-launch RUN_ID` to resolve the local attempt explicitly.
+
+## Security and privacy
+
+- `gh`, `codex`, and `claude` own their credentials.
+- Provider configuration rejects credential-shaped keys.
+- SQLite and its new parent directory are created with user-only permissions.
+- Set `RELAY_STORE_PROMPTS=false` to omit prompts from new local run records.
+- External commands use argument arrays with `shell: false`.
+- Candidate-controlled Git hooks are disabled during skill reads and staged landing.
+- MCP is local STDIO only; there is no unauthenticated listener.
+- Diagnostic objects redact credential-shaped values.
+
+Provider prompts are not GitHub authorization. A provider's GitHub identity can write any ref GitHub permits, regardless of the requested `relay/run/...` branch. Protect base and integration branches with GitHub rulesets and use least-privileged provider identities.
+
+See [SECURITY.md](SECURITY.md) for private reporting and the complete trust boundary.
+
+## Development
+
+```sh
+git clone https://github.com/Memrov/relay-cluster.git
+cd relay-cluster
+npm ci
+npm run verify
 npm pack --dry-run
 ```
 
-CI runs the release checks on macOS and Linux with Node 22.
+Public tests use fake `claude`, `codex`, and `gh` executables. CI requires no paid provider task and runs on macOS and Ubuntu with Node 22.
 
-## Contributing and license
+The architecture remains intentionally small:
 
-Contributions are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md). Relay Madness is licensed under [Apache-2.0](LICENSE).
+```text
+src/app.ts + src/mcp.ts
+          │
+      RelayCore
+       ├── StateStore (SQLite coordination truth)
+       ├── GitHubClient (artifact truth)
+       └── ClaudeProvider / CodexProvider (execution translation)
+```
+
+Read the [current design](docs/superpowers/specs/2026-08-17-relay-cluster-rebrand-design.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [NOTICE](NOTICE). Relay Cluster is licensed under [Apache-2.0](LICENSE).
