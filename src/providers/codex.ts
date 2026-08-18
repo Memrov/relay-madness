@@ -71,12 +71,12 @@ export class CodexProvider implements CloudProvider {
     };
   }
 
-  async authStatus(): Promise<AuthStatus> {
+  async authStatus(profilePath?: string): Promise<AuthStatus> {
     try {
       const result = await this.runner.run(
         'codex',
         ['login', 'status'],
-        this.runOptions(),
+        this.runOptions(undefined, profilePath),
       );
       const method = result.stdout.trim().match(/Logged in using\s+(.+)$/i)?.[1];
       const status: AuthStatus = { authenticated: true };

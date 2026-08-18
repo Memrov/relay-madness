@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-import { appendFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const scenario = process.env.FAKE_CLAUDE_SCENARIO ?? 'start';
@@ -9,16 +15,46 @@ const environmentLog = process.env.FAKE_ENVIRONMENT_LOG;
 if (environmentLog) {
   appendFileSync(
     environmentLog,
-    `${JSON.stringify({ CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR })}\n`,
+    `${JSON.stringify({
+      CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
+      CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+      ANTHROPIC_PROFILE: process.env.ANTHROPIC_PROFILE,
+      CLAUDE_CODE_USE_BEDROCK: process.env.CLAUDE_CODE_USE_BEDROCK,
+    })}\n`,
   );
 }
 
+const profilePath = process.env.CLAUDE_CONFIG_DIR;
+const loginMarker = profilePath === undefined
+  ? undefined
+  : join(profilePath, '.fake-authenticated');
+
 if (args[0] === 'auth' && args[1] === 'status') {
+  const loggedIn = scenario !== 'logged-out' &&
+    (scenario !== 'profile-login-required' ||
+      (loginMarker !== undefined && existsSync(loginMarker)));
   process.stdout.write(JSON.stringify({
-    loggedIn: scenario !== 'logged-out',
-    authMethod: scenario === 'logged-out' ? 'none' : 'claude.ai',
+    loggedIn,
+    authMethod: loggedIn ? 'claude.ai' : 'none',
     apiProvider: 'firstParty',
+    ...(loggedIn
+      ? {
+          email: 'claude-a@example.test',
+          orgId: 'org_claude_a',
+          orgName: 'Claude A',
+        }
+      : {}),
   }));
+} else if (args[0] === 'auth' && args[1] === 'login') {
+  if (loginMarker === undefined) {
+    process.stderr.write('missing CLAUDE_CONFIG_DIR');
+    process.exitCode = 2;
+  } else {
+    mkdirSync(profilePath, { recursive: true });
+    writeFileSync(loginMarker, 'authenticated\n', { mode: 0o600 });
+  }
 } else if (args[0] === '--version') {
   process.stdout.write('2.1.217 (Claude Code)');
 } else if (args[0] === '--help') {

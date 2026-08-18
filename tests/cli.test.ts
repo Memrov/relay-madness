@@ -52,6 +52,7 @@ interface CoreCalls {
   handoff: unknown[];
   initialize: unknown[];
   addAccount: unknown[];
+  loginAccount: unknown[];
   recordUsage: unknown[];
   land: unknown[];
   chat: unknown[];
@@ -70,6 +71,7 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
     handoff: [],
     initialize: [],
     addAccount: [],
+    loginAccount: [],
     recordUsage: [],
     land: [],
     chat: [],
@@ -113,6 +115,22 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
         ...(input as object),
         createdAt: '2026-08-16T00:00:00.000Z',
         updatedAt: '2026-08-16T00:00:00.000Z',
+      };
+    },
+    loginAccount: async (accountId: string) => {
+      calls.loginAccount.push(accountId);
+      return {
+        id: accountId,
+        provider: 'claude',
+        label: 'Claude Primary',
+        profilePath: '/profiles/claude-a',
+        status: 'ready',
+        maxConcurrency: 1,
+        isDefault: true,
+        authFingerprint: 'a'.repeat(64),
+        authVerifiedAt: '2026-08-18T05:00:00.000Z',
+        createdAt: '2026-08-18T04:00:00.000Z',
+        updatedAt: '2026-08-18T05:00:00.000Z',
       };
     },
     accounts: async (input: unknown) => {
@@ -563,6 +581,47 @@ test('manages account and caller-supplied weekly usage without listing profile p
   ]);
   assert.equal(io.stdout.includes('/profiles/codex-a'), false);
   assert.match(io.stdout, /"accountId": "codex-a"/);
+});
+
+test('registers a Claude profile as auth-required and performs native login', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+  const cli = createCli(core, io);
+
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'account',
+    'add',
+    'claude',
+    'claude-a',
+    '--label',
+    'Claude Primary',
+    '--profile',
+    '/profiles/claude-a',
+    '--default',
+  ]);
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'account',
+    'login',
+    'claude-a',
+  ]);
+
+  assert.deepEqual(calls.addAccount, [
+    {
+      provider: 'claude',
+      id: 'claude-a',
+      label: 'Claude Primary',
+      profilePath: '/profiles/claude-a',
+      status: 'auth_required',
+      maxConcurrency: 1,
+      isDefault: true,
+    },
+  ]);
+  assert.deepEqual(calls.loginAccount, ['claude-a']);
+  assert.match(io.stdout, /Authenticated Claude Primary \(claude-a\)/);
 });
 
 test('rejects blank remaining usage percentages before recording a snapshot', async () => {

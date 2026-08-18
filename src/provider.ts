@@ -39,6 +39,8 @@ export interface AuthStatus {
   authenticated: boolean;
   method?: string;
   detail?: string;
+  /** Opaque, non-secret digest used to bind a native profile to one account. */
+  identityFingerprint?: string;
 }
 
 export interface StartRunInput {
@@ -101,7 +103,8 @@ export interface ProviderInspection {
 export interface CloudProvider {
   readonly name: ProviderName;
   capabilities(): Promise<ProviderCapabilities>;
-  authStatus(): Promise<AuthStatus>;
+  authStatus(profilePath?: string): Promise<AuthStatus>;
+  loginProfile?(profilePath: string): Promise<AuthStatus>;
   start(input: StartRunInput): Promise<ProviderExecution>;
   send?(input: SendRunInput): Promise<ProviderExecution>;
   inspect?(input: InspectRunInput): Promise<ProviderInspection>;

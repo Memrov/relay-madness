@@ -189,6 +189,44 @@ export class RelayCore {
     };
   }
 
+  async loginAccount(accountId: string): Promise<ProviderAccountRecord> {
+    const account = this.dependencies.store.getProviderAccount(accountId);
+    if (account === undefined) {
+      throw new RelayError(
+        'not_found',
+        `Provider account ${accountId} was not found.`,
+      );
+    }
+    const provider = this.provider(account.provider);
+    const capabilities = await provider.capabilities();
+    if (!capabilities.profileIsolation || provider.loginProfile === undefined) {
+      throw new RelayError(
+        'capability_unavailable',
+        `${account.provider} does not support native profile login.`,
+      );
+    }
+    const auth = await provider.loginProfile(account.profilePath);
+    if (!auth.authenticated) {
+      this.dependencies.store.markProviderAccountAuthRequired(account.id);
+      throw new RelayError(
+        'account_unavailable',
+        `Provider account ${account.id} is not authenticated.`,
+      );
+    }
+    if (auth.identityFingerprint === undefined) {
+      this.dependencies.store.markProviderAccountAuthRequired(account.id);
+      throw new RelayError(
+        'provider_output_invalid',
+        `${account.provider} did not report a verifiable profile identity.`,
+      );
+    }
+    return this.dependencies.store.bindProviderAccountAuth(
+      account.id,
+      auth.identityFingerprint,
+      this.now(),
+    );
+  }
+
   async initialize(input: InitializeInput): Promise<ProjectRecord> {
     const detected = await this.dependencies.github.detectProject(input.cwd);
     const project = this.dependencies.store.upsertProject({
@@ -1459,12 +1497,61 @@ export class RelayCore {
     if (requirements.account !== undefined && !capabilities.profileIsolation) {
       unavailable(`${provider.name} cannot isolate a selected account profile.`);
     }
+    if (
+      requirements.account !== undefined &&
+      provider.loginProfile !== undefined
+    ) {
+      await this.requireAccountIdentity(provider, requirements.account);
+    }
     if (requirements.model !== undefined && !capabilities.selectModel) {
       unavailable(`${provider.name} does not support explicit model selection.`);
     }
     if (requirements.mode === 'write' && !capabilities.controlledResultBranch) {
       unavailable(
         `${provider.name} cannot publish to a Relay-controlled result branch.`,
+      );
+    }
+  }
+
+  private async requireAccountIdentity(
+    provider: CloudProvider,
+    account: ProviderAccountRecord,
+  ): Promise<void> {
+    if (account.status !== 'ready' && account.status !== 'auth_required') return;
+    if (account.authFingerprint === undefined) {
+      this.dependencies.store.markProviderAccountAuthRequired(account.id);
+      throw new RelayError(
+        'account_unavailable',
+        `Provider account ${account.id} needs native login before it can run.`,
+      );
+    }
+    const auth = await provider.authStatus(account.profilePath);
+    if (!auth.authenticated) {
+      this.dependencies.store.markProviderAccountAuthRequired(account.id);
+      throw new RelayError(
+        'account_unavailable',
+        `Provider account ${account.id} is no longer authenticated.`,
+      );
+    }
+    if (auth.identityFingerprint === undefined) {
+      this.dependencies.store.markProviderAccountAuthRequired(account.id);
+      throw new RelayError(
+        'provider_output_invalid',
+        `${provider.name} did not report a verifiable profile identity.`,
+      );
+    }
+    if (auth.identityFingerprint !== account.authFingerprint) {
+      this.dependencies.store.markProviderAccountAuthRequired(account.id);
+      throw new RelayError(
+        'provider_mismatch',
+        `Provider profile for account ${account.id} is authenticated as another identity.`,
+      );
+    }
+    if (account.status === 'auth_required') {
+      this.dependencies.store.bindProviderAccountAuth(
+        account.id,
+        auth.identityFingerprint,
+        this.now(),
       );
     }
   }

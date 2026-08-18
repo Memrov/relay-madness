@@ -47,6 +47,8 @@ export interface ProviderAccountInput {
 }
 
 export interface ProviderAccountRecord extends ProviderAccountInput {
+  authFingerprint?: string;
+  authVerifiedAt?: string;
   lastUsedAt?: string;
   createdAt: string;
   updatedAt: string;
@@ -423,6 +425,16 @@ export class StateStore {
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             label = excluded.label,
+            auth_fingerprint = CASE
+              WHEN provider_accounts.profile_path = excluded.profile_path
+                THEN provider_accounts.auth_fingerprint
+              ELSE NULL
+            END,
+            auth_verified_at = CASE
+              WHEN provider_accounts.profile_path = excluded.profile_path
+                THEN provider_accounts.auth_verified_at
+              ELSE NULL
+            END,
             profile_path = excluded.profile_path,
             status = excluded.status,
             max_concurrency = excluded.max_concurrency,
@@ -442,6 +454,47 @@ export class StateStore {
         );
       return this.getRequiredProviderAccount(input.id);
     }).immediate();
+  }
+
+  bindProviderAccountAuth(
+    id: string,
+    fingerprint: string,
+    verifiedAt = new Date(),
+  ): ProviderAccountRecord {
+    if (!/^[0-9a-f]{64}$/i.test(fingerprint) || !isValidDate(verifiedAt)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Provider account authentication binding is invalid.',
+      );
+    }
+    const timestamp = verifiedAt.toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE provider_accounts
+         SET auth_fingerprint = ?, auth_verified_at = ?, status = 'ready',
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(fingerprint.toLowerCase(), timestamp, timestamp, id);
+    if (result.changes !== 1) {
+      throw new RelayError('not_found', `Provider account ${id} was not found.`);
+    }
+    return this.getRequiredProviderAccount(id);
+  }
+
+  markProviderAccountAuthRequired(id: string): ProviderAccountRecord {
+    const timestamp = new Date().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE provider_accounts
+         SET status = 'auth_required', updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(timestamp, id);
+    if (result.changes !== 1) {
+      throw new RelayError('not_found', `Provider account ${id} was not found.`);
+    }
+    return this.getRequiredProviderAccount(id);
   }
 
   getProviderAccount(id: string): ProviderAccountRecord | undefined {
@@ -2123,6 +2176,15 @@ export class StateStore {
         this.recordMigration(10);
       }).immediate();
     }
+    if (!applied.has(11)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          ALTER TABLE provider_accounts ADD COLUMN auth_fingerprint TEXT;
+          ALTER TABLE provider_accounts ADD COLUMN auth_verified_at TEXT;
+        `);
+        this.recordMigration(11);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -2343,6 +2405,12 @@ export class StateStore {
       updatedAt: String(row.updated_at),
     };
     if (row.last_used_at !== null) record.lastUsedAt = String(row.last_used_at);
+    if (row.auth_fingerprint !== null) {
+      record.authFingerprint = String(row.auth_fingerprint);
+    }
+    if (row.auth_verified_at !== null) {
+      record.authVerifiedAt = String(row.auth_verified_at);
+    }
     return record;
   }
 

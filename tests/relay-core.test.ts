@@ -43,14 +43,25 @@ class FakeProvider implements CloudProvider {
   readonly sends: SendRunInput[] = [];
   readonly inspections: InspectRunInput[] = [];
   readonly attachments: AttachInput[] = [];
+  readonly profileLogins: string[] = [];
   startStatus: ProviderRunStatus = 'running';
   sendStatus: ProviderRunStatus = 'running';
   startError: RelayError | undefined;
   sendError: RelayError | undefined;
   onStart?: (input: StartRunInput) => void;
   capabilityOverrides: Partial<ProviderCapabilities> = {};
+  profileAuthenticated = true;
+  profileIdentityFingerprint = 'a'.repeat(64);
+  readonly loginProfile?: (profilePath: string) => Promise<AuthStatus>;
 
-  constructor(readonly name: ProviderName) {}
+  constructor(readonly name: ProviderName) {
+    if (name === 'claude') {
+      this.loginProfile = async (profilePath) => {
+        this.profileLogins.push(profilePath);
+        return await this.authStatus(profilePath);
+      };
+    }
+  }
 
   async capabilities(): Promise<ProviderCapabilities> {
     return {
@@ -71,8 +82,14 @@ class FakeProvider implements CloudProvider {
     };
   }
 
-  async authStatus(): Promise<AuthStatus> {
-    return { authenticated: true, method: 'fake' };
+  async authStatus(profilePath?: string): Promise<AuthStatus> {
+    return {
+      authenticated: this.profileAuthenticated,
+      method: 'fake',
+      ...(profilePath === undefined || !this.profileAuthenticated
+        ? {}
+        : { identityFingerprint: this.profileIdentityFingerprint }),
+    };
   }
 
   async start(input: StartRunInput): Promise<ProviderExecution> {
@@ -194,6 +211,7 @@ function addAccount(
     isDefault?: boolean;
     maxConcurrency?: number;
     model?: string;
+    bindAuth?: boolean;
   },
 ): void {
   store.upsertProviderAccount({
@@ -205,6 +223,9 @@ function addAccount(
     maxConcurrency: input.maxConcurrency ?? 1,
     isDefault: input.isDefault ?? false,
   });
+  if (input.provider === 'claude' && input.bindAuth !== false) {
+    store.bindProviderAccountAuth(input.id, 'a'.repeat(64));
+  }
 }
 
 afterEach(() => {
@@ -268,6 +289,69 @@ test('binds an explicit account and its configured model to provider execution',
   assert.equal(harness.codex.starts[0]?.profilePath, '/profiles/codex-a');
   assert.equal(harness.codex.starts[0]?.model, 'gpt-5.6-sol');
   assert.equal(harness.codex.starts[0]?.environmentId, 'env-codex-a');
+});
+
+test('binds a Claude native login to its registered account profile', async () => {
+  const harness = await relayHarness();
+  addAccount(harness.store, {
+    id: 'claude-login',
+    provider: 'claude',
+    bindAuth: false,
+  });
+
+  const account = await harness.core.loginAccount('claude-login');
+
+  assert.deepEqual(harness.claude.profileLogins, ['/profiles/claude-login']);
+  assert.equal(account.status, 'ready');
+  assert.equal(account.authFingerprint, 'a'.repeat(64));
+  assert.match(account.authVerifiedAt ?? '', /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('rejects an unbound Claude profile before creating provider work', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, {
+    id: 'claude-unbound',
+    provider: 'claude',
+    bindAuth: false,
+  });
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      accountId: 'claude-unbound',
+      task: 'Review it',
+      title: 'Unbound profile',
+      cwd: harness.cwd,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'account_unavailable',
+  );
+  assert.equal(harness.claude.starts.length, 0);
+  assert.equal(harness.store.getProviderAccount('claude-unbound')?.status, 'auth_required');
+});
+
+test('rejects a Claude profile that resolves to another bound identity', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'claude-a', provider: 'claude' });
+  harness.claude.profileIdentityFingerprint = 'b'.repeat(64);
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'claude',
+      accountId: 'claude-a',
+      task: 'Review it',
+      title: 'Wrong identity',
+      cwd: harness.cwd,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_mismatch',
+  );
+  assert.equal(harness.claude.starts.length, 0);
+  assert.equal(harness.store.getProviderAccount('claude-a')?.status, 'auth_required');
 });
 
 test('rejects an explicit account registered to another provider', async () => {
