@@ -33,6 +33,8 @@ export interface ProviderCapabilities {
   subscriptionAuth: boolean;
   selectModel: boolean;
   profileIsolation: boolean;
+  /** The provider reports a stable non-secret identity for a selected profile. */
+  reportsProfileIdentity: boolean;
 }
 
 export interface AuthStatus {

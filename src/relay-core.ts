@@ -213,6 +213,12 @@ export class RelayCore {
         `Provider account ${account.id} is not authenticated.`,
       );
     }
+    if (!capabilities.reportsProfileIdentity) {
+      return this.dependencies.store.verifyProviderAccountAuth(
+        account.id,
+        this.now(),
+      );
+    }
     if (auth.identityFingerprint === undefined) {
       this.dependencies.store.markProviderAccountAuthRequired(account.id);
       throw new RelayError(
@@ -1501,7 +1507,11 @@ export class RelayCore {
       requirements.account !== undefined &&
       provider.loginProfile !== undefined
     ) {
-      await this.requireAccountIdentity(provider, requirements.account);
+      await this.requireAccountIdentity(
+        provider,
+        requirements.account,
+        capabilities,
+      );
     }
     if (requirements.model !== undefined && !capabilities.selectModel) {
       unavailable(`${provider.name} does not support explicit model selection.`);
@@ -1516,9 +1526,13 @@ export class RelayCore {
   private async requireAccountIdentity(
     provider: CloudProvider,
     account: ProviderAccountRecord,
+    capabilities: ProviderCapabilities,
   ): Promise<void> {
     if (account.status !== 'ready' && account.status !== 'auth_required') return;
-    if (account.authFingerprint === undefined) {
+    if (
+      account.authVerifiedAt === undefined ||
+      (capabilities.reportsProfileIdentity && account.authFingerprint === undefined)
+    ) {
       this.dependencies.store.markProviderAccountAuthRequired(account.id);
       throw new RelayError(
         'account_unavailable',
@@ -1533,26 +1547,38 @@ export class RelayCore {
         `Provider account ${account.id} is no longer authenticated.`,
       );
     }
-    if (auth.identityFingerprint === undefined) {
-      this.dependencies.store.markProviderAccountAuthRequired(account.id);
-      throw new RelayError(
-        'provider_output_invalid',
-        `${provider.name} did not report a verifiable profile identity.`,
-      );
-    }
-    if (auth.identityFingerprint !== account.authFingerprint) {
-      this.dependencies.store.markProviderAccountAuthRequired(account.id);
-      throw new RelayError(
-        'provider_mismatch',
-        `Provider profile for account ${account.id} is authenticated as another identity.`,
-      );
+    if (capabilities.reportsProfileIdentity) {
+      if (auth.identityFingerprint === undefined) {
+        this.dependencies.store.markProviderAccountAuthRequired(account.id);
+        throw new RelayError(
+          'provider_output_invalid',
+          `${provider.name} did not report a verifiable profile identity.`,
+        );
+      }
+      if (auth.identityFingerprint !== account.authFingerprint) {
+        this.dependencies.store.markProviderAccountAuthRequired(account.id);
+        throw new RelayError(
+          'provider_mismatch',
+          `Provider profile for account ${account.id} is authenticated as another identity.`,
+        );
+      }
     }
     if (account.status === 'auth_required') {
-      this.dependencies.store.bindProviderAccountAuth(
-        account.id,
-        auth.identityFingerprint,
-        this.now(),
-      );
+      if (
+        capabilities.reportsProfileIdentity &&
+        auth.identityFingerprint !== undefined
+      ) {
+        this.dependencies.store.bindProviderAccountAuth(
+          account.id,
+          auth.identityFingerprint,
+          this.now(),
+        );
+      } else {
+        this.dependencies.store.verifyProviderAccountAuth(
+          account.id,
+          this.now(),
+        );
+      }
     }
   }
 

@@ -119,15 +119,16 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
     },
     loginAccount: async (accountId: string) => {
       calls.loginAccount.push(accountId);
+      const codex = accountId.startsWith('codex');
       return {
         id: accountId,
-        provider: 'claude',
-        label: 'Claude Primary',
-        profilePath: '/profiles/claude-a',
+        provider: codex ? 'codex' : 'claude',
+        label: codex ? 'Codex Primary' : 'Claude Primary',
+        profilePath: codex ? '/profiles/codex-a' : '/profiles/claude-a',
         status: 'ready',
         maxConcurrency: 1,
         isDefault: true,
-        authFingerprint: 'a'.repeat(64),
+        ...(codex ? {} : { authFingerprint: 'a'.repeat(64) }),
         authVerifiedAt: '2026-08-18T05:00:00.000Z',
         createdAt: '2026-08-18T04:00:00.000Z',
         updatedAt: '2026-08-18T05:00:00.000Z',
@@ -556,7 +557,7 @@ test('manages account and caller-supplied weekly usage without listing profile p
       id: 'codex-a',
       label: 'Primary',
       profilePath: '/profiles/codex-a',
-      status: 'ready',
+      status: 'auth_required',
       maxConcurrency: 1,
       isDefault: true,
     },
@@ -622,6 +623,47 @@ test('registers a Claude profile as auth-required and performs native login', as
   ]);
   assert.deepEqual(calls.loginAccount, ['claude-a']);
   assert.match(io.stdout, /Authenticated Claude Primary \(claude-a\)/);
+});
+
+test('registers a Codex profile as auth-required and performs native login', async () => {
+  const { core, calls } = fakeCore();
+  const io = memoryIo();
+  const cli = createCli(core, io);
+
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'account',
+    'add',
+    'codex',
+    'codex-a',
+    '--label',
+    'Codex Primary',
+    '--profile',
+    '/profiles/codex-a',
+    '--default',
+  ]);
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'account',
+    'login',
+    'codex-a',
+  ]);
+
+  assert.deepEqual(calls.addAccount, [
+    {
+      provider: 'codex',
+      id: 'codex-a',
+      label: 'Codex Primary',
+      profilePath: '/profiles/codex-a',
+      status: 'auth_required',
+      maxConcurrency: 1,
+      isDefault: true,
+    },
+  ]);
+  assert.deepEqual(calls.loginAccount, ['codex-a']);
+  assert.match(io.stdout, /Authenticated Codex Primary \(codex-a\)/);
 });
 
 test('rejects blank remaining usage percentages before recording a snapshot', async () => {

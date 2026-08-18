@@ -482,6 +482,31 @@ export class StateStore {
     return this.getRequiredProviderAccount(id);
   }
 
+  verifyProviderAccountAuth(
+    id: string,
+    verifiedAt = new Date(),
+  ): ProviderAccountRecord {
+    if (!isValidDate(verifiedAt)) {
+      throw new RelayError(
+        'invalid_argument',
+        'Provider account authentication verification is invalid.',
+      );
+    }
+    const timestamp = verifiedAt.toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE provider_accounts
+         SET auth_fingerprint = NULL, auth_verified_at = ?, status = 'ready',
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(timestamp, timestamp, id);
+    if (result.changes !== 1) {
+      throw new RelayError('not_found', `Provider account ${id} was not found.`);
+    }
+    return this.getRequiredProviderAccount(id);
+  }
+
   markProviderAccountAuthRequired(id: string): ProviderAccountRecord {
     const timestamp = new Date().toISOString();
     const result = this.database

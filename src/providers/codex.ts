@@ -1,3 +1,5 @@
+import { mkdir } from 'node:fs/promises';
+
 import * as z from 'zod/v4';
 
 import { RelayError } from '../errors.js';
@@ -13,7 +15,22 @@ import type {
   SendRunInput,
   StartRunInput,
 } from '../provider.js';
-import { ProcessRunner, type RunOptions } from '../process-runner.js';
+import {
+  ProcessRunner,
+  type InteractiveOptions,
+  type RunOptions,
+} from '../process-runner.js';
+
+const PROFILE_CONFIG_ARGS = [
+  '-c',
+  'cli_auth_credentials_store="file"',
+  '-c',
+  'forced_login_method="chatgpt"',
+] as const;
+const PROFILE_CREDENTIAL_OVERRIDES = [
+  'OPENAI_API_KEY',
+  'CODEX_ACCESS_TOKEN',
+] as const;
 
 const diffSummarySchema = z.object({
   files_changed: z.number().int().nonnegative(),
@@ -68,6 +85,7 @@ export class CodexProvider implements CloudProvider {
       subscriptionAuth: true,
       selectModel: available,
       profileIsolation: available,
+      reportsProfileIdentity: false,
     };
   }
 
@@ -75,13 +93,27 @@ export class CodexProvider implements CloudProvider {
     try {
       const result = await this.runner.run(
         'codex',
-        ['login', 'status'],
+        ['login', 'status', ...profileConfigArgs(profilePath)],
         this.runOptions(undefined, profilePath),
       );
-      const method = result.stdout.trim().match(/Logged in using\s+(.+)$/i)?.[1];
-      const status: AuthStatus = { authenticated: true };
-      if (method !== undefined) status.method = method;
-      return status;
+      const reportedMethod = result.stdout
+        .trim()
+        .match(/^Logged in using\s+(.+)$/i)?.[1];
+      if (reportedMethod === undefined) {
+        throw new RelayError(
+          'provider_output_invalid',
+          'Codex authentication status did not report a login method.',
+        );
+      }
+      const method = reportedMethod.replace(/^an?\s+/i, '');
+      if (method.toLowerCase() !== 'chatgpt') {
+        return {
+          authenticated: false,
+          method,
+          detail: 'Codex Cloud requires ChatGPT authentication.',
+        };
+      }
+      return { authenticated: true, method: 'ChatGPT' };
     } catch (error) {
       if (
         error instanceof RelayError &&
@@ -99,9 +131,35 @@ export class CodexProvider implements CloudProvider {
     }
   }
 
+  async loginProfile(profilePath: string): Promise<AuthStatus> {
+    await ensureProfileDirectory(profilePath);
+    const current = await this.authStatus(profilePath);
+    if (current.authenticated) return current;
+
+    const exitCode = await this.runner.spawnInteractive(
+      'codex',
+      ['login', ...PROFILE_CONFIG_ARGS],
+      this.interactiveOptions(undefined, profilePath),
+    );
+    if (exitCode !== 0) {
+      throw new RelayError(
+        'process_failed',
+        `Codex profile login exited with ${exitCode}.`,
+        { command: 'codex', exitCode },
+      );
+    }
+    return await this.authStatus(profilePath);
+  }
+
   async start(input: StartRunInput): Promise<ProviderExecution> {
     const environmentId = requireEnvironment(input.environmentId);
-    const args = ['cloud', 'exec', '--env', environmentId];
+    const args = [
+      'cloud',
+      'exec',
+      '--env',
+      environmentId,
+      ...profileConfigArgs(input.profilePath),
+    ];
     if (input.model !== undefined) args.push('-c', `model="${validatedModel(input.model)}"`);
     const branch = input.resultBranch ?? input.startingBranch;
     if (branch !== undefined) args.push('--branch', branch);
@@ -126,7 +184,16 @@ export class CodexProvider implements CloudProvider {
     const environmentId = requireEnvironment(input.environmentId);
     const result = await this.runner.run(
       'codex',
-      ['cloud', 'list', '--env', environmentId, '--json', '--limit', '20'],
+      [
+        'cloud',
+        'list',
+        '--env',
+        environmentId,
+        '--json',
+        '--limit',
+        '20',
+        ...profileConfigArgs(input.profilePath),
+      ],
       this.runOptions(undefined, input.profilePath),
     );
     const tasks = parseTaskList(result.stdout);
@@ -147,7 +214,7 @@ export class CodexProvider implements CloudProvider {
   async attach(input: AttachInput): Promise<number> {
     return await this.runner.spawnInteractive(
       'codex',
-      ['cloud'],
+      ['cloud', ...profileConfigArgs(input.profilePath)],
       this.interactiveOptions(input.cwd, input.profilePath),
     );
   }
@@ -167,24 +234,61 @@ export class CodexProvider implements CloudProvider {
     if (this.options.env !== undefined || profilePath !== undefined) {
       options.env = {
         ...this.options.env,
-        ...(profilePath === undefined ? {} : { CODEX_HOME: profilePath }),
+        ...(profilePath === undefined
+          ? {}
+          : {
+              CODEX_HOME: profilePath,
+              CODEX_SQLITE_HOME: profilePath,
+            }),
       };
     }
     if (this.options.timeoutMs !== undefined) {
       options.timeoutMs = this.options.timeoutMs;
     }
+    if (profilePath !== undefined) {
+      options.unsetEnv = PROFILE_CREDENTIAL_OVERRIDES;
+    }
     return options;
   }
 
-  private interactiveOptions(cwd: string, profilePath?: string) {
-    const options: { cwd: string; env?: NodeJS.ProcessEnv } = { cwd };
+  private interactiveOptions(
+    cwd: string | undefined,
+    profilePath?: string,
+  ): InteractiveOptions {
+    const options: InteractiveOptions = {};
+    if (cwd !== undefined) options.cwd = cwd;
     if (this.options.env !== undefined || profilePath !== undefined) {
       options.env = {
         ...this.options.env,
-        ...(profilePath === undefined ? {} : { CODEX_HOME: profilePath }),
+        ...(profilePath === undefined
+          ? {}
+          : {
+              CODEX_HOME: profilePath,
+              CODEX_SQLITE_HOME: profilePath,
+            }),
       };
     }
+    if (profilePath !== undefined) {
+      options.unsetEnv = PROFILE_CREDENTIAL_OVERRIDES;
+    }
     return options;
+  }
+}
+
+function profileConfigArgs(profilePath: string | undefined): readonly string[] {
+  return profilePath === undefined ? [] : PROFILE_CONFIG_ARGS;
+}
+
+async function ensureProfileDirectory(profilePath: string): Promise<void> {
+  try {
+    await mkdir(profilePath, { recursive: true, mode: 0o700 });
+  } catch (cause) {
+    throw new RelayError(
+      'invalid_argument',
+      `Unable to create Codex profile directory ${profilePath}.`,
+      { profilePath },
+      { cause },
+    );
   }
 }
 

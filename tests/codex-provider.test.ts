@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 
 import { RelayError } from '../src/errors.js';
+import type { CloudProvider, ProviderCapabilities } from '../src/provider.js';
 import { ProcessRunner } from '../src/process-runner.js';
 import { CodexProvider } from '../src/providers/codex.js';
 
@@ -16,12 +17,16 @@ const fixtureBin = join(
   'bin',
 );
 
-function codexForScenario(scenario: string) {
+function codexForScenario(
+  scenario: string,
+  environment: NodeJS.ProcessEnv = {},
+) {
   const root = mkdtempSync(join(tmpdir(), 'relay-codex-test-'));
   roots.push(root);
   const commandLog = join(root, 'commands.jsonl');
   const environmentLog = join(root, 'environment.jsonl');
   const env = {
+    ...environment,
     PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
     FAKE_CODEX_SCENARIO: scenario,
     FAKE_COMMAND_LOG: commandLog,
@@ -41,7 +46,12 @@ function codexForScenario(scenario: string) {
         .trim()
         .split('\n')
         .filter(Boolean)
-        .map((line) => JSON.parse(line) as { CODEX_HOME?: string }),
+        .map((line) => JSON.parse(line) as {
+          CODEX_HOME?: string;
+          CODEX_SQLITE_HOME?: string;
+          OPENAI_API_KEY?: string;
+          CODEX_ACCESS_TOKEN?: string;
+        }),
   };
 }
 
@@ -98,7 +108,14 @@ test('accepts current Codex cloud task identifiers', async () => {
 });
 
 test('runs Codex with the selected account home and requested cloud model', async () => {
-  const { provider, cwd, readCommands, readEnvironments } = codexForScenario('exec');
+  const { provider, cwd, readCommands, readEnvironments } = codexForScenario(
+    'exec',
+    {
+      CODEX_SQLITE_HOME: '/wrong/shared-state',
+      OPENAI_API_KEY: 'wrong-api-key',
+      CODEX_ACCESS_TOKEN: 'wrong-access-token',
+    },
+  );
 
   await provider.start({
     prompt: 'Build it',
@@ -116,12 +133,19 @@ test('runs Codex with the selected account home and requested cloud model', asyn
     '--env',
     'env-1',
     '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
     'model="gpt-5.6-sol"',
     '--branch',
     'relay/run/work-1/run-1',
     'Build it',
   ]);
-  assert.equal(readEnvironments()[0]?.CODEX_HOME, '/profiles/codex-a');
+  assert.deepEqual(readEnvironments()[0], {
+    CODEX_HOME: '/profiles/codex-a',
+    CODEX_SQLITE_HOME: '/profiles/codex-a',
+  });
 });
 
 test('inspects task status from cloud list JSON', async () => {
@@ -192,6 +216,99 @@ test('uses Codex login status without copying credentials', async () => {
     authenticated: true,
     method: 'ChatGPT',
   });
+});
+
+test('logs in one isolated Codex profile and reuses its native login', async () => {
+  const { provider, cwd, readCommands, readEnvironments } = codexForScenario(
+    'profile-login',
+    {
+      CODEX_SQLITE_HOME: '/wrong/shared-state',
+      OPENAI_API_KEY: 'wrong-api-key',
+      CODEX_ACCESS_TOKEN: 'wrong-access-token',
+    },
+  );
+  const profilePath = join(cwd, 'codex-profile');
+  const login = (provider as CloudProvider).loginProfile;
+  assert.ok(login);
+
+  assert.deepEqual(await login.call(provider, profilePath), {
+    authenticated: true,
+    method: 'ChatGPT',
+  });
+  assert.equal(statSync(profilePath).mode & 0o777, 0o700);
+  assert.deepEqual(await login.call(provider, profilePath), {
+    authenticated: true,
+    method: 'ChatGPT',
+  });
+  assert.deepEqual(readCommands(), [
+    [
+      'login',
+      'status',
+      '-c',
+      'cli_auth_credentials_store="file"',
+      '-c',
+      'forced_login_method="chatgpt"',
+    ],
+    [
+      'login',
+      '-c',
+      'cli_auth_credentials_store="file"',
+      '-c',
+      'forced_login_method="chatgpt"',
+    ],
+    [
+      'login',
+      'status',
+      '-c',
+      'cli_auth_credentials_store="file"',
+      '-c',
+      'forced_login_method="chatgpt"',
+    ],
+    [
+      'login',
+      'status',
+      '-c',
+      'cli_auth_credentials_store="file"',
+      '-c',
+      'forced_login_method="chatgpt"',
+    ],
+  ]);
+  assert.deepEqual(
+    readEnvironments(),
+    Array.from({ length: 4 }, () => ({
+      CODEX_HOME: profilePath,
+      CODEX_SQLITE_HOME: profilePath,
+    })),
+  );
+});
+
+test('rejects API-key authentication for Codex Cloud profiles', async () => {
+  const { provider } = codexForScenario('api-key');
+
+  assert.deepEqual(await provider.authStatus('/profiles/codex-a'), {
+    authenticated: false,
+    method: 'API key',
+    detail: 'Codex Cloud requires ChatGPT authentication.',
+  });
+});
+
+test('rejects a successful Codex login status without an authentication method', async () => {
+  const { provider } = codexForScenario('malformed-login-status');
+
+  await assert.rejects(
+    provider.authStatus('/profiles/codex-a'),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_output_invalid',
+  );
+});
+
+test('reports that Codex cannot expose a stable profile identity', async () => {
+  const { provider } = codexForScenario('exec');
+  const capabilities = await provider.capabilities() as ProviderCapabilities & {
+    reportsProfileIdentity?: boolean;
+  };
+
+  assert.equal(capabilities.reportsProfileIdentity, false);
 });
 
 test('rejects submission output without a task identifier', async () => {

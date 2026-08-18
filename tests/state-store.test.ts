@@ -1000,6 +1000,29 @@ test('binds an opaque native identity and marks the provider account ready', () 
   store.close();
 });
 
+test('verifies a native profile without inventing an identity fingerprint', () => {
+  const store = openStore();
+  store.upsertProviderAccount({
+    id: 'codex-a',
+    provider: 'codex',
+    label: 'Primary',
+    profilePath: '/profiles/codex-a',
+    status: 'auth_required',
+    maxConcurrency: 1,
+    isDefault: true,
+  });
+
+  const account = store.verifyProviderAccountAuth(
+    'codex-a',
+    new Date('2026-08-18T06:00:00.000Z'),
+  );
+
+  assert.equal(account.status, 'ready');
+  assert.equal(account.authFingerprint, undefined);
+  assert.equal(account.authVerifiedAt, '2026-08-18T06:00:00.000Z');
+  store.close();
+});
+
 test('clears a bound identity when its provider profile path changes', () => {
   const store = openStore();
   store.upsertProviderAccount({

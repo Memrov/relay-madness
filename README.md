@@ -112,7 +112,7 @@ Relay probes installed CLI capabilities and fails closed when a provider cannot 
 
 ### Codex Cloud
 
-Authenticate the Codex CLI, connect a cloud environment to the repository, and store only its non-secret environment identifier:
+Authenticate the Codex CLI, connect a cloud environment to the repository, and store only its non-secret environment identifier. The first commands below exercise the default CLI profile; registered Relay profiles use the isolated login flow shown under Multiple accounts.
 
 ```sh
 codex login
@@ -144,9 +144,10 @@ Each account record contains a label, a non-secret local profile reference, capa
 
 ```sh
 relay account add codex codex-a \
-  --label Primary \
-  --profile /profiles/codex-a \
+  --label "Codex Primary" \
+  --profile /absolute/path/to/codex-a \
   --default
+relay account login codex-a
 
 relay account add claude claude-a \
   --label "Claude Primary" \
@@ -164,7 +165,11 @@ relay accounts --provider codex --status ready --limit 100 --json
 relay delegate codex "Implement it" --account codex-a --model gpt-5.6-sol
 ```
 
-`CODEX_HOME` and `CLAUDE_CONFIG_DIR` are passed only to the selected provider process. Usage is informational and caller-supplied: Relay does not scrape a provider UI, decide that an account is exhausted, or choose the next account or model.
+`CODEX_HOME`, `CODEX_SQLITE_HOME`, and `CLAUDE_CONFIG_DIR` are passed only to the selected provider process. Usage is informational and caller-supplied: Relay does not scrape a provider UI, decide that an account is exhausted, or choose the next account or model.
+
+For Codex, `relay account login` creates a missing profile directory with user-only permissions, then runs the native `codex login` flow with both Codex state directories set to that absolute path. Relay forces ChatGPT authentication, forces the Codex CLI's file-backed credential store inside that profile, and removes shell-level `OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` overrides. The Codex CLI owns its credential file; Relay never reads or copies it. Before profile-scoped work, Relay reruns `codex login status` and fails closed unless the profile reports ChatGPT authentication.
+
+The current Codex CLI does not expose a stable, non-secret ChatGPT account identifier through `codex login status`. Relay can therefore prove that the selected directory has a usable ChatGPT login, but cannot prove that an operator authenticated the intended ChatGPT identity. Keep one absolute profile directory per account, label it carefully, and do not reuse or copy profile contents.
 
 For Claude, `relay account login` runs the native `claude auth login` flow with that account's `CLAUDE_CONFIG_DIR`. Claude owns the OAuth credential and its platform credential-store entry; Relay stores only an opaque identity fingerprint and verification time. A profile that is already authenticated is bound without opening another browser flow.
 

@@ -353,7 +353,7 @@ export function createCli(
         provider,
         label: commandOptions.label as string,
         profilePath: commandOptions.profile as string,
-        status: provider === 'claude' ? 'auth_required' : 'ready',
+        status: 'auth_required',
         maxConcurrency: 1,
         isDefault: commandOptions.default === true,
       });
