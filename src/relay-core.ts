@@ -12,6 +12,7 @@ import type {
   ProviderName,
   ProviderRunStatus,
 } from './provider.js';
+import { SUPPORTED_PROVIDERS } from './provider.js';
 import {
   appendSkillPacket,
   type ResolvedSkill,
@@ -170,7 +171,7 @@ export class RelayCore {
     const [github, entries] = await Promise.all([
       this.dependencies.github.authStatus(),
       Promise.all(
-        (['claude', 'codex', 'jules'] as const).map(async (name) => {
+        SUPPORTED_PROVIDERS.map(async (name) => {
           const provider = this.provider(name);
           return [
             name,
@@ -743,7 +744,7 @@ export class RelayCore {
     Readonly<Record<ProviderName, ProviderCapabilities>>
   > {
     const entries = await Promise.all(
-      (['claude', 'codex', 'jules'] as const).map(async (name) => [
+      SUPPORTED_PROVIDERS.map(async (name) => [
         name,
         await this.provider(name).capabilities(),
       ] as const),

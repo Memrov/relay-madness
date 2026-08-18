@@ -1,4 +1,9 @@
-export type ProviderName = 'claude' | 'codex' | 'jules';
+export const SUPPORTED_PROVIDERS = ['claude', 'codex'] as const;
+export type ProviderName = (typeof SUPPORTED_PROVIDERS)[number];
+
+export function isSupportedProvider(value: string): value is ProviderName {
+  return (SUPPORTED_PROVIDERS as readonly string[]).includes(value);
+}
 export type MutationMode = 'read' | 'write';
 
 export type ProviderRunStatus =

@@ -1,7 +1,7 @@
-Relay Madness
+Relay Cluster
 Copyright 2026 Memrov
 
-This product includes software developed by Relay Madness contributors and is
+This product includes software developed by Relay Cluster contributors and is
 distributed under the Apache License, Version 2.0.
 
 The first release was informed by public interface and lifecycle patterns in:
@@ -13,6 +13,6 @@ The first release was informed by public interface and lifecycle patterns in:
 - OpenHands
   https://github.com/OpenHands/OpenHands (MIT)
 
-No source code from those projects was copied into Relay Madness for the first
+No source code from those projects was copied into Relay Cluster for the first
 release. Runtime dependencies are installed as separate packages and retain
 their own copyright notices and licenses.

@@ -10,7 +10,7 @@ import {
   SKILL_NAME_PATTERN,
 } from './skills.js';
 
-const providerSchema = z.enum(['claude', 'codex', 'jules']);
+const providerSchema = z.enum(['claude', 'codex']);
 const modeSchema = z.enum(['read', 'write']);
 const workItemSchema = z.string().min(1).default('current');
 const skillsSchema = z
@@ -114,7 +114,7 @@ export function createRelayMcpServer(
 ): McpServer {
   const cwd = options.cwd ?? process.cwd();
   const server = new McpServer(
-    { name: 'relay-madness', version: '0.1.0' },
+    { name: 'relay-cluster', version: '0.1.0' },
     { capabilities: { tools: {} } },
   );
 
@@ -340,7 +340,7 @@ export async function serveRelayMcp(
   const handle = serveStdio(() => createRelayMcpServer(core, options), {
     onerror: (error) => process.stderr.write(`MCP error: ${error.message}\n`),
   });
-  process.stderr.write('Relay Madness MCP ready on STDIO.\n');
+  process.stderr.write('Relay Cluster MCP ready on STDIO.\n');
   await waitForStdinEnd();
   await handle.close();
 }

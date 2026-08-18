@@ -59,13 +59,13 @@ class FakeProvider implements CloudProvider {
       queueFollowup: this.name !== 'codex',
       interactiveAttach: true,
       structuredStatus: true,
-      events: this.name === 'jules',
+      events: false,
       selectBranch: this.name !== 'claude',
-      publishPullRequest: this.name === 'jules',
+      publishPullRequest: false,
       cancel: false,
-      subscriptionAuth: this.name !== 'jules',
-      selectModel: this.name !== 'jules',
-      profileIsolation: this.name !== 'jules',
+      subscriptionAuth: true,
+      selectModel: true,
+      profileIsolation: true,
       controlledResultBranch: true,
       ...this.capabilityOverrides,
     };
@@ -151,9 +151,8 @@ async function relayHarness(
   };
   const claude = new FakeProvider('claude');
   const codex = new FakeProvider('codex');
-  const jules = new FakeProvider('jules');
   const skillResolver = new FakeSkillResolver();
-  for (const provider of [claude, codex, jules]) {
+  for (const provider of [claude, codex]) {
     provider.startStatus = options.providerStatus ?? 'running';
     provider.onStart = (input) => {
       env.FAKE_GH_BRANCH = input.resultBranch ?? input.startingBranch;
@@ -165,7 +164,6 @@ async function relayHarness(
     providers: new Map<ProviderName, CloudProvider>([
       ['claude', claude],
       ['codex', codex],
-      ['jules', jules],
     ]),
     skillResolver,
     storePrompts: options.storePrompts ?? true,
@@ -178,7 +176,6 @@ async function relayHarness(
     cwd: root,
     claude,
     codex,
-    jules,
     skillResolver,
     setGithubScenario(scenario: string) {
       env.FAKE_GH_SCENARIO = scenario;
@@ -217,13 +214,20 @@ afterEach(() => {
   }
 });
 
+test('exposes exactly the supported Codex and Claude providers', async () => {
+  const harness = await relayHarness();
+
+  const providers = await harness.core.providers();
+
+  assert.deepEqual(Object.keys(providers).sort(), ['claude', 'codex']);
+});
+
 test('initializes provider references and passes them into a delegated run', async () => {
   const harness = await relayHarness();
   const project = await harness.core.initialize({
     cwd: harness.cwd,
     providerConfigs: {
       codex: { environmentId: 'env_123' },
-      jules: { source: 'sources/github-acme-web' },
     },
   });
 
@@ -328,11 +332,12 @@ test('rejects unsupported write, profile, and model selection before provider la
   );
   assert.equal(harness.claude.starts.length, 0);
 
-  addAccount(harness.store, { id: 'jules-a', provider: 'jules' });
+  harness.codex.capabilityOverrides.profileIsolation = false;
+  addAccount(harness.store, { id: 'codex-a', provider: 'codex' });
   await assert.rejects(
     harness.core.delegate({
-      provider: 'jules',
-      accountId: 'jules-a',
+      provider: 'codex',
+      accountId: 'codex-a',
       task: 'Review it',
       title: 'Profile gate',
       cwd: harness.cwd,
@@ -341,10 +346,12 @@ test('rejects unsupported write, profile, and model selection before provider la
     (error: unknown) =>
       error instanceof RelayError && error.code === 'capability_unavailable',
   );
+  harness.codex.capabilityOverrides.profileIsolation = true;
+  harness.codex.capabilityOverrides.selectModel = false;
   await assert.rejects(
     harness.core.delegate({
-      provider: 'jules',
-      model: 'gemini-2.5-pro',
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
       task: 'Review it',
       title: 'Model gate',
       cwd: harness.cwd,
@@ -353,7 +360,7 @@ test('rejects unsupported write, profile, and model selection before provider la
     (error: unknown) =>
       error instanceof RelayError && error.code === 'capability_unavailable',
   );
-  assert.equal(harness.jules.starts.length, 0);
+  assert.equal(harness.codex.starts.length, 0);
 });
 
 test('rejects a follow-up when the provider no longer supports that operation', async () => {
@@ -1090,7 +1097,7 @@ test('builds a handoff from the reconciled SHA without copying the original prom
   });
 
   const result = await harness.core.handoff({
-    provider: 'jules',
+    provider: 'codex',
     instruction: 'Add edge-case tests',
     workItemId: original.workItem.id,
     mode: 'read',
@@ -1224,7 +1231,7 @@ test('handoff does not inherit the source provider skill selection', async () =>
   });
 
   const handoff = await harness.core.handoff({
-    provider: 'jules',
+    provider: 'codex',
     instruction: 'Review it',
     workItemId: original.workItem.id,
     mode: 'read',
@@ -1232,7 +1239,7 @@ test('handoff does not inherit the source provider skill selection', async () =>
 
   assert.deepEqual(handoff.session.skills, []);
   assert.deepEqual(handoff.run.skills, []);
-  assert.doesNotMatch(harness.jules.starts[0]?.prompt ?? '', /Relay-selected skills/);
+  assert.doesNotMatch(harness.codex.starts[0]?.prompt ?? '', /Relay-selected skills/);
   assert.equal(harness.skillResolver.resolutions.length, 1);
 });
 
@@ -1383,7 +1390,7 @@ test('does not hand off or report a stale artifact after its branch disappears',
 
   await assert.rejects(
     harness.core.handoff({
-      provider: 'jules',
+      provider: 'codex',
       instruction: 'Review it',
       workItemId: original.workItem.id,
     }),
@@ -1394,7 +1401,7 @@ test('does not hand off or report a stale artifact after its branch disappears',
   assert.equal(status.artifact, undefined);
   assert.equal(status.workItem.currentSha, undefined);
   assert.equal(status.workItem.pullRequest, undefined);
-  assert.equal(harness.jules.starts.length, 0);
+  assert.equal(harness.codex.starts.length, 0);
 });
 
 test('reconciles a mutating handoff against its isolated result branch', async () => {
@@ -1411,7 +1418,7 @@ test('reconciles a mutating handoff against its isolated result branch', async (
     mode: 'write',
   });
   const handoff = await harness.core.handoff({
-    provider: 'jules',
+    provider: 'codex',
     instruction: 'Fix the review findings',
     workItemId: original.workItem.id,
     mode: 'write',
@@ -1512,12 +1519,12 @@ test('releases a completed writer lease even when GitHub reconciliation fails', 
 
   harness.setGithubScenario('missing');
   await harness.core.delegate({
-    provider: 'jules',
+    provider: 'codex',
     task: 'Continue implementation',
     workItemId: original.workItem.id,
     mode: 'write',
   });
-  assert.equal(harness.jules.starts.length, 1);
+  assert.equal(harness.codex.starts.length, 1);
 });
 
 test('starts a replacement writer on a distinct result branch without a WorkItem lease', async () => {
@@ -1556,15 +1563,15 @@ test('allows a write follow-up and a different writer on isolated result branche
     workItemId: original.workItem.id,
     mode: 'write',
   });
-  const jules = await harness.core.delegate({
-    provider: 'jules',
+  const codex = await harness.core.delegate({
+    provider: 'codex',
     task: 'Edit the same branch',
     workItemId: original.workItem.id,
     mode: 'write',
   });
   assert.equal(harness.claude.sends.length, 1);
-  assert.equal(harness.jules.starts.length, 1);
-  assert.notEqual(jules.run.expectedBranch, original.run.expectedBranch);
+  assert.equal(harness.codex.starts.length, 1);
+  assert.notEqual(codex.run.expectedBranch, original.run.expectedBranch);
 });
 
 test('gives readers a pinned commit without instructing them to push', async () => {
@@ -1639,7 +1646,7 @@ test('derives delegation depth from parent runs and rejects depth three', async 
     mode: 'read',
   });
   const depthOne = await harness.core.delegate({
-    provider: 'jules',
+    provider: 'codex',
     task: 'First handoff',
     workItemId: depthZero.workItem.id,
     parentRunId: depthZero.run.id,
@@ -1656,7 +1663,7 @@ test('derives delegation depth from parent runs and rejects depth three', async 
   assert.equal(depthTwo.run.delegationDepth, 2);
   await assert.rejects(
     harness.core.delegate({
-      provider: 'jules',
+      provider: 'codex',
       task: 'Recursive loop',
       workItemId: depthZero.workItem.id,
       parentRunId: depthTwo.run.id,

@@ -140,8 +140,7 @@ if (args[0] === 'auth' && args[1] === 'status') {
   } else if (
     scenario === 'deleted' ||
     ((scenario === 'missing' || scenario === 'missing-base-a') &&
-      !args[1]?.includes('heads/main')) ||
-    (scenario === 'target-missing' && args[1]?.includes('-jules-'))
+      !args[1]?.includes('heads/main'))
   ) {
     process.stderr.write('gh: Not Found (HTTP 404)');
     process.exitCode = 1;

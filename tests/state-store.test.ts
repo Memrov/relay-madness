@@ -7,6 +7,7 @@ import { afterEach, test } from 'node:test';
 import Database from 'better-sqlite3';
 
 import { RelayError } from '../src/errors.js';
+import type { ProviderName } from '../src/provider.js';
 import { StateStore } from '../src/state-store.js';
 
 const temporaryRoots: string[] = [];
@@ -204,7 +205,7 @@ function createMalformedV6Database(): string {
 
 function storeWithAccount(
   id: string,
-  provider: 'claude' | 'codex' | 'jules',
+  provider: 'claude' | 'codex',
   options: Partial<{
     label: string;
     maxConcurrency: number;
@@ -250,7 +251,7 @@ function activeRunForAccount(
   store: StateStore,
   input: {
     accountId: string;
-    provider: 'claude' | 'codex' | 'jules';
+    provider: 'claude' | 'codex';
     id?: string;
     providerSessionId?: string;
     sessionStatus?: 'pending' | 'active';
@@ -954,6 +955,65 @@ test('stores only a provider profile reference and selects one explicit default'
   store.close();
 });
 
+test('rejects accounts for providers outside the supported contract', () => {
+  const store = openStore();
+
+  assert.throws(
+    () =>
+      store.upsertProviderAccount({
+        id: 'unsupported-a',
+        provider: 'jules' as ProviderName,
+        label: 'Unsupported',
+        profilePath: '/profiles/unsupported-a',
+        status: 'ready',
+        maxConcurrency: 1,
+        isDefault: false,
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'invalid_argument',
+  );
+  assert.equal(store.getProviderAccount('unsupported-a'), undefined);
+  store.close();
+});
+
+test('rejects project configuration for providers outside the supported contract', () => {
+  const store = openStore();
+  const { project } = seed(store);
+
+  assert.throws(
+    () =>
+      store.setProviderConfig(project.id, 'jules' as ProviderName, {
+        source: 'sources/github-acme-web',
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'invalid_argument',
+  );
+  assert.equal(
+    store.getProviderConfig(project.id, 'jules' as ProviderName),
+    undefined,
+  );
+  store.close();
+});
+
+test('rejects sessions for providers outside the supported contract', () => {
+  const store = openStore();
+  const { workItem } = seed(store);
+
+  assert.throws(
+    () =>
+      store.upsertSession({
+        workItemId: workItem.id,
+        provider: 'jules' as ProviderName,
+        providerSessionId: 'unsupported-session',
+        status: 'active',
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'invalid_argument',
+  );
+  assert.equal(store.listSessions(workItem.id).length, 1);
+  store.close();
+});
+
 test('keeps identical provider session IDs isolated by account', () => {
   const store = openStore();
   const { project } = seed(store);
@@ -1557,7 +1617,7 @@ test('rejects provider settings that look like credentials', () => {
   const { project } = seed(store);
 
   assert.throws(
-    () => store.setProviderConfig(project.id, 'jules', { apiKey: 'secret' }),
+    () => store.setProviderConfig(project.id, 'codex', { apiKey: 'secret' }),
     (error: unknown) =>
       error instanceof RelayError && error.code === 'invalid_argument',
   );

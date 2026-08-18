@@ -1,5 +1,8 @@
 # Relay Madness Design
 
+> [!IMPORTANT]
+> **Historical predecessor design.** The current product is Relay Cluster and supports only Codex Cloud and Claude Code cloud. Names and provider scope below are retained as an implementation record; see the [current design](./2026-08-17-relay-cluster-rebrand-design.md).
+
 ## Purpose
 
 Relay Madness is a thin, open-source control plane for provider-hosted coding agents. It coordinates work performed by Claude Code on the web, OpenAI Codex cloud, and Google Jules without hosting model inference, build environments, project dependencies, or development virtual machines.

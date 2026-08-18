@@ -15,6 +15,7 @@ import type {
   ProviderName,
   ProviderRunStatus,
 } from './provider.js';
+import { isSupportedProvider } from './provider.js';
 
 export interface ProjectInput {
   repo: string;
@@ -337,6 +338,7 @@ export class StateStore {
     provider: ProviderName,
     settings: Readonly<Record<string, unknown>>,
   ): void {
+    this.requireSupportedProvider(provider);
     if (containsSensitiveSetting(settings)) {
       throw new RelayError(
         'invalid_argument',
@@ -769,6 +771,7 @@ export class StateStore {
   }
 
   upsertSession(input: SessionInput): SessionRecord {
+    this.requireSupportedProvider(input.provider);
     const now = new Date().toISOString();
     this.database.transaction(() => {
       if (input.status === 'active') {
@@ -2141,6 +2144,7 @@ export class StateStore {
   }
 
   private validateProviderAccount(input: ProviderAccountInput): void {
+    this.requireSupportedProvider(input.provider);
     if (
       input.id.length === 0 ||
       input.label.length === 0 ||
@@ -2149,6 +2153,15 @@ export class StateStore {
       input.maxConcurrency <= 0
     ) {
       throw new RelayError('invalid_argument', 'Provider account fields are invalid.');
+    }
+  }
+
+  private requireSupportedProvider(provider: string): void {
+    if (!isSupportedProvider(provider)) {
+      throw new RelayError(
+        'invalid_argument',
+        `Unsupported provider ${provider}. Expected claude or codex.`,
+      );
     }
   }
 

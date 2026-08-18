@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, test } from 'node:test';
@@ -23,14 +23,21 @@ test('packed package exposes a runnable relay binary without source files', () =
     root,
   ]);
   const report = JSON.parse(packed.stdout) as Array<{ filename: string }>;
+  assert.match(report[0]?.filename ?? '', /^relay-cluster-0\.1\.0\.tgz$/);
   const tarball = join(root, report[0]?.filename ?? 'missing.tgz');
   const listing = run('tar', ['-tf', tarball]).stdout.trim().split('\n');
 
   assert.ok(listing.includes('package/dist/cli.js'));
   assert.ok(!listing.some((path) => path.startsWith('package/src/')));
   assert.ok(!listing.some((path) => path.startsWith('package/tests/')));
+  assert.ok(!listing.some((path) => /jules/i.test(path)));
 
   run('tar', ['-xzf', tarball, '-C', root]);
+  const metadata = JSON.parse(
+    readFileSync(join(root, 'package', 'package.json'), 'utf8'),
+  ) as { name?: string; bin?: Record<string, string> };
+  assert.equal(metadata.name, 'relay-cluster');
+  assert.deepEqual(metadata.bin, { relay: 'dist/cli.js' });
   const help = run(
     process.execPath,
     [join(root, 'package', 'dist', 'cli.js'), '--help'],

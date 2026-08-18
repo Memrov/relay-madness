@@ -1,5 +1,8 @@
 # Portable Agent Skills Design
 
+> [!IMPORTANT]
+> **Historical feature design.** The skills model remains part of Relay Cluster, but any predecessor name or provider example below is superseded by the current Codex-and-Claude scope. See the [current design](./2026-08-17-relay-cluster-rebrand-design.md).
+
 ## Status
 
 Approved direction from the 2026-08-17 architecture discussion. This specification narrows the feature to explicit skill transport. Relay does not choose an agent, provider account, model, or skill and does not become a workflow engine.

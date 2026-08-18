@@ -1,23 +1,22 @@
 {
-  "name": "relay-madness",
+  "name": "relay-cluster",
   "version": "0.1.0",
-  "description": "A thin universal relay for provider-hosted coding agents, with GitHub as artifact truth.",
+  "description": "Turn Codex and Claude Code subscriptions into a personal coding compute cluster, with GitHub as truth.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Memrov/relay-madness.git"
+    "url": "git+https://github.com/Memrov/relay-cluster.git"
   },
-  "homepage": "https://github.com/Memrov/relay-madness#readme",
+  "homepage": "https://github.com/Memrov/relay-cluster#readme",
   "bugs": {
-    "url": "https://github.com/Memrov/relay-madness/issues"
+    "url": "https://github.com/Memrov/relay-cluster/issues"
   },
   "keywords": [
     "coding-agent",
     "mcp",
     "claude",
     "codex",
-    "jules",
     "github"
   ],
   "files": [
@@ -45,7 +44,7 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/build.mjs",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "verify": "npm run check && npm run build && npm test",

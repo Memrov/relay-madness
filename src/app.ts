@@ -12,9 +12,9 @@ import type {
   MutationMode,
   ProviderName,
 } from './provider.js';
+import { isSupportedProvider, SUPPORTED_PROVIDERS } from './provider.js';
 import { ClaudeProvider } from './providers/claude.js';
 import { CodexProvider } from './providers/codex.js';
-import { JulesProvider } from './providers/jules.js';
 import { RelayCore } from './relay-core.js';
 import { runRepl } from './repl.js';
 import {
@@ -98,7 +98,7 @@ export function createRelayApplication(options: {
     options.statePath ??
     join(
       env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'),
-      'relay-madness',
+      'relay-cluster',
       'relay.db',
     );
   const store = StateStore.open(statePath);
@@ -106,7 +106,6 @@ export function createRelayApplication(options: {
   const providers = new Map<ProviderName, CloudProvider>([
     ['claude', new ClaudeProvider(runner, { env })],
     ['codex', new CodexProvider(runner, { env })],
-    ['jules', new JulesProvider({ apiKey: () => env.JULES_API_KEY })],
   ]);
   const github = new GitHubClient(runner, { env });
   const relayCore = new RelayCore({
@@ -178,7 +177,7 @@ export function createCli(
 ): Command {
   const program = new Command('relay');
   program
-    .description('A thin relay for provider-hosted coding agents')
+    .description('Control Codex and Claude cloud coding agents')
     .version('0.1.0')
     .configureOutput({
       writeOut: (text) => io.write(text),
@@ -208,12 +207,10 @@ export function createCli(
     .command('init')
     .description('Register the current GitHub project')
     .option('--codex-env <id>', 'Codex cloud environment ID')
-    .option('--jules-source <name>', 'Jules source resource name')
     .option('--json', 'print machine-readable JSON')
     .action(
       async (commandOptions: {
         codexEnv?: string;
-        julesSource?: string;
         json?: boolean;
       }) => {
         const providerConfigs: Partial<
@@ -221,9 +218,6 @@ export function createCli(
         > = {};
         if (commandOptions.codexEnv !== undefined) {
           providerConfigs.codex = { environmentId: commandOptions.codexEnv };
-        }
-        if (commandOptions.julesSource !== undefined) {
-          providerConfigs.jules = { source: commandOptions.julesSource };
         }
         const project = await core.initialize({
           cwd: io.cwd(),
@@ -239,7 +233,7 @@ export function createCli(
   program
     .command('delegate')
     .description('Delegate durable work to a cloud provider')
-    .argument('<provider>', 'claude, codex, or jules')
+    .argument('<provider>', 'claude or codex')
     .argument('<task>', 'work to perform')
     .option('--title <title>', 'WorkItem title')
     .option('--work-item <id>', 'existing WorkItem ID')
@@ -274,7 +268,7 @@ export function createCli(
   program
     .command('send')
     .description('Continue a provider session for the current WorkItem')
-    .argument('<provider>', 'claude, codex, or jules')
+    .argument('<provider>', 'claude or codex')
     .argument('<message>', 'message to send')
     .option('--work-item <id>', 'WorkItem ID')
     .option('--account <id>', 'provider account ID')
@@ -300,7 +294,7 @@ export function createCli(
   program
     .command('handoff')
     .description('Hand verified GitHub state to another provider')
-    .argument('<provider>', 'claude, codex, or jules')
+    .argument('<provider>', 'claude or codex')
     .argument('<instruction>', 'handoff instruction')
     .option('--work-item <id>', 'WorkItem ID')
     .option('--account <id>', 'provider account ID')
@@ -331,7 +325,7 @@ export function createCli(
   account
     .command('add')
     .description('Register a local provider profile reference')
-    .argument('<provider>', 'claude, codex, or jules')
+    .argument('<provider>', 'claude or codex')
     .argument('<id>', 'provider account ID')
     .requiredOption('--label <label>', 'human-readable account label')
     .requiredOption('--profile <path>', 'local profile reference')
@@ -497,7 +491,7 @@ export function createCli(
   program
     .command('chat')
     .description('Attach to a provider-native cloud session')
-    .argument('<provider>', 'claude, codex, or jules')
+    .argument('<provider>', 'claude or codex')
     .option('--work-item <id>', 'WorkItem ID')
     .option('--account <id>', 'provider account ID')
     .action(async (
@@ -750,12 +744,12 @@ function writeJson(io: RelayIo, value: unknown): void {
 }
 
 function providerName(value: string): ProviderName {
-  if ((PROVIDERS as readonly string[]).includes(value)) {
+  if (isSupportedProvider(value)) {
     return value as ProviderName;
   }
   throw new RelayError(
     'invalid_argument',
-    `Unknown provider ${value}. Expected claude, codex, or jules.`,
+    `Unknown provider ${value}. Expected claude or codex.`,
   );
 }
 
@@ -776,4 +770,4 @@ function normalizeIsoTimestamp(value: string | undefined): string | undefined {
   return timestamp.toISOString();
 }
 
-const PROVIDERS = ['claude', 'codex', 'jules'] as const;
+const PROVIDERS = SUPPORTED_PROVIDERS;
