@@ -36,6 +36,7 @@ import {
 type RelayCoreApi = Pick<
   RelayCore,
   | 'doctor'
+  | 'loginAccount'
   | 'initialize'
   | 'delegate'
   | 'send'
@@ -136,6 +137,7 @@ function createRelayApi(
 ): RelayApi {
   return {
     doctor: core.doctor.bind(core),
+    loginAccount: core.loginAccount.bind(core),
     initialize: core.initialize.bind(core),
     delegate: core.delegate.bind(core),
     send: core.send.bind(core),
@@ -345,16 +347,25 @@ export function createCli(
     .requiredOption('--profile <path>', 'local profile reference')
     .option('--default', 'use this account by default for its provider')
     .action(async (providerText: string, id: string, commandOptions) => {
+      const provider = providerName(providerText);
       const saved = await core.addAccount({
         id,
-        provider: providerName(providerText),
+        provider,
         label: commandOptions.label as string,
         profilePath: commandOptions.profile as string,
-        status: 'ready',
+        status: provider === 'claude' ? 'auth_required' : 'ready',
         maxConcurrency: 1,
         isDefault: commandOptions.default === true,
       });
       io.write(`Registered ${saved.label} (${saved.id}).\n`);
+    });
+  account
+    .command('login')
+    .description('Authenticate one registered native provider profile')
+    .argument('<id>', 'provider account ID')
+    .action(async (id: string) => {
+      const saved = await core.loginAccount(id);
+      io.write(`Authenticated ${saved.label} (${saved.id}).\n`);
     });
 
   program

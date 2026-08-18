@@ -12,6 +12,7 @@ export interface ProcessResult {
 export interface RunOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  unsetEnv?: readonly string[];
   timeoutMs?: number;
   pty?: boolean;
 }
@@ -19,6 +20,7 @@ export interface RunOptions {
 export interface InteractiveOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  unsetEnv?: readonly string[];
 }
 
 export class ProcessRunner {
@@ -41,7 +43,7 @@ export class ProcessRunner {
           : { command, args };
       const child = spawn(invocation.command, [...invocation.args], {
         cwd: options.cwd,
-        env: { ...process.env, ...options.env },
+        env: childEnvironment(options.env, options.unsetEnv),
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -142,7 +144,7 @@ export class ProcessRunner {
     return await new Promise<number>((resolve, reject) => {
       const child = spawn(command, [...args], {
         cwd: options.cwd,
-        env: { ...process.env, ...options.env },
+        env: childEnvironment(options.env, options.unsetEnv),
         shell: false,
         stdio: 'inherit',
       });
@@ -162,6 +164,15 @@ export class ProcessRunner {
       child.once('close', (exitCode) => resolve(exitCode ?? 1));
     });
   }
+}
+
+function childEnvironment(
+  overrides: NodeJS.ProcessEnv | undefined,
+  unset: readonly string[] | undefined,
+): NodeJS.ProcessEnv {
+  const environment = { ...process.env, ...overrides };
+  for (const name of unset ?? []) delete environment[name];
+  return environment;
 }
 
 function pseudoTerminalInvocation(

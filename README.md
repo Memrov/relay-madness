@@ -148,6 +148,12 @@ relay account add codex codex-a \
   --profile /profiles/codex-a \
   --default
 
+relay account add claude claude-a \
+  --label "Claude Primary" \
+  --profile /absolute/path/to/claude-a \
+  --default
+relay account login claude-a
+
 relay usage set codex-a \
   --model gpt-5.6-sol \
   --remaining-percent 62 \
@@ -160,7 +166,11 @@ relay delegate codex "Implement it" --account codex-a --model gpt-5.6-sol
 
 `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are passed only to the selected provider process. Usage is informational and caller-supplied: Relay does not scrape a provider UI, decide that an account is exhausted, or choose the next account or model.
 
-Relay accepts a selected Claude account profile only when the installed CLI advertises profile isolation. The currently verified Claude CLI does not, so Relay rejects that routing mode instead of guessing. A separately operated bridge environment may use its own native Claude login, but Relay does not currently federate those bridges or claim multi-account Claude support. macOS Claude authentication can also rely on Keychain, so a directory reference alone is not a safe isolation boundary.
+For Claude, `relay account login` runs the native `claude auth login` flow with that account's `CLAUDE_CONFIG_DIR`. Claude owns the OAuth credential and its platform credential-store entry; Relay stores only an opaque identity fingerprint and verification time. A profile that is already authenticated is bound without opening another browser flow.
+
+Before a selected Claude profile starts, continues, or attaches to work, Relay checks `claude auth status` under that exact directory. Missing authentication, a changed identity, or a profile path changed after binding fails closed before Relay creates provider work. Shell-level API keys, OAuth tokens, Anthropic profiles, and Bedrock, Vertex, Foundry, or Mantle selectors are removed from profile-scoped Claude processes so they cannot silently override the selected subscription login.
+
+Each Claude profile is a complete native identity boundary with its own settings, credentials, session history, and plugins. Relay does not copy or swap credentials between profiles and does not put tokens in SQLite.
 
 ### Fleet size, concurrency, and provider rules
 

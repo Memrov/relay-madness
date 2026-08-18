@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import * as z from 'zod/v4';
 
 import { RelayError } from '../errors.js';
@@ -15,6 +17,9 @@ const authSchema = z.object({
   loggedIn: z.boolean(),
   authMethod: z.string().optional(),
   apiProvider: z.string().optional(),
+  email: z.string().optional(),
+  orgId: z.string().optional(),
+  orgName: z.string().optional(),
 });
 
 const followupSchema = z.object({
@@ -30,6 +35,21 @@ const rejectionSchema = z.object({
 });
 
 const CLAUDE_SESSION_ID = /^(?:session_|cse_)[A-Za-z0-9_-]{1,184}$/;
+const PROFILE_CREDENTIAL_OVERRIDES = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_PROFILE',
+  'ANTHROPIC_FEDERATION_RULE_ID',
+  'ANTHROPIC_ORGANIZATION_ID',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
+  'CLAUDE_CODE_OAUTH_SCOPES',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_MANTLE',
+] as const;
 
 interface ClaudeProviderOptions {
   env?: NodeJS.ProcessEnv;
@@ -57,7 +77,7 @@ export class ClaudeProvider implements CloudProvider {
       /(?:^|\s)(?:-p|--print)(?:[\s,]|$)/m.test(helpText) &&
       /(?:^|\s)--output-format(?:\s|$)/m.test(helpText);
     const model = cloud && /(?:^|\s)--model(?:\s|$)/m.test(helpText);
-    const profileIsolation = cloud && /\bCLAUDE_CONFIG_DIR\b/.test(helpText);
+    const profileIsolation = cloud;
     return {
       start: cloud,
       structuredStart: false,
@@ -75,16 +95,22 @@ export class ClaudeProvider implements CloudProvider {
     };
   }
 
-  async authStatus(): Promise<AuthStatus> {
+  async authStatus(profilePath?: string): Promise<AuthStatus> {
     try {
       const result = await this.runner.run(
         'claude',
         ['auth', 'status'],
-        this.runOptions(),
+        this.runOptions(undefined, profilePath),
       );
       const auth = authSchema.parse(JSON.parse(result.stdout));
       const status: AuthStatus = { authenticated: auth.loggedIn };
       if (auth.authMethod !== undefined) status.method = auth.authMethod;
+      const identityFingerprint = profilePath === undefined
+        ? undefined
+        : claudeIdentityFingerprint(auth);
+      if (identityFingerprint !== undefined) {
+        status.identityFingerprint = identityFingerprint;
+      }
       return status;
     } catch (error) {
       if (
@@ -106,6 +132,28 @@ export class ClaudeProvider implements CloudProvider {
         { cause: error },
       );
     }
+  }
+
+  async loginProfile(profilePath: string): Promise<AuthStatus> {
+    const current = await this.authStatus(profilePath);
+    if (current.authenticated) return current;
+
+    const exitCode = await this.runner.spawnInteractive(
+      'claude',
+      ['auth', 'login'],
+      {
+        env: this.profileEnvironment(profilePath),
+        unsetEnv: PROFILE_CREDENTIAL_OVERRIDES,
+      },
+    );
+    if (exitCode !== 0) {
+      throw new RelayError(
+        'process_failed',
+        `Claude profile login exited with ${exitCode}.`,
+        { command: 'claude', exitCode },
+      );
+    }
+    return await this.authStatus(profilePath);
   }
 
   async start(input: StartRunInput): Promise<ProviderExecution> {
@@ -169,9 +217,30 @@ export class ClaudeProvider implements CloudProvider {
     if (this.options.timeoutMs !== undefined) {
       options.timeoutMs = this.options.timeoutMs;
     }
+    if (profilePath !== undefined) {
+      options.unsetEnv = PROFILE_CREDENTIAL_OVERRIDES;
+    }
     if (pty) options.pty = true;
     return options;
   }
+
+  private profileEnvironment(profilePath: string): NodeJS.ProcessEnv {
+    return {
+      ...this.options.env,
+      CLAUDE_CONFIG_DIR: profilePath,
+    };
+  }
+}
+
+function claudeIdentityFingerprint(
+  auth: z.infer<typeof authSchema>,
+): string | undefined {
+  if (!auth.loggedIn || auth.email === undefined || auth.orgId === undefined) {
+    return undefined;
+  }
+  return createHash('sha256')
+    .update(`${auth.orgId}\n${auth.email.trim().toLowerCase()}`)
+    .digest('hex');
 }
 
 function parseClaudeRejection(

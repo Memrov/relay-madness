@@ -823,6 +823,9 @@ test('applies ordered schema migrations', () => {
   const landingLeaseColumns = database.pragma(
     'table_info(landing_leases)',
   ) as Array<{ name: string }>;
+  const accountColumns = database.pragma(
+    'table_info(provider_accounts)',
+  ) as Array<{ name: string }>;
   const accountLeaseForeignKeys = database.pragma(
     'foreign_key_list(account_leases)',
   ) as Array<{ table: string; from: string }>;
@@ -837,7 +840,7 @@ test('applies ordered schema migrations', () => {
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
   );
   assert.deepEqual(
     indexes.map(({ name }) => name),
@@ -851,6 +854,8 @@ test('applies ordered schema migrations', () => {
   assert.ok(
     workItemColumns.some(({ name }) => name === 'skill_source_sha'),
   );
+  assert.ok(accountColumns.some(({ name }) => name === 'auth_fingerprint'));
+  assert.ok(accountColumns.some(({ name }) => name === 'auth_verified_at'));
   assert.ok(
     sessionColumns.some(
       ({ name, notnull, dflt_value: defaultValue }) =>
@@ -968,6 +973,59 @@ test('stores only a provider profile reference and selects one explicit default'
     store.listProviderAccounts('codex').filter((item) => item.isDefault).length,
     1,
   );
+  store.close();
+});
+
+test('binds an opaque native identity and marks the provider account ready', () => {
+  const store = openStore();
+  store.upsertProviderAccount({
+    id: 'claude-a',
+    provider: 'claude',
+    label: 'Primary',
+    profilePath: '/profiles/claude-a',
+    status: 'auth_required',
+    maxConcurrency: 1,
+    isDefault: true,
+  });
+
+  const account = store.bindProviderAccountAuth(
+    'claude-a',
+    'a'.repeat(64),
+    new Date('2026-08-18T05:00:00.000Z'),
+  );
+
+  assert.equal(account.status, 'ready');
+  assert.equal(account.authFingerprint, 'a'.repeat(64));
+  assert.equal(account.authVerifiedAt, '2026-08-18T05:00:00.000Z');
+  store.close();
+});
+
+test('clears a bound identity when its provider profile path changes', () => {
+  const store = openStore();
+  store.upsertProviderAccount({
+    id: 'claude-a',
+    provider: 'claude',
+    label: 'Primary',
+    profilePath: '/profiles/claude-a',
+    status: 'auth_required',
+    maxConcurrency: 1,
+    isDefault: true,
+  });
+  store.bindProviderAccountAuth('claude-a', 'a'.repeat(64));
+
+  store.upsertProviderAccount({
+    id: 'claude-a',
+    provider: 'claude',
+    label: 'Replacement',
+    profilePath: '/profiles/claude-replacement',
+    status: 'auth_required',
+    maxConcurrency: 1,
+    isDefault: true,
+  });
+
+  const account = store.getProviderAccount('claude-a');
+  assert.equal(account?.authFingerprint, undefined);
+  assert.equal(account?.authVerifiedAt, undefined);
   store.close();
 });
 

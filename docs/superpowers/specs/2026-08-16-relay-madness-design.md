@@ -110,7 +110,7 @@ Callers may not override Relay-generated lineage fields.
 
 ### Provider accounts and usage telemetry
 
-A ProviderAccount holds a provider, label, local profile reference, status, concurrency capacity, and optional default flag. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are references only: Relay never stores provider credentials. macOS Claude authentication uses Keychain, so multiple Claude profiles should use isolated Linux bridge environments rather than attempting a shared macOS credential store.
+A ProviderAccount holds a provider, label, local profile reference, status, concurrency capacity, and optional default flag. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are references only: Relay never stores provider credentials. Claude profiles use the native login associated with their own configuration directory; Relay persists only an opaque identity fingerprint, verifies it before execution, and fails closed if authentication disappears or resolves to another identity.
 
 Weekly usage snapshots are caller-supplied advisory scheduling telemetry keyed by account and model. Relay records a finite 0–100 remaining percentage and normalized reset timestamp, but does not scrape provider interfaces, infer usage, or use snapshots to select an account or model. Users must follow provider terms, never share credentials, and must not use Relay to bypass quotas, protective limits, or account controls.
 

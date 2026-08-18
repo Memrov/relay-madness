@@ -16,7 +16,10 @@ const fixtureBin = join(
   'bin',
 );
 
-function claudeForScenario(scenario: string) {
+function claudeForScenario(
+  scenario: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+) {
   const root = mkdtempSync(join(tmpdir(), 'relay-claude-test-'));
   roots.push(root);
   const commandLog = join(root, 'commands.jsonl');
@@ -26,6 +29,7 @@ function claudeForScenario(scenario: string) {
     FAKE_CLAUDE_SCENARIO: scenario,
     FAKE_COMMAND_LOG: commandLog,
     FAKE_ENVIRONMENT_LOG: environmentLog,
+    ...extraEnv,
   };
   const readCommands = () =>
     readFileSync(commandLog, 'utf8')
@@ -38,7 +42,14 @@ function claudeForScenario(scenario: string) {
       .trim()
       .split('\n')
       .filter(Boolean)
-      .map((line) => JSON.parse(line) as { CLAUDE_CONFIG_DIR?: string });
+      .map((line) => JSON.parse(line) as {
+        CLAUDE_CONFIG_DIR?: string;
+        ANTHROPIC_API_KEY?: string;
+        ANTHROPIC_AUTH_TOKEN?: string;
+        CLAUDE_CODE_OAUTH_TOKEN?: string;
+        ANTHROPIC_PROFILE?: string;
+        CLAUDE_CODE_USE_BEDROCK?: string;
+      });
   return {
     provider: new ClaudeProvider(new ProcessRunner(), { env }),
     cwd: root,
@@ -162,6 +173,56 @@ test('reports authentication independently of account-gated attachment', async (
   assert.equal(capabilities.structuredStatus, false);
 });
 
+test('reports one opaque identity for an authenticated Claude profile', async () => {
+  const { provider, cwd, readEnvironments } = claudeForScenario('start');
+  const profilePath = join(cwd, 'profiles', 'claude-a');
+
+  const status = await provider.authStatus(profilePath);
+
+  assert.deepEqual(status, {
+    authenticated: true,
+    method: 'claude.ai',
+    identityFingerprint:
+      '029a2469a15ea6c54d50c525080717c37341dcc776b010d0e1b1278016b9d020',
+  });
+  assert.equal(readEnvironments()[0]?.CLAUDE_CONFIG_DIR, profilePath);
+});
+
+test('logs in one fresh Claude profile and reuses its native login', async () => {
+  const { provider, cwd, readCommands, readEnvironments } =
+    claudeForScenario('profile-login-required', {
+      ANTHROPIC_API_KEY: 'wrong-account-key',
+      ANTHROPIC_AUTH_TOKEN: 'wrong-account-token',
+      CLAUDE_CODE_OAUTH_TOKEN: 'wrong-account-oauth',
+      ANTHROPIC_PROFILE: 'wrong-account-profile',
+      CLAUDE_CODE_USE_BEDROCK: '1',
+    });
+  const profilePath = join(cwd, 'profiles', 'claude-a');
+
+  const first = await provider.loginProfile!(profilePath);
+  const second = await provider.loginProfile!(profilePath);
+
+  assert.equal(first.authenticated, true);
+  assert.equal(first.identityFingerprint, second.identityFingerprint);
+  assert.deepEqual(readCommands(), [
+    ['auth', 'status'],
+    ['auth', 'login'],
+    ['auth', 'status'],
+    ['auth', 'status'],
+  ]);
+  assert.deepEqual(
+    readEnvironments().map(({ CLAUDE_CONFIG_DIR }) => CLAUDE_CONFIG_DIR),
+    [profilePath, profilePath, profilePath, profilePath],
+  );
+  for (const environment of readEnvironments()) {
+    assert.equal(environment.ANTHROPIC_API_KEY, undefined);
+    assert.equal(environment.ANTHROPIC_AUTH_TOKEN, undefined);
+    assert.equal(environment.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+    assert.equal(environment.ANTHROPIC_PROFILE, undefined);
+    assert.equal(environment.CLAUDE_CODE_USE_BEDROCK, undefined);
+  }
+});
+
 test('advertises documented queue-and-exit cloud follow-up', async () => {
   const { provider } = claudeForScenario('start');
 
@@ -244,6 +305,7 @@ test('does not infer account-gated attachment from the current CLI help', async 
   const capabilities = await provider.capabilities();
 
   assert.equal(capabilities.start, true);
+  assert.equal(capabilities.profileIsolation, true);
   assert.equal(capabilities.interactiveAttach, false);
 });
 
