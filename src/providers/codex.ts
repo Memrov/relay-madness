@@ -15,15 +15,21 @@ import type {
 } from '../provider.js';
 import { ProcessRunner, type RunOptions } from '../process-runner.js';
 
+const diffSummarySchema = z.object({
+  files_changed: z.number().int().nonnegative(),
+  lines_added: z.number().int().nonnegative(),
+  lines_removed: z.number().int().nonnegative(),
+});
+
 const taskSchema = z.object({
   id: z.string().min(1),
   url: z.url(),
   title: z.string(),
   status: z.string(),
   updated_at: z.iso.datetime(),
-  environment_id: z.string(),
+  environment_id: z.string().nullable(),
   environment_label: z.string(),
-  summary: z.string(),
+  summary: z.union([z.string(), diffSummarySchema]),
   is_review: z.boolean(),
   attempt_total: z.number().int().nonnegative(),
 });
@@ -134,7 +140,7 @@ export class CodexProvider implements CloudProvider {
     return {
       status: mapCodexStatus(task.status),
       url: task.url,
-      summary: task.summary,
+      summary: formatSummary(task.summary),
     };
   }
 
@@ -253,7 +259,9 @@ function parseCodexTaskUrl(value: string, expectedTaskId?: string): string {
       { cause },
     );
   }
-  const match = /^\/codex\/tasks\/(task_[A-Za-z0-9]+)$/.exec(url.pathname);
+  const match = /^\/codex\/tasks\/(task_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)$/.exec(
+    url.pathname,
+  );
   if (
     url.protocol !== 'https:' ||
     url.hostname !== 'chatgpt.com' ||
@@ -277,6 +285,11 @@ function parseCodexTaskUrl(value: string, expectedTaskId?: string): string {
     );
   }
   return taskId;
+}
+
+function formatSummary(summary: z.infer<typeof taskSchema>['summary']): string {
+  if (typeof summary === 'string') return summary;
+  return `${summary.files_changed} files changed, +${summary.lines_added}/-${summary.lines_removed}`;
 }
 
 function mapCodexStatus(status: string): ProviderRunStatus {

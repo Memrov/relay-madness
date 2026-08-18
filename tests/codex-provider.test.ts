@@ -78,6 +78,25 @@ test('submits a cloud task to the configured environment and branch', async () =
   ]);
 });
 
+test('accepts current Codex cloud task identifiers', async () => {
+  const { provider, cwd } = codexForScenario('current-cli');
+
+  assert.deepEqual(
+    await provider.start({
+      prompt: 'Review auth',
+      cwd,
+      startingBranch: 'main',
+      environmentId: 'acme/web',
+      mode: 'read',
+    }),
+    {
+      providerSessionId: 'task_e_6a83c77cbef483309fffeee9568686bd',
+      status: 'running',
+      url: 'https://chatgpt.com/codex/tasks/task_e_6a83c77cbef483309fffeee9568686bd',
+    },
+  );
+});
+
 test('runs Codex with the selected account home and requested cloud model', async () => {
   const { provider, cwd, readCommands, readEnvironments } = codexForScenario('exec');
 
@@ -118,6 +137,22 @@ test('inspects task status from cloud list JSON', async () => {
     url: 'https://chatgpt.com/codex/tasks/task_456',
     summary: 'Review complete',
   });
+});
+
+test('inspects current Codex cloud list output', async () => {
+  const { provider } = codexForScenario('current-cli');
+
+  assert.deepEqual(
+    await provider.inspect!({
+      providerSessionId: 'task_e_6a83c77cbef483309fffeee9568686bd',
+      environmentId: 'acme/web',
+    }),
+    {
+      status: 'provider_complete',
+      url: 'https://chatgpt.com/codex/tasks/task_e_6a83c77cbef483309fffeee9568686bd',
+      summary: '0 files changed, +0/-0',
+    },
+  );
 });
 
 test('requires an environment for cloud submission and inspection', async () => {
