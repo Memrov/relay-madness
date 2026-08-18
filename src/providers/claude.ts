@@ -92,6 +92,7 @@ export class ClaudeProvider implements CloudProvider {
       subscriptionAuth: available,
       selectModel: model,
       profileIsolation,
+      reportsProfileIdentity: true,
     };
   }
 

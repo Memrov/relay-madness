@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const scenario = process.env.FAKE_CODEX_SCENARIO ?? 'exec';
@@ -7,15 +8,41 @@ const log = process.env.FAKE_COMMAND_LOG;
 if (log) appendFileSync(log, `${JSON.stringify(args)}\n`);
 const environmentLog = process.env.FAKE_ENVIRONMENT_LOG;
 if (environmentLog) {
-  appendFileSync(environmentLog, `${JSON.stringify({ CODEX_HOME: process.env.CODEX_HOME })}\n`);
+  appendFileSync(environmentLog, `${JSON.stringify({
+    CODEX_HOME: process.env.CODEX_HOME,
+    CODEX_SQLITE_HOME: process.env.CODEX_SQLITE_HOME,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    CODEX_ACCESS_TOKEN: process.env.CODEX_ACCESS_TOKEN,
+  })}\n`);
 }
 
 if (args[0] === 'login' && args[1] === 'status') {
-  if (scenario === 'logged-out') {
+  const authenticatedMarker = process.env.CODEX_HOME === undefined
+    ? undefined
+    : join(process.env.CODEX_HOME, '.fake-authenticated');
+  if (
+    scenario === 'logged-out' ||
+    (scenario === 'profile-login' &&
+      (authenticatedMarker === undefined || !existsSync(authenticatedMarker)))
+  ) {
     process.stderr.write('Not logged in');
     process.exitCode = 1;
+  } else if (scenario === 'api-key') {
+    process.stdout.write('Logged in using an API key');
+  } else if (scenario === 'malformed-login-status') {
+    process.stdout.write('Authentication available');
   } else {
     process.stdout.write('Logged in using ChatGPT');
+  }
+} else if (args[0] === 'login' && scenario === 'profile-login') {
+  if (process.env.CODEX_HOME === undefined) {
+    process.stderr.write('CODEX_HOME is required');
+    process.exitCode = 2;
+  } else if (!existsSync(process.env.CODEX_HOME)) {
+    process.stderr.write('CODEX_HOME must already exist');
+    process.exitCode = 2;
+  } else {
+    writeFileSync(join(process.env.CODEX_HOME, '.fake-authenticated'), 'yes');
   }
 } else if (args[0] === 'cloud' && args[1] === '--help') {
   process.stdout.write('[EXPERIMENTAL] Browse or execute Codex Cloud tasks');
