@@ -26,7 +26,9 @@ import {
   StateStore,
   type CandidateRecord,
   type ProviderAccountInput,
+  type ProviderAccountQuery,
   type ProviderAccountRecord,
+  type ProviderAccountStatus,
   type UsageSnapshotInput,
   type UsageSnapshotRecord,
 } from './state-store.js';
@@ -57,13 +59,18 @@ export interface RelayAccountSummary {
   latestUsage: readonly UsageSnapshotRecord[];
 }
 
+export interface RelayAccountPage {
+  accounts: readonly RelayAccountSummary[];
+  nextCursor?: string;
+}
+
 export type RelayStatus = Awaited<ReturnType<RelayCore['status']>> & {
   candidates?: readonly CandidateRecord[];
 };
 
 export type RelayApi = Omit<RelayCoreApi, 'status'> & {
   addAccount(input: ProviderAccountInput): Promise<ProviderAccountRecord>;
-  accounts(): Promise<readonly RelayAccountSummary[]>;
+  accounts(input?: ProviderAccountQuery): Promise<RelayAccountPage>;
   recordUsage(
     input: Omit<UsageSnapshotInput, 'observedAt'>,
   ): Promise<UsageSnapshotRecord>;
@@ -150,16 +157,23 @@ function createRelayApi(
     chat: core.chat.bind(core),
     merge: core.merge.bind(core),
     addAccount: async (input) => store.upsertProviderAccount(input),
-    accounts: async () =>
-      store.listProviderAccounts().map((account) => ({
-        id: account.id,
-        label: account.label,
-        provider: account.provider,
-        status: account.status,
-        capacity: account.maxConcurrency,
-        activeLeaseCount: store.countActiveAccountLeases(account.id),
-        latestUsage: store.listLatestUsage(account.id),
-      })),
+    accounts: async (input) => {
+      const page = store.listProviderAccountPage(input);
+      return {
+        accounts: page.accounts.map((account) => ({
+          id: account.id,
+          label: account.label,
+          provider: account.provider,
+          status: account.status,
+          capacity: account.maxConcurrency,
+          activeLeaseCount: store.countActiveAccountLeases(account.id),
+          latestUsage: store.listLatestUsage(account.id),
+        })),
+        ...(page.nextCursor === undefined
+          ? {}
+          : { nextCursor: page.nextCursor }),
+      };
+    },
     recordUsage: async (input) =>
       store.recordUsageSnapshot({
         ...input,
@@ -346,14 +360,51 @@ export function createCli(
   program
     .command('accounts')
     .description('List provider account capacity and weekly usage')
+    .addOption(
+      new Option('--provider <provider>', 'filter by provider').choices([
+        ...SUPPORTED_PROVIDERS,
+      ]),
+    )
+    .addOption(
+      new Option('--status <status>', 'filter by account status').choices([
+        'ready',
+        'disabled',
+        'auth_required',
+        'cooldown',
+      ]),
+    )
+    .option('--limit <count>', 'return at most 200 accounts')
+    .option('--cursor <account-id>', 'continue after this account ID')
     .option('--json', 'print machine-readable JSON')
-    .action(async ({ json }: { json?: boolean }) => {
-      const accounts = await core.accounts();
-      if (json === true) return writeJson(io, accounts);
+    .action(async (commandOptions: {
+      provider?: ProviderName;
+      status?: ProviderAccountStatus;
+      limit?: string;
+      cursor?: string;
+      json?: boolean;
+    }) => {
+      const limit = optionalAccountPageLimit(commandOptions.limit);
+      const page = await core.accounts({
+        ...(commandOptions.provider === undefined
+          ? {}
+          : { provider: commandOptions.provider }),
+        ...(commandOptions.status === undefined
+          ? {}
+          : { status: commandOptions.status }),
+        ...(limit === undefined ? {} : { limit }),
+        ...(commandOptions.cursor === undefined
+          ? {}
+          : { cursor: commandOptions.cursor }),
+      });
+      if (commandOptions.json === true) return writeJson(io, page);
+      const { accounts } = page;
       for (const entry of accounts) {
         io.write(
           `${titleCase(entry.provider)}  ${entry.label}  ${entry.status}  ${entry.activeLeaseCount}/${entry.capacity} active\n`,
         );
+      }
+      if (page.nextCursor !== undefined) {
+        io.write(`Next cursor: ${page.nextCursor}\n`);
       }
     });
 
@@ -759,6 +810,24 @@ function titleCase(value: string): string {
 
 function isYes(value: string | undefined): boolean {
   return value?.trim().toLowerCase() === 'y' || value?.trim().toLowerCase() === 'yes';
+}
+
+function optionalAccountPageLimit(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (value.trim() === '') {
+    throw new RelayError(
+      'invalid_argument',
+      '--limit must be an integer from 1 through 200.',
+    );
+  }
+  const limit = Number(value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+    throw new RelayError(
+      'invalid_argument',
+      '--limit must be an integer from 1 through 200.',
+    );
+  }
+  return limit;
 }
 
 function normalizeIsoTimestamp(value: string | undefined): string | undefined {

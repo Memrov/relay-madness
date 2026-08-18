@@ -24,6 +24,7 @@ function fakeCore(options: {
     status: 0,
     merge: 0,
     land: [] as string[],
+    accounts: [] as unknown[],
   };
   const workItem = {
     id: 'work_1',
@@ -94,27 +95,32 @@ function fakeCore(options: {
       calls.handoff.push(input);
       return { ...result, prompt: 'hidden prompt' };
     },
-    accounts: async () => [
-      {
-        id: 'codex-a',
-        label: 'Primary',
-        provider: 'codex',
-        status: 'ready',
-        capacity: 1,
-        activeLeaseCount: 0,
-        latestUsage: [
+    accounts: async (input: unknown) => {
+      calls.accounts.push(input);
+      return {
+        accounts: [
           {
-            id: 'usage_1',
-            accountId: 'codex-a',
-            period: 'weekly',
-            model: 'gpt-5.6-sol',
-            remainingPercent: 62,
-            source: 'manual',
-            observedAt: '2026-08-16T00:00:00.000Z',
+            id: 'codex-a',
+            label: 'Primary',
+            provider: 'codex',
+            status: 'ready',
+            capacity: 1,
+            activeLeaseCount: 0,
+            latestUsage: [
+              {
+                id: 'usage_1',
+                accountId: 'codex-a',
+                period: 'weekly',
+                model: 'gpt-5.6-sol',
+                remainingPercent: 62,
+                source: 'manual',
+                observedAt: '2026-08-16T00:00:00.000Z',
+              },
+            ],
           },
         ],
-      },
-    ],
+      };
+    },
     land: async (runId: string) => {
       calls.land.push(runId);
       return {
@@ -225,7 +231,7 @@ test('exposes account inspection and integration-only landing without a merge to
 });
 
 test('returns redacted account capacity, leases, and latest usage to MCP clients', async () => {
-  const { core } = fakeCore();
+  const { core, calls } = fakeCore();
   const { client, close } = await connectedMcp(core);
   try {
     const response = await client.callTool({
@@ -252,6 +258,46 @@ test('returns redacted account capacity, leases, and latest usage to MCP clients
         },
       ],
     });
+    assert.equal(JSON.stringify(response).includes('profilePath'), false);
+    assert.deepEqual(calls.accounts, [{ limit: 100 }]);
+  } finally {
+    await close();
+  }
+});
+
+test('paginates filtered account fleets without exposing profile paths', async () => {
+  const { core, calls } = fakeCore();
+  const originalAccounts = core.accounts;
+  const pagedCore = {
+    ...core,
+    accounts: async (...args: Parameters<RelayApi['accounts']>) => ({
+      ...(await originalAccounts(...args)),
+      nextCursor: 'codex-a',
+    }),
+  } as RelayApi;
+  const { client, close } = await connectedMcp(pagedCore);
+  try {
+    const response = await client.callTool({
+      name: 'relay_accounts',
+      arguments: {
+        provider: 'codex',
+        status: 'ready',
+        limit: 25,
+        cursor: 'codex-0099',
+      },
+    });
+    assert.deepEqual(calls.accounts, [
+      {
+        provider: 'codex',
+        status: 'ready',
+        limit: 25,
+        cursor: 'codex-0099',
+      },
+    ]);
+    assert.equal(
+      (response.structuredContent as { nextCursor?: string }).nextCursor,
+      'codex-a',
+    );
     assert.equal(JSON.stringify(response).includes('profilePath'), false);
   } finally {
     await close();
