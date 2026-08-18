@@ -237,4 +237,3 @@ Switch to `main`, fetch and fast-forward from the renamed origin, rerun `npm run
 - the merged PR is closed as merged;
 - macOS and Ubuntu checks succeeded on the merged commit;
 - the repository URL is `https://github.com/Memrov/relay-cluster`.
-
