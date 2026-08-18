@@ -30,6 +30,7 @@ test('packed package exposes a runnable relay binary without source files', () =
   assert.ok(listing.includes('package/dist/cli.js'));
   assert.ok(!listing.some((path) => path.startsWith('package/src/')));
   assert.ok(!listing.some((path) => path.startsWith('package/tests/')));
+  assert.ok(!listing.some((path) => /jules/i.test(path)));
 
   run('tar', ['-xzf', tarball, '-C', root]);
   const metadata = JSON.parse(
