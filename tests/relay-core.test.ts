@@ -75,7 +75,7 @@ class FakeProvider implements CloudProvider {
       subscriptionAuth: true,
       selectModel: true,
       profileIsolation: true,
-      reportsProfileIdentity: this.name === 'claude',
+      reportsProfileIdentity: true,
       controlledResultBranch: true,
       ...this.capabilityOverrides,
     };
@@ -85,9 +85,7 @@ class FakeProvider implements CloudProvider {
     return {
       authenticated: this.profileAuthenticated,
       method: this.name === 'codex' ? 'ChatGPT' : 'fake',
-      ...(this.name !== 'claude' ||
-        profilePath === undefined ||
-        !this.profileAuthenticated
+      ...(profilePath === undefined || !this.profileAuthenticated
         ? {}
         : { identityFingerprint: this.profileIdentityFingerprint }),
     };
@@ -225,11 +223,7 @@ function addAccount(
     isDefault: input.isDefault ?? false,
   });
   if (input.bindAuth !== false) {
-    if (input.provider === 'claude') {
-      store.bindProviderAccountAuth(input.id, 'a'.repeat(64));
-    } else {
-      store.verifyProviderAccountAuth(input.id);
-    }
+    store.bindProviderAccountAuth(input.id, 'a'.repeat(64));
   }
 }
 
@@ -312,7 +306,7 @@ test('binds a Claude native login to its registered account profile', async () =
   assert.match(account.authVerifiedAt ?? '', /^\d{4}-\d{2}-\d{2}T/);
 });
 
-test('verifies a Codex native login without inventing an account identity', async () => {
+test('binds a Codex native login to its official account identity', async () => {
   const harness = await relayHarness();
   addAccount(harness.store, {
     id: 'codex-login',
@@ -324,7 +318,7 @@ test('verifies a Codex native login without inventing an account identity', asyn
 
   assert.deepEqual(harness.codex.profileLogins, ['/profiles/codex-login']);
   assert.equal(account.status, 'ready');
-  assert.equal(account.authFingerprint, undefined);
+  assert.equal(account.authFingerprint, 'a'.repeat(64));
   assert.match(account.authVerifiedAt ?? '', /^\d{4}-\d{2}-\d{2}T/);
 });
 
@@ -373,6 +367,28 @@ test('rejects a verified Codex profile after its native login expires', async ()
     }),
     (error: unknown) =>
       error instanceof RelayError && error.code === 'account_unavailable',
+  );
+  assert.equal(harness.codex.starts.length, 0);
+  assert.equal(harness.store.getProviderAccount('codex-a')?.status, 'auth_required');
+});
+
+test('rejects a Codex profile that resolves to another bound identity', async () => {
+  const harness = await relayHarness({ githubScenario: 'published' });
+  await harness.core.initialize({ cwd: harness.cwd });
+  addAccount(harness.store, { id: 'codex-a', provider: 'codex' });
+  harness.codex.profileIdentityFingerprint = 'b'.repeat(64);
+
+  await assert.rejects(
+    harness.core.delegate({
+      provider: 'codex',
+      accountId: 'codex-a',
+      task: 'Review it',
+      title: 'Wrong identity',
+      cwd: harness.cwd,
+      mode: 'read',
+    }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'provider_mismatch',
   );
   assert.equal(harness.codex.starts.length, 0);
   assert.equal(harness.store.getProviderAccount('codex-a')?.status, 'auth_required');

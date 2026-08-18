@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { Command, Option } from 'commander';
 
@@ -113,7 +113,13 @@ export function createRelayApplication(options: {
   const runner = new ProcessRunner();
   const providers = new Map<ProviderName, CloudProvider>([
     ['claude', new ClaudeProvider(runner, { env })],
-    ['codex', new CodexProvider(runner, { env })],
+    [
+      'codex',
+      new CodexProvider(runner, {
+        env,
+        identityStatePath: join(dirname(statePath), 'codex-identity'),
+      }),
+    ],
   ]);
   const github = new GitHubClient(runner, { env });
   const relayCore = new RelayCore({
