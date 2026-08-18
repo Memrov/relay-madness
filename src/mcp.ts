@@ -85,6 +85,7 @@ const accountsOutputSchema = z.object({
       ),
     }),
   ),
+  nextCursor: z.string().optional(),
 });
 
 const landingOutputSchema = z.object({
@@ -296,7 +297,16 @@ export function createRelayMcpServer(
       title: 'Inspect provider account capacity and usage',
       description:
         'Read account labels, availability, active leases, and caller-supplied weekly usage telemetry. Profile paths are never exposed.',
-      inputSchema: z.object({}).strict(),
+      inputSchema: z
+        .object({
+          provider: providerSchema.optional(),
+          status: z
+            .enum(['ready', 'disabled', 'auth_required', 'cooldown'])
+            .optional(),
+          limit: z.number().int().min(1).max(200).default(100),
+          cursor: z.string().min(1).optional(),
+        })
+        .strict(),
       outputSchema: accountsOutputSchema,
       annotations: {
         readOnlyHint: true,
@@ -305,8 +315,21 @@ export function createRelayMcpServer(
         openWorldHint: false,
       },
     },
-    async () => {
-      return await executeTool(async () => ({ accounts: publicAccounts(await core.accounts()) }));
+    async ({ provider, status, limit, cursor }) => {
+      return await executeTool(async () => {
+        const page = await core.accounts({
+          ...(provider === undefined ? {} : { provider }),
+          ...(status === undefined ? {} : { status }),
+          limit,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        return {
+          accounts: publicAccounts(page.accounts),
+          ...(page.nextCursor === undefined
+            ? {}
+            : { nextCursor: page.nextCursor }),
+        };
+      });
     },
   );
 
@@ -434,7 +457,9 @@ function publicStatus(status: Awaited<ReturnType<RelayApi['status']>>) {
   });
 }
 
-function publicAccounts(accounts: Awaited<ReturnType<RelayApi['accounts']>>) {
+function publicAccounts(
+  accounts: Awaited<ReturnType<RelayApi['accounts']>>['accounts'],
+) {
   return accounts.map((account) => ({
     id: account.id,
     label: account.label,

@@ -56,6 +56,7 @@ interface CoreCalls {
   land: unknown[];
   chat: unknown[];
   resolveLaunch: unknown[];
+  accounts: unknown[];
 }
 
 function fakeCore(overrides: Partial<RelayApi> = {}): {
@@ -73,6 +74,7 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
     land: [],
     chat: [],
     resolveLaunch: [],
+    accounts: [] as unknown[],
   };
   const core = {
     doctor: async () => ({
@@ -113,28 +115,34 @@ function fakeCore(overrides: Partial<RelayApi> = {}): {
         updatedAt: '2026-08-16T00:00:00.000Z',
       };
     },
-    accounts: async () => [
-      {
-        id: 'codex-a',
-        label: 'Primary',
-        provider: 'codex',
-        status: 'ready',
-        capacity: 1,
-        activeLeaseCount: 0,
-        latestUsage: [
+    accounts: async (input: unknown) => {
+      calls.accounts.push(input);
+      return {
+        accounts: [
           {
-            id: 'usage_1',
-            accountId: 'codex-a',
-            period: 'weekly',
-            model: 'gpt-5.6-sol',
-            remainingPercent: 62,
-            resetsAt: '2026-08-20T00:00:00.000Z',
-            source: 'manual',
-            observedAt: '2026-08-16T00:00:00.000Z',
+            id: 'codex-a',
+            label: 'Primary',
+            provider: 'codex',
+            status: 'ready',
+            capacity: 1,
+            activeLeaseCount: 0,
+            latestUsage: [
+              {
+                id: 'usage_1',
+                accountId: 'codex-a',
+                period: 'weekly',
+                model: 'gpt-5.6-sol',
+                remainingPercent: 62,
+                resetsAt: '2026-08-20T00:00:00.000Z',
+                source: 'manual',
+                observedAt: '2026-08-16T00:00:00.000Z',
+              },
+            ],
           },
         ],
-      },
-    ],
+        nextCursor: 'codex-a',
+      };
+    },
     recordUsage: async (input: unknown) => {
       calls.recordUsage.push(input);
       return { id: 'usage_1', ...(input as object) };
@@ -495,7 +503,20 @@ test('manages account and caller-supplied weekly usage without listing profile p
     '/profiles/codex-a',
     '--default',
   ]);
-  await cli.parseAsync(['node', 'relay', 'accounts', '--json']);
+  await cli.parseAsync([
+    'node',
+    'relay',
+    'accounts',
+    '--provider',
+    'codex',
+    '--status',
+    'ready',
+    '--limit',
+    '25',
+    '--cursor',
+    'codex-0099',
+    '--json',
+  ]);
   await cli.parseAsync([
     'node',
     'relay',
@@ -530,6 +551,14 @@ test('manages account and caller-supplied weekly usage without listing profile p
       remainingPercent: 62,
       resetsAt: '2026-08-20T00:00:00.000Z',
       source: 'manual',
+    },
+  ]);
+  assert.deepEqual(calls.accounts, [
+    {
+      provider: 'codex',
+      status: 'ready',
+      limit: 25,
+      cursor: 'codex-0099',
     },
   ]);
   assert.equal(io.stdout.includes('/profiles/codex-a'), false);

@@ -57,6 +57,7 @@ A provider message is evidence about execution. A GitHub branch and commit are e
 - Proxy subscription tokens or turn subscriptions into an unofficial model API.
 - Copy provider or GitHub credentials into its database.
 - Scrape quotas, rotate accounts, select models, or choose Agent Skills automatically.
+- Assign or rotate proxies, network egress, or IP addresses by account.
 - Synchronize provider transcripts or context windows.
 - Treat “done” from a provider as proof of a published result.
 - Let MCP clients merge the base branch.
@@ -153,12 +154,25 @@ relay usage set codex-a \
   --resets-at 2026-08-20T00:00:00Z
 
 relay accounts --json
+relay accounts --provider codex --status ready --limit 100 --json
 relay delegate codex "Implement it" --account codex-a --model gpt-5.6-sol
 ```
 
 `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are passed only to the selected provider process. Usage is informational and caller-supplied: Relay does not scrape a provider UI, decide that an account is exhausted, or choose the next account or model.
 
-For multiple Claude identities, prefer isolated Linux bridge environments. macOS Claude authentication can rely on Keychain, so a directory reference alone is not a safe multi-account isolation boundary.
+Relay accepts a selected Claude account profile only when the installed CLI advertises profile isolation. The currently verified Claude CLI does not, so Relay rejects that routing mode instead of guessing. A separately operated bridge environment may use its own native Claude login, but Relay does not currently federate those bridges or claim multi-account Claude support. macOS Claude authentication can also rely on Keychain, so a directory reference alone is not a safe isolation boundary.
+
+### Fleet size, concurrency, and provider rules
+
+Relay's state layer has an automated regression that round-trips 1,000 distinct Codex account records and their account-scoped session records after reopening SQLite. That proves metadata durability and account-scoped session routing; it does not prove that a laptop, bridge host, provider, subscription, or GitHub repository supports 1,000 simultaneous jobs.
+
+Every provider profile must use a distinct absolute directory, and one remote provider session cannot be assigned to multiple WorkItems. Per-account leases enforce configured account capacity. Relay deliberately has no durable global queue, so the caller must bound aggregate submissions instead of launching an unbounded number of provider CLI processes at once.
+
+Relay inherits the host's ordinary network connection. It does not configure proxies or per-account IP addresses, and it must not be used to conceal account sharing, evade enforcement, or bypass provider limits.
+
+[OpenAI's account-sharing policy](https://help.openai.com/en/articles/10471989-openai-account-sharing-policy) says an account is for the individual who created it. [OpenAI's service terms](https://openai.com/policies/services-agreement/) also prohibit bypassing restrictions or configuring services to avoid usage limits. [Anthropic's Claude Code legal guidance](https://code.claude.com/docs/en/legal-and-compliance) says subscription OAuth is for ordinary use by subscription purchasers and directs developers building products or services to supported API-key authentication rather than routing Free, Pro, or Max credentials for users.
+
+Relay Cluster is therefore designed as local, owner-operated software. Do not expose subscription-authenticated Relay instances as a shared or managed service. Multi-user or commercial deployments should use provider-supported organizational or API authentication and obtain provider confirmation for the intended workflow.
 
 ## CLI and REPL
 
@@ -223,6 +237,8 @@ The caller chooses skills. Relay resolves them from a trusted full Git commit, s
 - `relay_land` (destructive; integration branch only)
 
 There is intentionally no `relay_merge` MCP tool.
+
+`relay_accounts` returns at most 100 records by default and accepts optional `provider`, `status`, `limit`, and `cursor` fields. When more matching accounts exist, pass the returned `nextCursor` into the next call.
 
 Generic STDIO configuration:
 

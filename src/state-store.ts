@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute, normalize } from 'node:path';
 
 import Database from 'better-sqlite3';
 
@@ -50,6 +50,18 @@ export interface ProviderAccountRecord extends ProviderAccountInput {
   lastUsedAt?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ProviderAccountQuery {
+  provider?: ProviderName;
+  status?: ProviderAccountStatus;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ProviderAccountPage {
+  accounts: readonly ProviderAccountRecord[];
+  nextCursor?: string;
 }
 
 export interface UsageSnapshotInput {
@@ -371,6 +383,7 @@ export class StateStore {
 
   upsertProviderAccount(input: ProviderAccountInput): ProviderAccountRecord {
     this.validateProviderAccount(input);
+    const profilePath = normalize(input.profilePath);
     return this.database.transaction(() => {
       const existing = this.database
         .prepare('SELECT provider FROM provider_accounts WHERE id = ?')
@@ -379,6 +392,18 @@ export class StateStore {
         throw new RelayError(
           'provider_mismatch',
           `Provider account ${input.id} is already registered to ${existing.provider}.`,
+        );
+      }
+      const profileOwner = this.database
+        .prepare(
+          `SELECT id FROM provider_accounts
+           WHERE provider = ? AND profile_path = ? AND id <> ?`,
+        )
+        .get(input.provider, profilePath, input.id) as SqlRow | undefined;
+      if (profileOwner !== undefined) {
+        throw new RelayError(
+          'state_conflict',
+          `Provider profile ${profilePath} is already registered to account ${profileOwner.id}.`,
         );
       }
 
@@ -408,7 +433,7 @@ export class StateStore {
           input.id,
           input.provider,
           input.label,
-          input.profilePath,
+          profilePath,
           input.status,
           input.maxConcurrency,
           Number(input.isDefault),
@@ -448,6 +473,56 @@ export class StateStore {
           )
           .all(provider) as SqlRow[]);
     return rows.map((row) => this.providerAccountFromRow(row));
+  }
+
+  listProviderAccountPage(
+    input: ProviderAccountQuery = {},
+  ): ProviderAccountPage {
+    if (
+      input.limit !== undefined &&
+      (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 200)
+    ) {
+      throw new RelayError(
+        'invalid_argument',
+        'Account page limit must be an integer from 1 through 200.',
+      );
+    }
+    if (input.cursor !== undefined && input.cursor.length === 0) {
+      throw new RelayError('invalid_argument', 'Account page cursor cannot be empty.');
+    }
+
+    const conditions: string[] = [];
+    const parameters: unknown[] = [];
+    if (input.provider !== undefined) {
+      this.requireSupportedProvider(input.provider);
+      conditions.push('provider = ?');
+      parameters.push(input.provider);
+    }
+    if (input.status !== undefined) {
+      conditions.push('status = ?');
+      parameters.push(input.status);
+    }
+    if (input.cursor !== undefined) {
+      conditions.push('id > ?');
+      parameters.push(input.cursor);
+    }
+    if (input.limit !== undefined) parameters.push(input.limit + 1);
+
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM provider_accounts
+         ${conditions.length === 0 ? '' : `WHERE ${conditions.join(' AND ')}`}
+         ORDER BY id
+         ${input.limit === undefined ? '' : 'LIMIT ?'}`,
+      )
+      .all(...parameters) as SqlRow[];
+    const hasNext = input.limit !== undefined && rows.length > input.limit;
+    const pageRows = hasNext ? rows.slice(0, input.limit) : rows;
+    const accounts = pageRows.map((row) => this.providerAccountFromRow(row));
+    return {
+      accounts,
+      ...(hasNext ? { nextCursor: accounts.at(-1)!.id } : {}),
+    };
   }
 
   setProviderAccountConfig(
@@ -774,6 +849,12 @@ export class StateStore {
     this.requireSupportedProvider(input.provider);
     const now = new Date().toISOString();
     this.database.transaction(() => {
+      this.assertRemoteSessionAvailable(
+        input.provider,
+        input.accountId,
+        input.providerSessionId,
+        input.workItemId,
+      );
       if (input.status === 'active') {
         this.database
           .prepare(
@@ -845,7 +926,7 @@ export class StateStore {
             existing.id,
           );
       }
-    })();
+    }).immediate();
     return this.sessionFromRow(
       this.requiredRow(
         this.database
@@ -901,6 +982,12 @@ export class StateStore {
         `Session ${id} was not found.`,
       );
       const now = new Date().toISOString();
+      this.assertRemoteSessionAvailable(
+        String(current.provider) as ProviderName,
+        nullableString(current.account_id),
+        input.providerSessionId,
+        String(current.work_item_id),
+      );
       if (input.status === 'active') {
         this.database
           .prepare(
@@ -931,7 +1018,7 @@ export class StateStore {
           `Session ${id} was not found after activation.`,
         ),
       );
-    })();
+    }).immediate();
   }
 
   listSessions(workItemId: string): readonly SessionRecord[] {
@@ -1995,6 +2082,47 @@ export class StateStore {
         this.recordMigration(9);
       }).immediate();
     }
+    if (!applied.has(10)) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          CREATE TABLE IF NOT EXISTS usage_snapshots (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
+            period TEXT NOT NULL CHECK(period = 'weekly'),
+            model TEXT NOT NULL,
+            remaining_percent REAL NOT NULL
+              CHECK(remaining_percent >= 0 AND remaining_percent <= 100),
+            resets_at TEXT,
+            source TEXT NOT NULL CHECK(source IN ('manual','provider')),
+            observed_at TEXT NOT NULL
+          );
+          CREATE UNIQUE INDEX relay_account_profile_identity
+            ON provider_accounts(provider, profile_path);
+          CREATE UNIQUE INDEX relay_remote_session_identity
+            ON provider_sessions(
+              provider,
+              COALESCE(account_id, ''),
+              provider_session_id
+            );
+          CREATE UNIQUE INDEX relay_active_session_scope
+            ON provider_sessions(
+              work_item_id,
+              provider,
+              COALESCE(account_id, '')
+            )
+            WHERE status = 'active';
+          CREATE INDEX relay_account_usage_latest
+            ON usage_snapshots(
+              account_id,
+              period,
+              model,
+              observed_at DESC,
+              id DESC
+            );
+        `);
+        this.recordMigration(10);
+      }).immediate();
+    }
   }
 
   private recordMigration(version: number): void {
@@ -2064,6 +2192,27 @@ export class StateStore {
       throw new RelayError(
         'invalid_run_transition',
         `Run ${runId} is not active for lease heartbeat.`,
+      );
+    }
+  }
+
+  private assertRemoteSessionAvailable(
+    provider: ProviderName,
+    accountId: string | undefined,
+    providerSessionId: string,
+    workItemId: string,
+  ): void {
+    const owner = this.database
+      .prepare(
+        `SELECT work_item_id FROM provider_sessions
+         WHERE provider = ? AND account_id IS ? AND provider_session_id = ?
+         LIMIT 1`,
+      )
+      .get(provider, accountId ?? null, providerSessionId) as SqlRow | undefined;
+    if (owner !== undefined && String(owner.work_item_id) !== workItemId) {
+      throw new RelayError(
+        'state_conflict',
+        `Provider session ${providerSessionId} is already assigned to another WorkItem.`,
       );
     }
   }
@@ -2149,6 +2298,7 @@ export class StateStore {
       input.id.length === 0 ||
       input.label.length === 0 ||
       input.profilePath.length === 0 ||
+      !isAbsolute(input.profilePath) ||
       !Number.isInteger(input.maxConcurrency) ||
       input.maxConcurrency <= 0
     ) {

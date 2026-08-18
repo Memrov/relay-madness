@@ -826,11 +826,27 @@ test('applies ordered schema migrations', () => {
   const accountLeaseForeignKeys = database.pragma(
     'foreign_key_list(account_leases)',
   ) as Array<{ table: string; from: string }>;
+  const indexes = database
+    .prepare(
+      `SELECT name FROM sqlite_master
+       WHERE type = 'index' AND name LIKE 'relay_%'
+       ORDER BY name`,
+    )
+    .all() as Array<{ name: string }>;
   database.close();
 
   assert.deepEqual(
     versions.map(({ version }) => version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  );
+  assert.deepEqual(
+    indexes.map(({ name }) => name),
+    [
+      'relay_account_profile_identity',
+      'relay_account_usage_latest',
+      'relay_active_session_scope',
+      'relay_remote_session_identity',
+    ],
   );
   assert.ok(
     workItemColumns.some(({ name }) => name === 'skill_source_sha'),
@@ -955,6 +971,90 @@ test('stores only a provider profile reference and selects one explicit default'
   store.close();
 });
 
+test('rejects two logical accounts that share one provider profile', () => {
+  const store = openStore();
+  store.upsertProviderAccount({
+    id: 'codex-a',
+    provider: 'codex',
+    label: 'Primary',
+    profilePath: '/profiles/shared-codex',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+
+  assert.throws(
+    () =>
+      store.upsertProviderAccount({
+        id: 'codex-b',
+        provider: 'codex',
+        label: 'Duplicate',
+        profilePath: '/profiles/shared-codex',
+        status: 'ready',
+        maxConcurrency: 1,
+        isDefault: false,
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'state_conflict',
+  );
+  assert.equal(store.getProviderAccount('codex-b'), undefined);
+  store.close();
+});
+
+test('rejects relative provider profile references', () => {
+  const store = openStore();
+
+  assert.throws(
+    () =>
+      store.upsertProviderAccount({
+        id: 'codex-relative',
+        provider: 'codex',
+        label: 'Relative',
+        profilePath: 'profiles/codex-relative',
+        status: 'ready',
+        maxConcurrency: 1,
+        isDefault: false,
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'invalid_argument',
+  );
+  assert.equal(store.getProviderAccount('codex-relative'), undefined);
+  store.close();
+});
+
+test('normalizes an absolute provider profile before identity checks', () => {
+  const store = openStore();
+  store.upsertProviderAccount({
+    id: 'claude-a',
+    provider: 'claude',
+    label: 'Primary',
+    profilePath: '/profiles/team/../claude-a',
+    status: 'ready',
+    maxConcurrency: 1,
+    isDefault: false,
+  });
+
+  assert.equal(
+    store.getProviderAccount('claude-a')?.profilePath,
+    '/profiles/claude-a',
+  );
+  assert.throws(
+    () =>
+      store.upsertProviderAccount({
+        id: 'claude-b',
+        provider: 'claude',
+        label: 'Alias',
+        profilePath: '/profiles/claude-a',
+        status: 'ready',
+        maxConcurrency: 1,
+        isDefault: false,
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'state_conflict',
+  );
+  store.close();
+});
+
 test('rejects accounts for providers outside the supported contract', () => {
   const store = openStore();
 
@@ -1062,6 +1162,179 @@ test('keeps identical provider session IDs isolated by account', () => {
     second.id,
   );
   store.close();
+});
+
+test('rejects one remote session identity across different WorkItems', () => {
+  const store = storeWithAccount('claude-a', 'claude');
+  const firstProject = store.upsertProject({
+    repo: 'acme/first-session-scope',
+    defaultBranch: 'main',
+    locatorPath: '/tmp/first-session-scope',
+  });
+  const secondProject = store.upsertProject({
+    repo: 'acme/second-session-scope',
+    defaultBranch: 'main',
+    locatorPath: '/tmp/second-session-scope',
+  });
+  const firstWorkItem = store.createWorkItem({
+    projectId: firstProject.id,
+    title: 'First scope',
+    baseBranch: 'main',
+  });
+  const secondWorkItem = store.createWorkItem({
+    projectId: secondProject.id,
+    title: 'Second scope',
+    baseBranch: 'main',
+  });
+  store.upsertSession({
+    workItemId: firstWorkItem.id,
+    provider: 'claude',
+    accountId: 'claude-a',
+    providerSessionId: 'remote-session-1',
+    status: 'active',
+  });
+
+  assert.throws(
+    () =>
+      store.upsertSession({
+        workItemId: secondWorkItem.id,
+        provider: 'claude',
+        accountId: 'claude-a',
+        providerSessionId: 'remote-session-1',
+        status: 'active',
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'state_conflict',
+  );
+  assert.equal(store.listSessions(secondWorkItem.id).length, 0);
+  store.close();
+});
+
+test('rejects activating a pending session with another WorkItems remote identity', () => {
+  const store = storeWithAccount('claude-a', 'claude');
+  const firstProject = store.upsertProject({
+    repo: 'acme/active-session-owner',
+    defaultBranch: 'main',
+    locatorPath: '/tmp/active-session-owner',
+  });
+  const secondProject = store.upsertProject({
+    repo: 'acme/pending-session-owner',
+    defaultBranch: 'main',
+    locatorPath: '/tmp/pending-session-owner',
+  });
+  const firstWorkItem = store.createWorkItem({
+    projectId: firstProject.id,
+    title: 'Active owner',
+    baseBranch: 'main',
+  });
+  const secondWorkItem = store.createWorkItem({
+    projectId: secondProject.id,
+    title: 'Pending owner',
+    baseBranch: 'main',
+  });
+  store.upsertSession({
+    workItemId: firstWorkItem.id,
+    provider: 'claude',
+    accountId: 'claude-a',
+    providerSessionId: 'remote-session-1',
+    status: 'active',
+  });
+  const pending = store.upsertSession({
+    workItemId: secondWorkItem.id,
+    provider: 'claude',
+    accountId: 'claude-a',
+    providerSessionId: 'pending:second',
+    status: 'pending',
+  });
+
+  assert.throws(
+    () =>
+      store.activateSession(pending.id, {
+        providerSessionId: 'remote-session-1',
+        status: 'active',
+      }),
+    (error: unknown) =>
+      error instanceof RelayError && error.code === 'state_conflict',
+  );
+  assert.equal(
+    store.getSession(secondWorkItem.id, 'claude', 'claude-a')?.status,
+    'pending',
+  );
+  store.close();
+});
+
+test('round-trips one thousand isolated account sessions after reopening', () => {
+  const path = databasePath();
+  const store = StateStore.open(path);
+  const project = store.upsertProject({
+    repo: 'acme/thousand-account-fleet',
+    defaultBranch: 'main',
+    locatorPath: '/tmp/thousand-account-fleet',
+  });
+  const workItem = store.createWorkItem({
+    projectId: project.id,
+    title: 'Fleet routing proof',
+    baseBranch: 'main',
+  });
+
+  for (let index = 0; index < 1_000; index += 1) {
+    const suffix = index.toString().padStart(4, '0');
+    const accountId = `codex-${suffix}`;
+    store.upsertProviderAccount({
+      id: accountId,
+      provider: 'codex',
+      label: `Codex ${suffix}`,
+      profilePath: `/profiles/${accountId}`,
+      status: 'ready',
+      maxConcurrency: 1,
+      isDefault: index === 0,
+    });
+    store.upsertSession({
+      workItemId: workItem.id,
+      provider: 'codex',
+      accountId,
+      providerSessionId: `remote-${suffix}`,
+      status: 'active',
+    });
+  }
+
+  assert.equal(store.listProviderAccounts('codex').length, 1_000);
+  assert.equal(store.listSessions(workItem.id).length, 1_000);
+  store.close();
+
+  const reopened = StateStore.open(path);
+  assert.equal(reopened.getDefaultProviderAccount('codex')?.id, 'codex-0000');
+  assert.equal(
+    reopened.getSession(workItem.id, 'codex', 'codex-0000')
+      ?.providerSessionId,
+    'remote-0000',
+  );
+  assert.equal(
+    reopened.getSession(workItem.id, 'codex', 'codex-0999')
+      ?.providerSessionId,
+    'remote-0999',
+  );
+  const firstPage = reopened.listProviderAccountPage({
+    provider: 'codex',
+    status: 'ready',
+    limit: 100,
+  });
+  assert.equal(firstPage.accounts.length, 100);
+  assert.equal(firstPage.accounts[0]?.id, 'codex-0000');
+  assert.equal(firstPage.accounts[99]?.id, 'codex-0099');
+  assert.equal(firstPage.nextCursor, 'codex-0099');
+  const secondPage = reopened.listProviderAccountPage({
+    provider: 'codex',
+    status: 'ready',
+    limit: 100,
+    cursor: firstPage.nextCursor,
+  });
+  assert.equal(secondPage.accounts[0]?.id, 'codex-0100');
+  assert.equal(secondPage.accounts[99]?.id, 'codex-0199');
+  assert.equal(secondPage.nextCursor, 'codex-0199');
+  assert.equal(reopened.listProviderAccounts('codex').length, 1_000);
+  assert.equal(reopened.listSessions(workItem.id).length, 1_000);
+  reopened.close();
 });
 
 test('returns the latest weekly usage independently for each model bucket', () => {
