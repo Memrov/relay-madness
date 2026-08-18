@@ -20,17 +20,11 @@ import {
   type InteractiveOptions,
   type RunOptions,
 } from '../process-runner.js';
-
-const PROFILE_CONFIG_ARGS = [
-  '-c',
-  'cli_auth_credentials_store="file"',
-  '-c',
-  'forced_login_method="chatgpt"',
-] as const;
-const PROFILE_CREDENTIAL_OVERRIDES = [
-  'OPENAI_API_KEY',
-  'CODEX_ACCESS_TOKEN',
-] as const;
+import {
+  CODEX_PROFILE_CREDENTIAL_OVERRIDES,
+  codexProfileConfigArgs,
+  readCodexProfileIdentity,
+} from './codex-account.js';
 
 const diffSummarySchema = z.object({
   files_changed: z.number().int().nonnegative(),
@@ -58,6 +52,7 @@ const taskListSchema = z.object({
 
 interface CodexProviderOptions {
   env?: NodeJS.ProcessEnv;
+  identityStatePath?: string;
   timeoutMs?: number;
 }
 
@@ -70,7 +65,10 @@ export class CodexProvider implements CloudProvider {
   ) {}
 
   async capabilities(): Promise<ProviderCapabilities> {
-    const available = await this.cloudAvailable();
+    const [available, accountIdentityAvailable] = await Promise.all([
+      this.cloudAvailable(),
+      this.accountIdentityAvailable(),
+    ]);
     return {
       start: available,
       structuredStart: false,
@@ -84,8 +82,8 @@ export class CodexProvider implements CloudProvider {
       cancel: false,
       subscriptionAuth: true,
       selectModel: available,
-      profileIsolation: available,
-      reportsProfileIdentity: false,
+      profileIsolation: available && accountIdentityAvailable,
+      reportsProfileIdentity: available && accountIdentityAvailable,
     };
   }
 
@@ -96,16 +94,16 @@ export class CodexProvider implements CloudProvider {
         ['login', 'status', ...profileConfigArgs(profilePath)],
         this.runOptions(undefined, profilePath),
       );
-      const reportedMethod = result.stdout
-        .trim()
-        .match(/^Logged in using\s+(.+)$/i)?.[1];
+      const reportedMethod = [result.stdout, result.stderr]
+        .map((output) => output.match(/(?:^|\n)Logged in using\s+(.+)$/im)?.[1])
+        .find((method) => method !== undefined);
       if (reportedMethod === undefined) {
         throw new RelayError(
           'provider_output_invalid',
           'Codex authentication status did not report a login method.',
         );
       }
-      const method = reportedMethod.replace(/^an?\s+/i, '');
+      const method = reportedMethod.trim().replace(/^an?\s+/i, '');
       if (method.toLowerCase() !== 'chatgpt') {
         return {
           authenticated: false,
@@ -113,7 +111,22 @@ export class CodexProvider implements CloudProvider {
           detail: 'Codex Cloud requires ChatGPT authentication.',
         };
       }
-      return { authenticated: true, method: 'ChatGPT' };
+      if (profilePath === undefined) {
+        return { authenticated: true, method: 'ChatGPT' };
+      }
+      return {
+        authenticated: true,
+        method: 'ChatGPT',
+        identityFingerprint: await readCodexProfileIdentity(profilePath, {
+          ...(this.options.env === undefined ? {} : { env: this.options.env }),
+          ...(this.options.identityStatePath === undefined
+            ? {}
+            : { statePath: this.options.identityStatePath }),
+          ...(this.options.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: this.options.timeoutMs }),
+        }),
+      };
     } catch (error) {
       if (
         error instanceof RelayError &&
@@ -138,7 +151,7 @@ export class CodexProvider implements CloudProvider {
 
     const exitCode = await this.runner.spawnInteractive(
       'codex',
-      ['login', ...PROFILE_CONFIG_ARGS],
+      ['login', ...codexProfileConfigArgs(profilePath)],
       this.interactiveOptions(undefined, profilePath),
     );
     if (exitCode !== 0) {
@@ -228,6 +241,15 @@ export class CodexProvider implements CloudProvider {
     }
   }
 
+  private async accountIdentityAvailable(): Promise<boolean> {
+    try {
+      await this.runner.run('codex', ['app-server', '--help'], this.runOptions());
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private runOptions(cwd?: string, profilePath?: string): RunOptions {
     const options: RunOptions = {};
     if (cwd !== undefined) options.cwd = cwd;
@@ -246,7 +268,7 @@ export class CodexProvider implements CloudProvider {
       options.timeoutMs = this.options.timeoutMs;
     }
     if (profilePath !== undefined) {
-      options.unsetEnv = PROFILE_CREDENTIAL_OVERRIDES;
+      options.unsetEnv = CODEX_PROFILE_CREDENTIAL_OVERRIDES;
     }
     return options;
   }
@@ -269,14 +291,14 @@ export class CodexProvider implements CloudProvider {
       };
     }
     if (profilePath !== undefined) {
-      options.unsetEnv = PROFILE_CREDENTIAL_OVERRIDES;
+      options.unsetEnv = CODEX_PROFILE_CREDENTIAL_OVERRIDES;
     }
     return options;
   }
 }
 
 function profileConfigArgs(profilePath: string | undefined): readonly string[] {
-  return profilePath === undefined ? [] : PROFILE_CONFIG_ARGS;
+  return codexProfileConfigArgs(profilePath);
 }
 
 async function ensureProfileDirectory(profilePath: string): Promise<void> {

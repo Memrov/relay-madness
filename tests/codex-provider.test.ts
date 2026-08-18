@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +20,7 @@ const fixtureBin = join(
 function codexForScenario(
   scenario: string,
   environment: NodeJS.ProcessEnv = {},
+  providerOptions: { identityStatePath?: string } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'relay-codex-test-'));
   roots.push(root);
@@ -33,7 +34,7 @@ function codexForScenario(
     FAKE_ENVIRONMENT_LOG: environmentLog,
   };
   return {
-    provider: new CodexProvider(new ProcessRunner(), { env }),
+    provider: new CodexProvider(new ProcessRunner(), { env, ...providerOptions }),
     cwd: root,
     readCommands: () =>
       readFileSync(commandLog, 'utf8')
@@ -137,6 +138,8 @@ test('runs Codex with the selected account home and requested cloud model', asyn
     '-c',
     'forced_login_method="chatgpt"',
     '-c',
+    'sqlite_home="/profiles/codex-a"',
+    '-c',
     'model="gpt-5.6-sol"',
     '--branch',
     'relay/run/work-1/run-1',
@@ -210,11 +213,52 @@ test('reports programmatic follow-up as unavailable', async () => {
 });
 
 test('uses Codex login status without copying credentials', async () => {
-  const { provider } = codexForScenario('exec');
+  const { provider, readCommands } = codexForScenario('exec');
 
   assert.deepEqual(await provider.authStatus(), {
     authenticated: true,
     method: 'ChatGPT',
+  });
+  assert.deepEqual(readCommands(), [['login', 'status']]);
+});
+
+test('binds an isolated Codex profile to its official ChatGPT account identity', async () => {
+  const { provider, readCommands, readEnvironments } = codexForScenario('exec', {
+    OPENAI_API_KEY: 'wrong-api-key',
+    CODEX_ACCESS_TOKEN: 'wrong-access-token',
+  });
+
+  assert.deepEqual(await provider.authStatus('/profiles/codex-a'), {
+    authenticated: true,
+    method: 'ChatGPT',
+    identityFingerprint:
+      'c8cd3c6427301eaf6665bccacd65ddb614527acc843a15463e3faba57124c351',
+  });
+
+  const commands = readCommands();
+  assert.deepEqual(commands[0], [
+    'login',
+    'status',
+    '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
+    'sqlite_home="/profiles/codex-a"',
+  ]);
+  assert.deepEqual(commands[1]?.slice(0, 4), [
+    'app-server',
+    '--stdio',
+    '--disable',
+    'plugins',
+  ]);
+  const scratch = readEnvironments()[1]?.CODEX_SQLITE_HOME;
+  assert.ok(scratch);
+  assert.match(scratch, /relay-codex-identity-/);
+  assert.equal(existsSync(scratch), false);
+  assert.deepEqual(readEnvironments()[1], {
+    CODEX_HOME: '/profiles/codex-a',
+    CODEX_SQLITE_HOME: scratch,
   });
 });
 
@@ -234,47 +278,85 @@ test('logs in one isolated Codex profile and reuses its native login', async () 
   assert.deepEqual(await login.call(provider, profilePath), {
     authenticated: true,
     method: 'ChatGPT',
+    identityFingerprint:
+      'c8cd3c6427301eaf6665bccacd65ddb614527acc843a15463e3faba57124c351',
   });
   assert.equal(statSync(profilePath).mode & 0o777, 0o700);
   assert.deepEqual(await login.call(provider, profilePath), {
     authenticated: true,
     method: 'ChatGPT',
+    identityFingerprint:
+      'c8cd3c6427301eaf6665bccacd65ddb614527acc843a15463e3faba57124c351',
   });
-  assert.deepEqual(readCommands(), [
-    [
-      'login',
-      'status',
-      '-c',
-      'cli_auth_credentials_store="file"',
-      '-c',
-      'forced_login_method="chatgpt"',
-    ],
-    [
-      'login',
-      '-c',
-      'cli_auth_credentials_store="file"',
-      '-c',
-      'forced_login_method="chatgpt"',
-    ],
-    [
-      'login',
-      'status',
-      '-c',
-      'cli_auth_credentials_store="file"',
-      '-c',
-      'forced_login_method="chatgpt"',
-    ],
-    [
-      'login',
-      'status',
-      '-c',
-      'cli_auth_credentials_store="file"',
-      '-c',
-      'forced_login_method="chatgpt"',
-    ],
+  const commands = readCommands();
+  assert.equal(commands.length, 6);
+  assert.deepEqual(commands[0], [
+    'login',
+    'status',
+    '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
+    `sqlite_home=${JSON.stringify(profilePath)}`,
   ]);
+  assert.deepEqual(commands[1], [
+    'login',
+    '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
+    `sqlite_home=${JSON.stringify(profilePath)}`,
+  ]);
+  assert.deepEqual(commands[2], [
+    'login',
+    'status',
+    '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
+    `sqlite_home=${JSON.stringify(profilePath)}`,
+  ]);
+  assert.deepEqual(commands[3]?.slice(0, 9), [
+    'app-server',
+    '--stdio',
+    '--disable',
+    'plugins',
+    '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
+  ]);
+  assert.match(commands[3]?.[9] ?? '', /^sqlite_home=".*relay-codex-identity-/);
+  assert.deepEqual(commands[4], [
+    'login',
+    'status',
+    '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
+    `sqlite_home=${JSON.stringify(profilePath)}`,
+  ]);
+  assert.deepEqual(commands[5]?.slice(0, 9), [
+    'app-server',
+    '--stdio',
+    '--disable',
+    'plugins',
+    '-c',
+    'cli_auth_credentials_store="file"',
+    '-c',
+    'forced_login_method="chatgpt"',
+    '-c',
+  ]);
+  assert.match(commands[5]?.[9] ?? '', /^sqlite_home=".*relay-codex-identity-/);
+  const environments = readEnvironments();
+  assert.equal(environments.length, 6);
   assert.deepEqual(
-    readEnvironments(),
+    environments.filter((_, index) => index !== 3 && index !== 5),
     Array.from({ length: 4 }, () => ({
       CODEX_HOME: profilePath,
       CODEX_SQLITE_HOME: profilePath,
@@ -302,13 +384,77 @@ test('rejects a successful Codex login status without an authentication method',
   );
 });
 
-test('reports that Codex cannot expose a stable profile identity', async () => {
+test('reports isolated Codex profiles only when app-server identity is available', async () => {
   const { provider } = codexForScenario('exec');
   const capabilities = await provider.capabilities() as ProviderCapabilities & {
     reportsProfileIdentity?: boolean;
   };
 
-  assert.equal(capabilities.reportsProfileIdentity, false);
+  assert.equal(capabilities.profileIsolation, true);
+  assert.equal(capabilities.reportsProfileIdentity, true);
+
+  const unsupported = codexForScenario('app-server-missing').provider;
+  const unsupportedCapabilities = await unsupported.capabilities();
+  assert.equal(unsupportedCapabilities.start, true);
+  assert.equal(unsupportedCapabilities.profileIsolation, false);
+  assert.equal(unsupportedCapabilities.reportsProfileIdentity, false);
+});
+
+test('fails closed when app-server cannot report a ChatGPT email identity', async () => {
+  for (const scenario of [
+    'account-email-missing',
+    'account-wrong-type',
+    'account-not-openai-auth',
+  ]) {
+    const { provider } = codexForScenario(scenario);
+    await assert.rejects(
+      provider.authStatus('/profiles/codex-a'),
+      (error: unknown) =>
+        error instanceof RelayError && error.code === 'provider_output_invalid',
+    );
+  }
+});
+
+test('serializes short-lived Codex identity probes within one Relay process', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'relay-codex-probe-test-'));
+  roots.push(root);
+  const probeLog = join(root, 'probes.log');
+  const { provider } = codexForScenario('slow-account', {
+    FAKE_PROBE_CONCURRENCY_LOG: probeLog,
+  });
+
+  await Promise.all([
+    provider.authStatus('/profiles/codex-a'),
+    provider.authStatus('/profiles/codex-b'),
+  ]);
+
+  const events = readFileSync(probeLog, 'utf8').trim().split('\n');
+  assert.equal(events.length, 4);
+  assert.match(events[0] ?? '', /^start:\d+$/);
+  assert.equal(events[1], `end:${events[0]?.slice('start:'.length)}`);
+  assert.match(events[2] ?? '', /^start:\d+$/);
+  assert.equal(events[3], `end:${events[2]?.slice('start:'.length)}`);
+});
+
+test('reuses one probe database without creating per-account Codex state', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'relay-codex-cache-test-'));
+  roots.push(root);
+  const identityStatePath = join(root, 'identity-state');
+  const { provider, readEnvironments } = codexForScenario(
+    'exec',
+    {},
+    { identityStatePath },
+  );
+
+  await provider.authStatus('/profiles/codex-a');
+  await provider.authStatus('/profiles/codex-b');
+
+  const appServerEnvironments = readEnvironments().filter(
+    ({ CODEX_SQLITE_HOME }) => CODEX_SQLITE_HOME === identityStatePath,
+  );
+  assert.equal(appServerEnvironments.length, 2);
+  assert.equal(statSync(identityStatePath).isDirectory(), true);
+  assert.equal(statSync(identityStatePath).mode & 0o777, 0o700);
 });
 
 test('rejects submission output without a task identifier', async () => {
